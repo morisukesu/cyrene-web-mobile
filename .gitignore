@@ -1,0 +1,20 @@
+# 运行时生成 / 隐私数据 —— 绝不入库
+cyrene_mobile/.config.json
+cyrene_mobile/.config.json.*
+cyrene_mobile/.history.json
+cyrene_mobile/data/
+cyrene_mobile/**/__pycache__/
+*.pyc
+
+# 本地快照 / 备份
+*.bak
+*.pre_*
+*.tmp
+
+# 下载与后台任务产物
+downloads/
+shell_jobs/
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
