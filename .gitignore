@@ -23,3 +23,6 @@ shell_jobs/
 # 系统垃圾
 .DS_Store
 Thumbs.db
+
+# 更新脚本留下的代码备份
+cyrene_mobile.bak-*/

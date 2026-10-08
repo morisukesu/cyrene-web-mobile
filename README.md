@@ -127,6 +127,28 @@ pkg install -y nodejs-lts     # install.sh 会尝试自动安装
 > 含桌面原生依赖（`.node` 二进制为 x86_64 编译）的插件在手机上无法运行，
 > 启用后会落到 `failed` 状态并在面板显示原因，不会拖垮服务。
 
+## 更新
+
+已经部署过、想升级到最新版，不用重新装一遍：
+
+```bash
+bash update.sh
+```
+
+它会从仓库取最新代码，只替换 `cyrene_mobile/` 里的代码部分，**保留你的
+`.config.json`、`data/`、`plugins/`、`plugins_inbox/`**。动手前先把旧代码备份到
+`cyrene_mobile.bak-<时间戳>/`；替换前还会对新版做一次 Python 语法自检，过不了就原地不动；
+更新完如果服务本来在跑，会自动重启并探一次 `/health`。
+
+```bash
+bash update.sh --check      # 只看有没有新版，一个文件都不动
+bash update.sh --no-start   # 更新，但不碰服务
+bash update.sh --from DIR   # 没网时，从本地解压好的目录更新
+```
+
+如果这份是 `git clone` 下来的，直接 `git pull` 也一样；改完 `pkill -f cyrene_web.py`
+让它重新起来即可。
+
 ## 手动启动
 
 不想用一键脚本时：
