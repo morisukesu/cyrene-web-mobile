@@ -7,6 +7,7 @@
 四模式对话 · 26 个设备/文件/联网工具 · 原生 Function Calling 多轮 Agent Loop · 技能按需加载 · 插件市场
 
 作者 **森亞ミミカ** · MIT License
+  **Wold.JM**
 
 </div>
 
@@ -182,6 +183,8 @@ python3 runtime/cyrene_web.py
 ## 致谢与署名
 
 - 作者：**森亞ミミカ**
+- 协助者：**Wold.JM**
+- 
 - 许可：[MIT License](./LICENSE)
 - 前端组件：[marked](https://github.com/markedjs/marked)、[highlight.js](https://github.com/highlightjs/highlight.js)（均本地托管）
 
