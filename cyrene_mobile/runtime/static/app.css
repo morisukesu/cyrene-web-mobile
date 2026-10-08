@@ -326,6 +326,7 @@ button,input,select,textarea{font-family:inherit;letter-spacing:inherit}
 .md a:hover{color:var(--md-link-hover)}
 .md strong{font-weight:600;color:var(--md-strong)}
 .md em{font-style:italic}
+.md img{display:block;max-width:min(100%,130px);height:auto;border-radius:12px;margin:8px 0}
 .md del{color:var(--rb-text-disabled)}
 .md blockquote{
   margin:9px 0;padding:7px 13px;border-left:3px solid var(--md-quote-border);

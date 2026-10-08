@@ -29,7 +29,7 @@
 """
 import os, sys, json, re, time, subprocess, urllib.request, urllib.error, urllib.parse
 import threading, uuid, socket, concurrent.futures, signal, shutil, fnmatch, tempfile
-import atexit, hashlib, zipfile, stat, base64, io
+import atexit, hashlib, zipfile, stat, base64, io, queue
 import html as _html_mod
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -70,6 +70,33 @@ STATIC_FILES = {
     "settings.css":     "text/css; charset=utf-8",
     "app.js":           "application/javascript; charset=utf-8",
 }
+# 素材子目录：按前缀开放的静态目录（表情包之类的图片素材）。
+# 仍是白名单思路 —— 只放行「一层子目录 + 安全文件名 + 图片扩展名」，
+# `..`、斜杠、绝对路径一律不收，也不存在「先拼路径再判越界」的窗口。
+STATIC_PREFIX_DIRS = {
+    "stickers/": {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                  "png": "image/png", "gif": "image/gif", "webp": "image/webp"},
+}
+STATIC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def static_ctype(name):
+    """把请求名解析成 MIME；任何规则都命中不了就返回 None（调用方回 404）。"""
+    ctype = STATIC_FILES.get(name)
+    if ctype is not None:
+        return ctype
+    for prefix, exts in STATIC_PREFIX_DIRS.items():
+        if not name.startswith(prefix):
+            continue
+        rest = name[len(prefix):]
+        if "/" in rest or "\\" in rest or ".." in rest:
+            return None
+        if not STATIC_NAME_RE.match(rest):
+            return None
+        return exts.get(rest.rsplit(".", 1)[-1].lower() if "." in rest else "")
+    return None
+
+
 # 自产文件改动频繁，不缓存；第三方库可长缓存
 STATIC_NOCACHE = {"app.css", "settings.css", "app.js"}
 STATIC_CACHE = {}
@@ -77,7 +104,9 @@ STATIC_CACHE_LOCK = threading.Lock()
 
 
 def load_static(name):
-    if name in STATIC_NOCACHE:
+    # 白名单里的自产文件、以及素材子目录下的图，都不进内存缓存：
+    # 前者改动频繁；后者数量会涨（表情包几十张），常驻内存不划算，读盘也够快。
+    if name in STATIC_NOCACHE or name not in STATIC_FILES:
         try:
             return (STATIC_DIR / name).read_bytes()
         except OSError:
@@ -2409,7 +2438,11 @@ def normalize_plugins(raw):
     每次前端保存设置都把已安装台账与密钥抹掉。
     """
     p = raw if isinstance(raw, dict) else {}
-    out = {"enabled": _as_bool(p.get("enabled"), True)}
+    out = {"enabled": _as_bool(p.get("enabled"), True),
+           # securityScan：插件导入时的静态高危扫描开关。必须在这里显式登记 ——
+           # 下面 out_reg 是白名单式的，漏一个键就会在每次启动 / 每次前端保存
+           # 设置时被静默抹回默认值，用户在面板上关掉又「自己打开」。
+           "securityScan": _as_bool(p.get("securityScan"), True)}
 
     reg = p.get("registry") if isinstance(p.get("registry"), dict) else {}
     out_reg = {}
@@ -2534,6 +2567,7 @@ DEFAULT_SETTINGS = {
     # 在每次启动 / 每次前端保存设置时**静默清空**用户数据。
     "plugins": {
         "enabled": True,     # 总开关：关掉则不加载任何插件（回退路径）
+        "securityScan": True,  # 插件安全检测：导入时静态扫高危调用（黄标提示，不阻断）
         "registry": {},      # {id: {version, enabled, source, sha256, installedAt, lastError}}
         "secrets": {},       # {id: {key: value}}，按插件命名空间隔离
     },
@@ -2668,6 +2702,10 @@ def deep_merge_settings(base, patch, trust_plugins=False):
             cur = out.setdefault("plugins", normalize_plugins(None))
             if isinstance(val.get("enabled"), bool):
                 cur["enabled"] = val["enabled"]
+            # securityScan 与 enabled 同类：普通偏好开关，逐键放行；
+            # registry / secrets 依旧不被 HTTP patch 触碰。
+            if isinstance(val.get("securityScan"), bool):
+                cur["securityScan"] = val["securityScan"]
             if trust_plugins:
                 # 启动路径：磁盘是权威源，整段交给 normalize_plugins 清洗后收下。
                 # 它只过滤非法 id，不会回落默认值（回落就是清空）。
@@ -3147,6 +3185,120 @@ class LLMClient:
         except Exception as e:
             return None, {"_error": str(e)}
 
+    def _post_stream(self, payload, on_delta=None, cancel=None):
+        """流式发一次请求：边收 SSE 边把增量回调出去。
+
+        on_delta(kind, text) 里 kind 是 "reasoning" 或 "content"；
+        cancel() 返回 True 时立刻收手（前端点了停止）。
+        返回 (status, result)——result 与 chat_ex 同形，失败时 status 为
+        错误码或 None、result 里带 _error。供 chat_ex_stream 复用。
+        """
+        url = self.base + "/chat/completions"
+        body = dict(payload)
+        body["stream"] = True
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json",
+                     "Accept": "text/event-stream",
+                     "Authorization": f"Bearer {self.key}"})
+        try:
+            resp = urllib.request.urlopen(req, timeout=self.timeout)
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read().decode(errors="replace")
+            except Exception:
+                detail = ""
+            return e.code, {"_error": detail}
+        except Exception as e:
+            return None, {"_error": str(e)}
+
+        content_parts, reasoning_parts, tc_acc = [], [], {}
+        finish_reason = None
+        try:
+            for raw in resp:
+                if cancel is not None and cancel():
+                    break
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                chunk = line[5:].strip()
+                if chunk == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(chunk)
+                except Exception:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                finish_reason = choice.get("finish_reason") or finish_reason
+                delta = choice.get("delta") or {}
+                piece_r = delta.get("reasoning_content") or delta.get("reasoning")
+                if piece_r:
+                    reasoning_parts.append(piece_r)
+                    if on_delta:
+                        try:
+                            on_delta("reasoning", piece_r)
+                        except Exception:
+                            pass
+                piece_c = delta.get("content")
+                if piece_c:
+                    content_parts.append(piece_c)
+                    if on_delta:
+                        try:
+                            on_delta("content", piece_c)
+                        except Exception:
+                            pass
+                for tc in (delta.get("tool_calls") or []):
+                    idx = tc.get("index", 0)
+                    slot = tc_acc.setdefault(idx, {"id": "", "name": "", "args": ""})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["args"] += fn["arguments"]
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+        reasoning = "".join(reasoning_parts) or None
+        if isinstance(reasoning, str) and not reasoning.strip():
+            reasoning = None
+        tool_calls = []
+        for i in sorted(tc_acc):
+            slot = tc_acc[i]
+            raw_args = slot["args"] or "{}"
+            try:
+                args = json.loads(raw_args)
+            except Exception:
+                args = raw_args
+            tool_calls.append({"id": slot["id"], "name": slot["name"], "args": args})
+        # 回灌用的原始 message：agent loop 靠 message.tool_calls 把 assistant
+        # 这次调用写回上下文；缺了它，后面 append 的 role=tool 就没有对应槽位，
+        # 端点会直接 400（tool message 前必须先有带 tool_calls 的 assistant）。
+        raw_tcs = []
+        for i in sorted(tc_acc):
+            slot = tc_acc[i]
+            raw_tcs.append({"id": slot["id"], "type": "function",
+                            "function": {"name": slot["name"],
+                                         "arguments": slot["args"] or "{}"}})
+        message = {"role": "assistant", "content": "".join(content_parts)}
+        if reasoning:
+            message["reasoning_content"] = reasoning
+        if raw_tcs:
+            message["tool_calls"] = raw_tcs
+        return 200, {"content": "".join(content_parts),
+                     "reasoning": reasoning,
+                     "tool_calls": tool_calls,
+                     "finish_reason": finish_reason,
+                     "error": None,
+                     "message": message}
+
     def chat_ex(self, messages, max_tokens=None, tools=None):
         """完整形态的一次 LLM 调用，返回结构化 dict：
 
@@ -3239,6 +3391,33 @@ class LLMClient:
                 "fc_rejected": fc_rejected,
                 "length_hit": choice.get("finish_reason") == "length",
                 "message": message}
+
+    def chat_ex_stream(self, messages, max_tokens=None, tools=None,
+                       on_delta=None, cancel=None):
+        """chat_ex 的流式版本：入参与返回同形，另收两个回调。
+
+        on_delta(kind, text) —— kind 为 "reasoning" / "content"，边收边吐；
+        cancel()             —— 返回 True 时立刻收手（前端点了停止）。
+
+        端点不认流式、或流式这一趟失败时，自动回落到整段的 chat_ex，
+        功能不会因为「想看到思考过程」而丢。
+        """
+        payload = self._base_payload(messages, max_tokens)
+        if self.reasoning_enabled:
+            payload["reasoning_effort"] = self.reasoning_effort
+            payload["reasoning"] = {"effort": self.reasoning_effort}
+            payload["enable_thinking"] = True
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        status, data = self._post_stream(payload, on_delta=on_delta, cancel=cancel)
+        if status == 200:
+            out = dict(data)
+            out["fc_rejected"] = False
+            out["length_hit"] = out.get("finish_reason") == "length"
+            return out
+        return self.chat_ex(messages, max_tokens=max_tokens, tools=tools)
 
     def chat(self, messages, max_tokens=None):
         """兼容旧调用方：返回 (content, reasoning, error) 三元组。
@@ -4403,9 +4582,15 @@ class PluginManager:
         # 这里是**所有**安装路径的汇聚点（ZIP 上传 / URL / inbox / 市场 /
         # 脚本直调 install_from_dir），放一处就全覆盖，不会漏掉某条通道。
         # 扫的是已落位的目录：那才是真正会被 node 执行的那份。
-        try:
-            risky = self.scan_risky(dest)
-        except OSError:
+        # 安全检测开关（plugins.securityScan）：关掉后导入时不再做静态高危
+        # 扫描，也不写黄标台账。扫描点仍固定在 install_from_dir —— 开关只决定
+        # 「扫不扫」，不改变「所有通道都汇聚到这一处」的结构。
+        if plugins_cfg("securityScan", True):
+            try:
+                risky = self.scan_risky(dest)
+            except OSError:
+                risky = []
+        else:
             risky = []
         if risky:
             # 只把 pattern 名写进台账（文件清单是「安装那一刻」给用户看的，
@@ -6354,6 +6539,43 @@ CURRENT_SID = list(SESSIONS.keys())[0] if SESSIONS else None
 #   ABORT 记录「哪个会话被用户要求中止」，agent loop 每轮开头检查它并优雅退出。
 STORE_LOCK = threading.Lock()
 INFLIGHT = {}
+
+# ---- 实时增量推送（思考过程看得见）----
+# agent loop 每收到一片增量就丢进订阅队列，GET /chat/<sid>/stream 的线程
+# 再取出来写成 SSE。没有订阅者时，代价只是一次空的列表遍历。
+STREAM_SUBS = {}            # sid -> set(queue.Queue)
+STREAM_LOCK = threading.Lock()
+STREAM_MAX_SECONDS = 900    # 单条 SSE 连接的兜底时长，防止线程挂死
+
+
+def stream_subscribe(sid):
+    q = queue.Queue(maxsize=4000)
+    with STREAM_LOCK:
+        STREAM_SUBS.setdefault(sid, set()).add(q)
+    return q
+
+
+def stream_unsubscribe(sid, q):
+    with STREAM_LOCK:
+        subs = STREAM_SUBS.get(sid)
+        if subs is not None:
+            subs.discard(q)
+            if not subs:
+                STREAM_SUBS.pop(sid, None)
+
+
+def stream_publish(sid, kind, text):
+    # 广播一片增量；没有人订就什么都不做。
+    if not text:
+        return
+    with STREAM_LOCK:
+        subs = list(STREAM_SUBS.get(sid) or ())
+    for q in subs:
+        try:
+            q.put_nowait((kind, text))
+        except Exception:
+            pass
+
 ABORT = {}
 
 # loop 最近一次运行的统计，供设置面板 Agent tab 的状态区展示（阶段5 用）
@@ -6580,8 +6802,10 @@ def run_agent_loop(sid, client, prompt, history, allow_tools, cfg=None):
         # 本次请求是否带了 tools 的快照。降级分支会在本轮内把 use_fc 置 False，
         # 而回灌 role 要按「发出请求时的形态」决定，所以先留一份快照。
         req_fc = use_fc
-        r = client.chat_ex([{"role": "system", "content": prompt}] + work,
-                           tools=tools_payload if use_fc else None)
+        r = client.chat_ex_stream([{"role": "system", "content": prompt}] + work,
+                           tools=tools_payload if use_fc else None,
+                                  on_delta=lambda _k, _t: stream_publish(sid, _k, _t),
+                                  cancel=lambda: is_aborted(sid))
         turns += 1
         llm_calls += 1
 
@@ -6926,14 +7150,55 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _static(self, name):
-        ctype = STATIC_FILES.get(name)   # dict 精确匹配 = 白名单，穿越串命中不了
+        ctype = static_ctype(name)   # 白名单精确匹配；素材子目录另按前缀放行
         if ctype is None:
             self._json({"error": "not found"}, 404); return
         data = load_static(name)
         if data is None:
             self._json({"error": "asset missing on disk"}, 404); return
-        cache = "no-store" if name in STATIC_NOCACHE else "public, max-age=86400"
+        cache = ("public, max-age=86400"
+                 if name in STATIC_FILES and name not in STATIC_NOCACHE else "no-store")
         self._send(data, ctype, 200, cache)
+
+    def _stream_chat(self, sid):
+        # 实时增量推送：SSE 长连接。
+        # 网页等一轮回复时订这里，模型吐一片就立刻填进「正在想」那一行。
+        # 客户端关了、或挂太久，就在这里收摊；平时由前端在 /send 返回后关闭。
+        q = stream_subscribe(sid)
+        started = time.time()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.wfile.write(b": open\n\n")
+            self.wfile.flush()
+            idle = 0.0
+            while True:
+                if time.time() - started > STREAM_MAX_SECONDS:
+                    break
+                try:
+                    kind, text = q.get(timeout=1.0)
+                    idle = 0.0
+                except queue.Empty:
+                    idle += 1.0
+                    if idle >= 15.0:
+                        idle = 0.0
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                    # 这一轮早跑完了、又一直没有增量：收摊，别占着线程
+                    if idle >= 30.0 and not INFLIGHT.get(sid):
+                        break
+                    continue
+                payload = json.dumps({"kind": kind, "text": text}, ensure_ascii=False)
+                self.wfile.write(b"data: " + payload.encode() + b"\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            pass
+        finally:
+            stream_unsubscribe(sid, q)
 
     def _body(self):
         try:
@@ -7011,6 +7276,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/sessions/export":
             with STORE_LOCK:
                 self._json({"exportedAt": time.time(), "sessions": SESSIONS})
+        elif len(seg) == 3 and seg[0] == "chat" and seg[2] == "stream":
+            self._stream_chat(seg[1])
         elif len(seg) == 2 and seg[0] == "chat":
             with STORE_LOCK:
                 s = SESSIONS.get(seg[1])
@@ -7182,6 +7449,8 @@ class Handler(BaseHTTPRequestHandler):
         return {
             "host": {
                 "enabled": bool(plugins_cfg("enabled", True)),
+                # 插件安全检测开关（导入时静态扫高危调用）。前端据此渲染开关与黄标。
+                "securityScan": bool(plugins_cfg("securityScan", True)),
                 "dir": str(PLUGINS_DIR),
                 "dirExists": PLUGINS_DIR.is_dir(),
                 "nodeBin": node_bin,
@@ -7659,6 +7928,9 @@ class Handler(BaseHTTPRequestHandler):
             ok, info = PLUGIN_MANAGER.start(pid)
             rebuild_system_prompt()
             self._json({"ok": ok, "id": pid, "action": action,
+                        # 失败时带上 error：前端 pluginErrMsg 优先读它，用户看到
+                        # 的是「插件启动失败：<真实原因>」，而不是兜底的 HTTP 502。
+                        "error": "" if ok else f"插件启动失败：{info}",
                         "info": info if ok else str(info),
                         "state": PLUGIN_MANAGER.state(pid),
                         "toolCount": len(TOOLS)},

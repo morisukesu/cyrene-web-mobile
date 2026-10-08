@@ -543,8 +543,23 @@ function showThinking() {
   var row = document.createElement('div'); row.className = 'msg-row bot'; row.id = 'thinking-row';
   var av = document.createElement('div'); av.className = 'avatar bot'; av.textContent = '♪';
   var box = document.createElement('div'); box.className = 'thinking-box';
+  box.style.flexWrap = 'wrap';
+  box.style.cursor = 'pointer';
+  box.title = '点一下看人家在想什么';
   box.innerHTML = '<span class="dots"><span></span><span></span><span></span></span>'
-    + '<span>昔涟正在想</span><span id="elapsed">0s</span>';
+    + '<span id="think-label">昔涟正在想</span><span id="elapsed">0s</span>';
+  /* 实时思考的落点：SSE 一推就往这里接。默认收着，点开才看。 */
+  var live = document.createElement('div');
+  live.id = 'think-live';
+  live.hidden = true;
+  live.style.cssText = 'flex:1 1 100%;min-width:0;white-space:pre-wrap;'
+    + 'word-break:break-word;max-height:36vh;overflow:auto;'
+    + 'margin-top:6px;font-size:12px;line-height:1.55;opacity:.85;';
+  box.appendChild(live);
+  box.addEventListener('click', function () {
+    if (!live.textContent) return;
+    live.hidden = !live.hidden;
+  });
   row.appendChild(av); row.appendChild(box); chat.appendChild(row);
   scrollBottom(true);
   secs = 0;
@@ -554,8 +569,45 @@ function showThinking() {
   }, 1000);
 }
 function hideThinking() {
+  stopThinkStream();
   if (timer) { clearInterval(timer); timer = null; }
   var r = $('thinking-row'); if (r) r.remove();
+}
+/* ================= 实时思考（SSE）=================
+   等一轮回复的时候订 /chat/{sid}/stream，后端每吐一片就接到「正在想」那一行。
+   连接只活在等回复这段时间：/send 一返回就关。没有 EventSource、或者中途
+   断线，都只当没这回事，主流程照常等 /send 的整段结果。 */
+var thinkES = null;
+function startThinkStream(sid) {
+  stopThinkStream();
+  if (!sid || typeof EventSource !== 'function') return;
+  try {
+    thinkES = new EventSource('/chat/' + encodeURIComponent(sid) + '/stream');
+  } catch (e) { thinkES = null; return; }
+  thinkES.onmessage = function (ev) {
+    var d;
+    try { d = JSON.parse(ev.data); } catch (e) { return; }
+    if (!d || !d.text) return;
+    if (d.kind === 'reasoning') {
+      var label = $('think-label');
+      if (label) label.textContent = '昔涟正在想';
+      var live = $('think-live');
+      if (live) {
+        live.hidden = false;
+        live.textContent += d.text;
+        live.scrollTop = live.scrollHeight;
+      }
+    } else if (d.kind === 'content') {
+      var label2 = $('think-label');
+      if (label2) label2.textContent = '昔涟正在写';
+    }
+  };
+  thinkES.onerror = function () { /* 断线不当错误：照常等 /send */ };
+}
+function stopThinkStream() {
+  if (!thinkES) return;
+  try { thinkES.close(); } catch (e) {}
+  thinkES = null;
 }
 function setStatus(kind) {
   statusDot.classList.remove('thinking', 'error');
@@ -901,6 +953,7 @@ function onSend() {
 function sendTurn(text, isRetry) {
   setBusy(true);
   showThinking();
+  startThinkStream(currentSid);
   /* 新一轮开始：先停掉可能还在跑的 settle 轮询，避免它和这一轮的渲染交错
      （poll 里的 applyChatData 是全量重建，和 sendTurn 成功后的 addSegmented
      抢 DOM 会让气泡 / 提问卡错乱）。 */
@@ -1723,6 +1776,14 @@ PANELS.plugins = function (host, S) {
     else drawInstalled(body);
   }
 
+  /* 安全检测开关落盘：走通用设置端点，只 patch plugins.securityScan 一个键。
+     后端 deep_merge_settings 对 plugins 段逐键合并，不会碰 registry / secrets。 */
+  function setSecurityScan(on) {
+    return apiPost('/settings', { plugins: { securityScan: !!on } })
+      .then(function () { draw(); })
+      .catch(function (e) { alert('保存失败: ' + pluginErrMsg(e)); });
+  }
+
   /* ---------- 已安装视图 ---------- */
   function drawInstalled(root) {
     root.innerHTML = '<div class="tool-panel__empty">加载中…</div>';
@@ -1751,6 +1812,13 @@ PANELS.plugins = function (host, S) {
       c.appendChild(row('插件目录', String(h.dir || ''), null));
       c.appendChild(row('Plugin API', 'v' + (h.apiVersion || 1)
         + (h.hostShellExists ? '' : '（宿主壳缺失！）'), null));
+      /* 插件安全检测：控制导入插件时要不要静态扫高危调用（黄标，不阻断安装）。
+         关掉后新装的包不再扫描、面板也不再显示黄标；已装插件照常运行。 */
+      c.appendChild(row('安全检测', h.securityScan === false
+        ? '已关闭 · 导入插件时不做高危调用扫描'
+        : '开启中 · 导入插件时扫描高危调用并打黄标（仅提示，不阻断安装）',
+        toggle(h.securityScan !== false, function (on) { setSecurityScan(on); },
+               '插件安全检测')));
       root.appendChild(section('宿主', null, c));
 
       /* 导入区：选文件 / 贴链接 / 扫描 inbox */
@@ -1843,7 +1911,7 @@ PANELS.plugins = function (host, S) {
       var vb = document.createElement('span'); vb.className = 'tool-card__badge';
       vb.textContent = 'v' + p.version; nm.appendChild(vb);
     }
-    if (p.risky && p.risky.length) {
+    if (h.securityScan !== false && p.risky && p.risky.length) {
       var rb = document.createElement('span'); rb.className = 'tool-card__badge';
       rb.textContent = '⚠ 高危调用'; rb.style.color = '#c8860d';
       rb.title = '静态扫描发现：' + p.risky.join(', ');
