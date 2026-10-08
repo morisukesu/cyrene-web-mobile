@@ -4,7 +4,7 @@
 
 **在 Android / Termux 上跑起来的本地 AI Agent Web 服务**
 
-四模式对话 · 26 个设备/文件/联网工具 · 原生 Function Calling 多轮 Agent Loop · 技能按需加载
+四模式对话 · 26 个设备/文件/联网工具 · 原生 Function Calling 多轮 Agent Loop · 技能按需加载 · 插件市场
 
 作者 **森亞ミミカ** · MIT License
 
@@ -23,6 +23,7 @@
 - **手机硬件工具**：电量、手电筒、通知、震动、剪贴板、WiFi、TTS、拍照、定位等（需 Termux:API）。
 - **文件与联网工具**：读写编辑文件、glob/grep 搜索、web_search、fetch_url、download_file。
 - **技能系统**：`skills/` 下的技能以「清单」形式注入，正文按需通过 `invoke_skill` 拉取，省 token。
+- **插件系统**：兼容桌面端 Cyrene Plugin API v1 的 Node 插件，网页内「插件市场」一键安装，或从 ZIP 导入；插件工具自动并入 Function Calling。
 - **本地托管前端**：marked + highlight.js 全部本地化，不依赖 CDN，离线可用。
 
 ## 项目结构
@@ -33,9 +34,11 @@ cyrene-web-mobile/
 │   ├── runtime/
 │   │   ├── cyrene_web.py      # 后端主程序（单文件，HTTP 服务 + Agent Loop + 工具）
 │   │   ├── cyrene_phone.py    # 早期 CLI 原型（终端对话，保留作参考）
+│   │   ├── plugin_host.cjs    # Node 插件宿主壳（子进程 + NDJSON RPC 桥）
 │   │   └── static/            # 前端：app.js / app.css / settings.css + marked / highlight.js
 │   ├── prompts/               # 四模式系统提示词、人格、世界书、技能纪律
 │   ├── skills/                # 技能包（每个含 SKILL.md + manifest.json）
+│   ├── plugins/               # 已安装插件（市场/ZIP 导入后落这里，运行时生成）
 │   └── data/                  # 运行时生成：会话、用量（不入库）
 ├── install.sh                 # Termux 一键部署脚本
 ├── config.example.json        # 配置模板
@@ -56,7 +59,7 @@ cd cyrene-web-mobile
 bash install.sh
 ```
 
-`install.sh` 会自动：检查/安装 Python → 尝试装 termux-api 桥 → 生成配置 → 注册 `cyrene-web` 启动命令 → 启动服务。
+`install.sh` 会自动：检查/安装 Python → 尝试装 termux-api 桥 → 尝试装 Node.js（插件用）→ 生成配置 → 注册 `cyrene-web` 启动命令 → 启动服务。
 
 启动后终端会打印访问地址，例如：
 
@@ -86,6 +89,43 @@ bash install.sh
 3. 在系统设置里给 Termux:API 授予相应权限（通知、定位、相机等）。
 
 未装 Termux:API 不影响 Web 对话与文件/联网工具，仅硬件类工具不可用。
+
+### 插件（可选）
+
+插件是**兼容桌面端 Cyrene Plugin API v1** 的 Node 程序，由 `runtime/plugin_host.cjs`
+以子进程方式承载，通过 stdin/stdout 上的 NDJSON RPC 与后端通信。插件注册的工具会
+自动并入 Function Calling，和内置工具一样被模型调用。
+
+前置条件：
+
+```bash
+pkg install -y nodejs-lts     # install.sh 会尝试自动安装
+```
+
+未装 Node 不影响其它功能，「设置 → 插件」页面会显示未就绪提示、且不提供启用开关。
+
+装好后打开 **设置 → 插件**：
+
+| 子页面 | 能做什么 |
+|---|---|
+| **已安装** | 启用/停用/卸载插件、看运行状态与错误日志、打开插件自带的设置面板 |
+| **市场** | 浏览在线插件仓库、一键安装、有新版时提示更新 |
+
+安装来源有三条通道，共用同一套校验与解包逻辑：
+
+1. **插件市场**（推荐）：在线仓库列出可用插件，点击安装。下载后做 **sha256 强校验**，校验不通过直接拒装并留证。
+2. **导入 ZIP**：网页上传 ZIP、贴 ZIP 直链、或把 ZIP 放进 `cyrene_mobile/plugins_inbox/` 后点「扫描收件箱」。
+3. **源码安装**：市场里未打包 ZIP 的示例插件走逐文件拉取，安装后会标记为「未校验」并要求二次确认。
+
+安全说明：
+
+- 解包做了 ZIP Slip 防护（路径归一化 + 落点必须在临时目录内 + 拒绝软链成员 + 解包字节数上限），并有成员数与体积上限。
+- 安装时静态扫描常见高危模式（如任意命令执行、网络外联），命中的插件会**黄标提示但不阻断**——插件与宿主同权限，扫描的价值是让你看得见，而不是代替你判断。
+- **只安装你信任来源的插件**。插件能读写文件、执行命令，等同于给它你的 Termux 权限。
+- 插件的安装/卸载/导入接口仅限本机访问（回环地址与 adb forward 视为本机），局域网其它设备调用会被拒。
+
+> 含桌面原生依赖（`.node` 二进制为 x86_64 编译）的插件在手机上无法运行，
+> 启用后会落到 `failed` 状态并在面板显示原因，不会拖垮服务。
 
 ## 手动启动
 

@@ -7,15 +7,18 @@
   外观      双主题 charcoal-pink / pearl-white + 回复排版四滑块
             （token 取自 src/renderer/ui/tokens.css 与 themes/*.css）
   模型      api_base / api_key / model + 采样参数 + 超时 + 历史上限
-  工具      12 个 termux-api 工具逐个开关，Runtime 级生效
-  技能      skills/*/SKILL.md 的 front matter 开关，注入系统提示
+  工具      内置 26 个（12 termux-api + shell + 6 文件 + 3 网络 + 5 元工具）
+            逐个开关，Runtime 级生效；另有 Agent Loop 多轮工具调用
+  插件      桌面端 Cyrene Plugin API v1 的 Node 插件（子进程桥 + NDJSON RPC），
+            市场插件不改一行即可跑；见「插件体系」段与 runtime/plugin_host.cjs
+  技能      skills/*/SKILL.md 的 front matter 开关，注入系统提示（清单式）
   语音      termux-tts-speak 自动朗读 + 语速/音调/语言 + 试听
   用量      token / 请求 / 工具调用累计，按模型分组
   服务      端口 / 监听地址 / 工具超时 / Markdown 与高亮开关
 
 不在移植范围（Termux 无对应运行时，做了就是空壳）：
   ASR、BrowserControl、Channels、KnowledgeBase/RAG、MCP、Memory/DMAE、
-  Music、Plugin、Subagent、Sticker、AppUpdate
+  Music、Subagent、Sticker、AppUpdate
 
 相对 v7 的修复：
   - main() 内 `import socket` 造成的 UnboundLocalError（原版根本起不来）
@@ -26,6 +29,7 @@
 """
 import os, sys, json, re, time, subprocess, urllib.request, urllib.error, urllib.parse
 import threading, uuid, socket, concurrent.futures, signal, shutil, fnmatch, tempfile
+import atexit, hashlib, zipfile, stat, base64, io
 import html as _html_mod
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -2093,7 +2097,24 @@ TOOLS = {
                                      "desc": "status=查状态（默认）；stop=终止任务"}},
                      },
 }
+# 只读工具清单。
+#
+# ⚠ 插件体系接入后这是**动态量**：插件启用会往 TOOLS 里加工具，停用会摘掉。
+# 模块级 list 在 import 时算一次就定死了，插件工具永远进不来。
+# 保留这个名字是为了兼容既有引用（含验证脚本的静态断言），但它只是
+# 「内置只读工具」的快照 —— 需要完整清单时调 readonly_tools()。
 READONLY_TOOLS = [k for k, v in TOOLS.items() if v.get("readonly")]
+
+
+def readonly_tools():
+    """当前全部只读工具（内置 + 已启用插件）。需要实时值就用这个。
+
+    每次现算而不缓存：TOOLS 规模是几十个，一次列表推导的成本远低于
+    「缓存失效时机没对上」带来的 bug。插件启停是低频操作，但 TOOLS
+    的变更点分散在 _register_tools / _unregister_tools / 工具开关三处，
+    任何一处漏了缓存清理就会读到脏数据。
+    """
+    return [k for k, v in TOOLS.items() if v.get("readonly")]
 
 # handler 型工具的 name → 函数映射。TOOLS 里存函数名字符串而不是函数对象，
 # 这样 TOOLS 仍然是纯数据（可 JSON 序列化、可被验证脚本静态检查）。
@@ -2337,6 +2358,126 @@ def agent_cfg(key, fb=None):
         return fb
 
 
+# 前端 settle 轮询预算的余量（秒）：留给 loop 收尾落库 + 中止交代那一次 LLM 调用。
+SETTLE_BUDGET_MARGIN = 15
+
+
+def settle_budget():
+    """前端「等后端这一轮落库」该等多久（秒）。随 GET /chat 一起回传。
+
+    最坏情形：loop 在轮前 elapsed_over() 检查**通过后**才发出一次请求，那次请求
+    要等满自己的 request_timeout 才返回，此时 totalTimeout 也基本到了 —— 两段相加
+    再加落库余量，才是前端该等的上限。
+
+    这个值必须由后端算：前端曾经硬编码 90s，而 totalTimeout 默认 180s，长轮次
+    （开思考链时单次请求显著变慢，最容易撞上）会在后端还在跑的时候就放弃轮询、
+    定格在旧画面上，提问卡选项与进度条依旧「消失」，用户仍要手动刷新。
+    """
+    try:
+        total = int(agent_cfg("totalTimeout"))
+    except (TypeError, ValueError):
+        total = AGENT_RANGES["totalTimeout"][2]
+    try:
+        req = int(SETTINGS.get("model", {}).get("request_timeout", 120))
+    except (NameError, AttributeError, TypeError, ValueError):
+        req = 120
+    return max(30, min(900, total + req + SETTLE_BUDGET_MARGIN))
+
+
+# 插件 id / 工具 id 的合法形状。用作路径片段与命名空间前缀前必须校验，
+# 否则 "../../evil" 这类 id 能穿到文件系统上。
+#
+# ⚠ 必须定义在这里（配置区）而不是插件段：SETTINGS = load_settings() 在模块
+#   导入期就执行，会调到 normalize_plugins；而插件段在文件更靠后的位置，
+#   那时 PLUGIN_ID_RE 还没定义，import 直接 NameError。
+PLUGIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+# GET /settings 回传时，插件密钥的值一律替换成这个占位符（见 _public_settings）。
+# 前端把它原样回存时，deep_merge_settings 要认得出来并**跳过**，
+# 否则真密钥会被字符串 "<set>" 顶掉 —— 表现为「插件突然全部失效」，
+# 而 .config.json 里看不出任何异常，很难查。
+PLUGIN_SECRET_MASK = "<set>"
+
+
+def normalize_plugins(raw):
+    """归一化插件配置。
+
+    与其它 section 不同的地方：registry / secrets 是**用户数据**，不是偏好设置，
+    所以这里只过滤非法 id，绝不做「回落默认值」——回落就是清空。
+
+    normalize_settings 是白名单式的，这个函数不保留就等于每次启动、
+    每次前端保存设置都把已安装台账与密钥抹掉。
+    """
+    p = raw if isinstance(raw, dict) else {}
+    out = {"enabled": _as_bool(p.get("enabled"), True)}
+
+    reg = p.get("registry") if isinstance(p.get("registry"), dict) else {}
+    out_reg = {}
+    for pid, entry in reg.items():
+        # id 会拼进文件路径，形状不对的一律丢掉（防穿越）
+        if not isinstance(pid, str) or not PLUGIN_ID_RE.match(pid):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        out_reg[pid] = {
+            "version": _as_str(entry.get("version"), "")[:40],
+            "enabled": _as_bool(entry.get("enabled"), False),
+            "source": _as_str(entry.get("source"), "")[:20],
+            "sha256": _as_str(entry.get("sha256"), "")[:64],
+            "installedAt": _as_str(entry.get("installedAt"), "")[:40],
+            # lastError 可能带路径与堆栈，留长一点便于面板排查，但仍设上限
+            "lastError": _as_str(entry.get("lastError"), "")[:2000],
+            # risky：安装时静态扫出的高危调用（只存 pattern 名，不存文件清单——
+            # 文件清单只在安装响应里给用户看一次，长期留在 .config.json 里没意义
+            # 还会撑大文件）。不登记在这里就会被下次 normalize 静默抹掉，
+            # 面板从此再也显示不出黄标（上面 out_reg 是白名单式的）。
+            "risky": [str(x)[:40] for x in (entry.get("risky") or [])
+                      if isinstance(x, str)][:12],
+        }
+    out["registry"] = out_reg
+
+    sec = p.get("secrets") if isinstance(p.get("secrets"), dict) else {}
+    out_sec = {}
+    for pid, kv in sec.items():
+        if not isinstance(pid, str) or not PLUGIN_ID_RE.match(pid):
+            continue
+        if not isinstance(kv, dict):
+            continue
+        # 密钥值原样保留（不做长度截断 —— 截断会悄悄废掉一个 key，
+        # 用户看到的是「插件突然不工作了」而不是「配置被截断了」）
+        out_sec[pid] = {str(k): v for k, v in kv.items() if isinstance(k, str)}
+    out["secrets"] = out_sec
+    return out
+
+
+def plugins_cfg(key, fb=None):
+    """读单个插件配置项。SETTINGS 未加载时回落默认值（与 agent_cfg 同构）。"""
+    try:
+        return SETTINGS.get("plugins", {}).get(key, fb)
+    except (NameError, AttributeError):
+        return fb
+
+
+def plugin_registry():
+    """已安装插件台账（内存视图）。调用方不应原地修改，改完要 save。"""
+    try:
+        reg = SETTINGS.get("plugins", {}).get("registry")
+        return reg if isinstance(reg, dict) else {}
+    except (NameError, AttributeError):
+        return {}
+
+
+def plugin_secrets(pid):
+    """某插件的私有密钥字典。按 id 命名空间隔离：插件读不到别人的 key。"""
+    try:
+        sec = SETTINGS.get("plugins", {}).get("secrets", {})
+        kv = sec.get(pid)
+        return kv if isinstance(kv, dict) else {}
+    except (NameError, AttributeError):
+        return {}
+
+
+
 # ========== 配置 schema ==========
 # 分层结构。每层都有归一化函数，任何非法值都夹回合法范围而不是让前端崩。
 TYPO_RANGES = {
@@ -2387,6 +2528,14 @@ DEFAULT_SETTINGS = {
         "maxOutputChars": 8000,
         "protocol": "auto",
         "showSteps": True,
+    },
+    # 插件体系。三个子键都必须在 normalize_settings 里显式保留 ——
+    # normalize_settings 是白名单式（未列出的键一律丢弃），漏一个就会
+    # 在每次启动 / 每次前端保存设置时**静默清空**用户数据。
+    "plugins": {
+        "enabled": True,     # 总开关：关掉则不加载任何插件（回退路径）
+        "registry": {},      # {id: {version, enabled, source, sha256, installedAt, lastError}}
+        "secrets": {},       # {id: {key: value}}，按插件命名空间隔离
     },
 }
 
@@ -2480,11 +2629,23 @@ def normalize_settings(raw):
 
     out["reasoning"] = normalize_reasoning(src.get("reasoning"))
     out["agent"] = normalize_agent(src.get("agent"))
+    out["plugins"] = normalize_plugins(src.get("plugins"))
     return out
 
 
-def deep_merge_settings(base, patch):
-    """局部 patch 合并进完整设置。只接受 schema 里存在的键，其余丢弃。"""
+def deep_merge_settings(base, patch, trust_plugins=False):
+    """局部 patch 合并进完整设置。只接受 schema 里存在的键，其余丢弃。
+
+    trust_plugins —— plugins 段的 registry/secrets 要不要当权威数据全盘接收。
+      · False（默认，HTTP patch 路径）：前端拿到的是**脱敏后**的配置
+        （secrets 值全是 "<set>" 占位符，registry 里的 lastError 等也可能被裁剪），
+        原样回写会污染真数据，所以只放行 enabled 开关与 secrets 的逐键真实值。
+      · True（load_settings 路径）：磁盘上的 .config.json 是唯一权威源，
+        registry 必须原样读进来 —— 否则冷启动时 plugin_boot_async 看到空台账，
+        报「无已启用插件」，用户装的插件永远起不来。
+        （这个区分是 P1-7 真机实测逼出来的：只按 False 一种语义处理，
+         启动路径的 registry 会被整个丢掉。）
+    """
     if not isinstance(patch, dict):
         return base
     out = json.loads(json.dumps(base))
@@ -2499,6 +2660,39 @@ def deep_merge_settings(base, patch):
                     continue
                 if isinstance(v, bool):
                     out[section][k] = v
+            continue
+        if section == "plugins":
+            # plugins 段不能走下面的「整段替换」通用分支：registry / secrets 是
+            # 用户数据，前端改任何无关开关（主题、超时…）都会 POST /settings，
+            # 整段覆盖会让插件台账与密钥当场蒸发。
+            cur = out.setdefault("plugins", normalize_plugins(None))
+            if isinstance(val.get("enabled"), bool):
+                cur["enabled"] = val["enabled"]
+            if trust_plugins:
+                # 启动路径：磁盘是权威源，整段交给 normalize_plugins 清洗后收下。
+                # 它只过滤非法 id，不会回落默认值（回落就是清空）。
+                out["plugins"] = normalize_plugins(val)
+                continue
+            patch_sec = val.get("secrets")
+            if isinstance(patch_sec, dict):
+                live = cur.setdefault("secrets", {})
+                for pid, kv in patch_sec.items():
+                    if not isinstance(pid, str) or not PLUGIN_ID_RE.match(pid):
+                        continue
+                    if not isinstance(kv, dict):
+                        continue
+                    dst = live.setdefault(pid, {})
+                    for k, v in kv.items():
+                        if not isinstance(k, str):
+                            continue
+                        # 占位符 = 「前端没改这个值」，保持原样，绝不写入
+                        if isinstance(v, str) and v == PLUGIN_SECRET_MASK:
+                            continue
+                        # 空串表示「清掉这个密钥」（面板上的删除操作）
+                        if isinstance(v, str) and not v.strip():
+                            dst.pop(k, None)
+                            continue
+                        dst[k] = v
             continue
         if section == "appearance" and isinstance(val.get("messageTypography"), dict):
             cur = out["appearance"].get("messageTypography", {})
@@ -2558,7 +2752,11 @@ def load_settings():
     migrated = migrate_legacy_cfg(raw)
     if migrated.get("_legacy_extra"):
         print(f"  迁移提示: 保留了 {len(migrated['_legacy_extra'])} 个旧版未知配置键")
-    s = normalize_settings(deep_merge_settings(DEFAULT_SETTINGS, migrated))
+    # trust_plugins=True：磁盘上的 .config.json 是插件台账的唯一权威源。
+    # 走默认的 False 会让 registry 在这里被丢掉，冷启动时 plugin_boot_async
+    # 读到空台账 → 报「无已启用插件」→ 用户装的插件永远起不来。
+    s = normalize_settings(
+        deep_merge_settings(DEFAULT_SETTINGS, migrated, trust_plugins=True))
     # 工具/技能默认值：schema 里没写的按默认启用
     for tid in TOOLS:
         s["tools"].setdefault(tid, True)
@@ -3153,6 +3351,2548 @@ def missing_required(name, args_dict):
     return out
 
 
+# ========== 插件体系（对齐桌面端 Cyrene Plugin API v1）==========
+#
+# 契约基准：Playa-Cyrene/Cyrene-Agent · packages/plugin-sdk/src/api.ts
+# 市场仓库：Playa-Cyrene/Cyrene-Plugins（registry.json + plugins/<id>/ + zips/）
+#
+# 桌面端插件是 Node 的 index.cjs，手机端宿主是纯 Python —— 靠一个
+# **子进程桥**把 PluginContext 契约投影过去，让市场里的插件不改一行就能跑：
+#
+#   cyrene_web.py ──spawn──> node plugin_host.cjs <id>
+#        │                          │
+#        │  NDJSON over stdio       │ require("index.cjs")
+#        │  （一行一个 JSON-RPC）    │
+#        └──────────────────────────┘
+#
+# 一插件一进程：崩溃隔离（插件 throw 不带走宿主）· 独立超时 · 可单独 kill
+# 做停用 · 内存可单独回收。代价是每插件 ~30-50MB Node 常驻，故默认不自动启用。
+#
+# 协议方向（详见 plugin_host.cjs 头部注释）：
+#   Python → Node：plugin.register / tool.execute / prompt.provide /
+#                  plugin.dispose / host.event / host.ping
+#   Node → Python：storage.* / secrets.* / llm.* / conversations.* /
+#                  events.emit / log
+#
+# ⚠ stdout 是协议通道，只准出现 JSON 行。插件的 console.* 已在 plugin_host.cjs
+#   里改道到 stderr，Python 侧读 stderr 转宿主日志。
+PLUGINS_DIR      = BASE_DIR / "plugins"
+PLUGIN_HOST_JS   = RUNTIME_DIR / "plugin_host.cjs"
+PLUGIN_LOCAL_DB  = PLUGINS_DIR / "registry.local.json"   # 本地安装台账（P3 持久化）
+
+PLUGIN_API_VERSION = 1        # 桌面端 CURRENT_PLUGIN_API_VERSION
+PLUGIN_READY_TIMEOUT = 20.0   # 等 host.ready 的上限（node 冷启动 + require 插件）
+PLUGIN_REGISTER_TIMEOUT = 30.0
+PLUGIN_DISPOSE_TIMEOUT = 10.0
+PLUGIN_PING_TIMEOUT = 5.0
+PLUGIN_RSS_LIMIT_MB = 256     # 单插件常驻内存上限，超限 kill（P3 落地巡检）
+PLUGIN_LOG_RING = 200         # 每插件保留的日志行数（面板「查看日志」用）
+PLUGIN_LOG_BURST = 60         # 日志速率限制：窗口内最多多少行，防插件刷爆
+
+# 九种稳定错误码（对齐 SDK 的 PLUGIN_HOST_ERROR_CODES）。插件靠
+# isPluginHostError(e.code) 分支，所以**不能静默返回 undefined**——
+# 那会让插件以为调用成功，走进错误路径。
+PLUGIN_HOST_ERROR_CODES = frozenset({
+    "E_CAPABILITY_UNAVAILABLE", "E_INVALID_ARGUMENT", "E_NOT_FOUND",
+    "E_NOT_OWNER", "E_STORAGE_UNAVAILABLE", "E_SPEECH_INPUT_BUSY",
+    "E_NO_ACTIVE_INPUT_TARGET", "E_PLUGIN_STOPPING", "E_INTERNAL",
+})
+
+# 插件状态机（见计划 P1 的 stateDiagram）
+PLUGIN_STATES = ("not_installed", "installed", "starting", "running",
+                 "stopping", "failed", "crashed", "unsupported")
+
+# node 可执行文件。Termux 装在 $PREFIX/bin/node；桌面调试时可能在 PATH 里。
+PLUGIN_NODE_CANDIDATES = (
+    "/data/data/com.termux/files/usr/bin/node",
+    "node",
+)
+
+# ---------- 导入（P6）：inbox 目录与体积上限 ----------
+#
+# inbox 是「离线导入」通道：用户用 adb push 或 Termux 手动把 ZIP 放进来，
+# 面板点「扫描 inbox」就能装。手机上不方便走浏览器上传时的兜底。
+PLUGIN_INBOX_DIR = BASE_DIR / "plugins_inbox"
+
+# 三道上限，缺一不可（都是防「一个恶意/损坏的包把手机撑爆」）：
+#   · ZIP_MAX_MB     —— 压缩包本身。浏览器上传走 base64，体积会涨 4/3，
+#                       所以真正卡的是 base64 字符串长度（见 _handle_plugin_import）。
+#   · UNPACK_MAX_MB  —— 解压后总字节。**边解边算**，超限立刻中止，
+#                       不能等解完再看（那时磁盘已经写满了）。zip bomb 就是冲这道来的。
+#   · ZIP_MAX_FILES  —— 成员数。几万个小文件一样能把 inode 和复制时间打爆。
+# 市场里最大的 minecraft-bot 是 9.1 MB（含 node_modules），32 MB 留足余量。
+PLUGIN_ZIP_MAX_MB = 32
+PLUGIN_UNPACK_MAX_MB = 128
+PLUGIN_ZIP_MAX_FILES = 4000
+
+# 静态高危扫描的模式。原设计要求「黄标提示、不阻断」——插件与宿主同权限
+# （桌面端 README 已明示「审核不构成担保」），扫出来只是让用户装之前看得见。
+PLUGIN_RISKY_PATTERNS = (
+    ("child_process", "可执行任意系统命令"),
+    ("process.binding", "可绕过 JS 层直接摸 node 内部绑定"),
+    ("eval(", "动态执行任意代码"),
+    ("new Function(", "动态执行任意代码"),
+    ("fs.unlink", "可删除文件"),
+    ("fs.rm", "可删除文件"),
+    ("require('fs')", "可读写宿主文件系统"),
+    ('require("fs")', "可读写宿主文件系统"),
+)
+
+# ---------- 插件市场（P5）：双源回退 ----------
+#
+# 主源 Gitee（国内快，registry.json 里的 zip 直链本来就全指向它），
+# 回退 GitHub（Gitee 挂了或不同步时）。两个都是 raw 文件直出，无 API 鉴权。
+# 所有请求必须走 _net_open（只放行 http/https，防 SSRF）。
+PLUGIN_MARKET_SOURCES = (
+    ("gitee", "https://gitee.com/playa0/cyrene-plugins/raw/main/"),
+    ("github", "https://raw.githubusercontent.com/Playa-Cyrene/Cyrene-Plugins/main/"),
+)
+PLUGIN_MARKET_TTL = 300         # registry.json 缓存 5 分钟；?refresh=1 可强制刷新
+PLUGIN_MARKET_TIMEOUT = 25.0    # 单次拉取超时（秒）
+PLUGIN_MARKET_MAX_BYTES = 8 * 1024 * 1024   # registry.json / 详情文件的读取上限
+
+# 插件包解包的临时根。**必须放 BASE_DIR（= ~/cyrene）下**：
+# Termux 上 /tmp 不可写、$PREFIX/tmp 的 SELinux 标签与 home/ 不同也会 Permission denied
+# （第二十四节实踩过的两个坑），~/cyrene 是反复验证过可写的。
+PLUGIN_TMP_ROOT = BASE_DIR / "_plugin_tmp"
+
+# ---------- 导入/安装进度（P5 与 P6 共用） ----------
+# 大 ZIP（minecraft-bot 9.1 MB）下载 + 解包可能几十秒，前端要进度条。
+# 纯内存表，不持久化：进度只在一次安装过程里有意义，重启丢了无所谓。
+PLUGIN_PROGRESS = {}
+PLUGIN_PROGRESS_LOCK = threading.Lock()
+
+PROGRESS_STAGES = ("downloading", "verifying", "unpacking", "installing",
+                   "done", "failed")
+
+
+def _progress_set(key, stage, done=0, total=0, message="", info=None):
+    with PLUGIN_PROGRESS_LOCK:
+        rec = PLUGIN_PROGRESS.get(str(key))
+        prev_info = (rec or {}).get("info")
+        PLUGIN_PROGRESS[str(key)] = {
+            "key": str(key), "stage": stage,
+            "done": int(done), "total": int(total),
+            "message": str(message or ""), "at": time.time(),
+            # info 只在终态（done/failed）写一次，中间阶段传 None 时**保留**
+            # 上一次的值 —— 覆盖成 None 会把安装结果丢掉，前端轮询到的就是空。
+            "info": info if info is not None else prev_info,
+        }
+
+
+def _progress_get(key):
+    with PLUGIN_PROGRESS_LOCK:
+        p = dict(PLUGIN_PROGRESS.get(str(key)) or {})
+    if not p:
+        return {"key": str(key), "stage": "unknown", "done": 0, "total": 0,
+                "message": "没有这个安装任务（未开始、已结束并清理、或 key 写错了）",
+                "at": 0, "info": None}
+    return p
+
+
+def _progress_clear(key):
+    with PLUGIN_PROGRESS_LOCK:
+        PLUGIN_PROGRESS.pop(str(key), None)
+
+
+def _zip_member_is_symlink(info):
+    """ZIP 成员的 external_attr 高 16 位存 unix mode，判 S_IFLNK。
+
+    为什么必须显式拒软链：zipfile 默认会把软链成员**当成普通文件**写出来，
+    内容就是目标路径字符串，看起来无害。但随后的 install_from_dir →
+    _copy_tree_safe 会 rglob 遍历，如果哪一步用了跟随软链的复制，
+    一个指向 /data/data/com.termux/files/home 的软链就等于把宿主家目录
+    整个抄进插件目录。在解包这一层就掐掉，不给下游留判断负担。
+    """
+    mode = (getattr(info, "external_attr", 0) >> 16) & 0xFFFF
+    return bool(mode) and stat.S_ISLNK(mode)
+
+
+def _zip_safe_relpath(name):
+    """把 ZIP 成员名归一化成安全相对路径；不安全返回 None。
+
+    拒的形状（每一类都是真实攻击面，不是理论洁癖）：
+      · 绝对路径 "/etc/passwd"、盘符 "C:/x"
+      · 任何一段是 ".."（ZIP Slip 本体）
+      · 反斜杠（Windows 分隔符，posixpath 归一化不掉，混着来最阴）
+      · 空名 / 纯分隔符 / 含空段（"a//b"）
+    目录条目（"a/b/"）返回去尾斜杠的 "a/b"，由调用方决定 mkdir。
+    """
+    if not isinstance(name, str) or not name:
+        return None
+    n = name.replace("\\", "/")
+    if n.startswith("/") or (len(n) > 1 and n[1] == ":"):
+        return None
+    parts = n.split("/")
+    while parts and parts[-1] == "":     # 目录条目的尾斜杠
+        parts.pop()
+    if not parts:
+        return None
+    for p in parts:
+        if p in ("", ".", ".."):
+            return None
+    return "/".join(parts)
+
+
+class PluginHostError(Exception):
+    """插件桥接层错误。code 取 PLUGIN_HOST_ERROR_CODES 之一。
+
+    与 Node 侧 plugin_host.cjs 的 hostError() 对应：跨进程传错误时，
+    code 走 JSON 的 error.code 字段，两边各自还原成带 code 的异常对象。
+    """
+
+    def __init__(self, code, message=""):
+        self.code = code if code in PLUGIN_HOST_ERROR_CODES else "E_INTERNAL"
+        super().__init__(message or self.code)
+
+
+def find_node_binary():
+    """定位 node 可执行文件。找不到返回 None（插件整体降级为 unsupported）。
+
+    每次现查而不缓存：P1-2 刚装上 node，若在安装前就 import 了本模块，
+    缓存住 None 会导致装完仍认为不可用，必须重启服务才行。
+    """
+    for cand in PLUGIN_NODE_CANDIDATES:
+        if os.path.sep in cand or "/" in cand:
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+        else:
+            found = shutil.which(cand)
+            if found:
+                return found
+    return None
+
+
+class BridgeClient:
+    """一个插件的 Node 子进程 + NDJSON 双向 RPC 通道。
+
+    线程模型（关键，改之前先读完）：
+      - reader 线程：常驻读 stdout。收到**响应**按 id 配对唤醒等待者；
+        收到 Node 发来的**请求**（storage.get 等）必须丢给工作线程处理，
+        绝不能在 reader 线程里同步做 —— 因为插件可能在 tool.execute 的
+        处理过程中回头调 storage.get，形成嵌套；reader 一旦被慢操作占住，
+        整条协议流就死了（表现为所有请求超时）。
+      - stderr 线程：常驻读 stderr 转宿主日志，带速率限制。
+        不读就会填满管道缓冲区，把 node 阻塞死。
+      - 调用方线程：call() 发请求后用 Condition 等响应，带超时。
+
+    写 stdin 必须持 _send_lock：多个 HTTP 线程可能同时调工具，
+    JSON 行交错会让 Node 侧 readline 收到半行，解析失败。
+    """
+
+    def __init__(self, plugin_id, plugin_dir, manifest, node_bin=None):
+        if not PLUGIN_ID_RE.match(plugin_id or ""):
+            raise PluginHostError("E_INVALID_ARGUMENT", f"非法插件 id: {plugin_id!r}")
+        self.plugin_id = plugin_id
+        self.plugin_dir = Path(plugin_dir)
+        self.manifest = manifest if isinstance(manifest, dict) else {}
+        self.node_bin = node_bin or find_node_binary()
+
+        self.proc = None
+        self.pid = None
+        self.ready = False
+        self.dead = False
+        self.dead_reason = ""
+        self.node_version = ""
+        self.started_at = 0.0
+
+        self._next_id = 1
+        self._pending = {}                 # id -> {"ev": Event, "msg": None}
+        self._pending_lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        self._log_lock = threading.Lock()
+        self._logs = []                    # 环形日志（面板用）
+        self._log_window = []              # 速率限制窗口的时间戳
+        self._reader = None
+        self._errreader = None
+        self._work_pool = None             # 处理 Node 入站请求的线程池
+        # 入站请求的服务实现由 PluginManager 注入（它才拿得到 SETTINGS / LLMClient）
+        self.host_services = {}
+
+    # ---------- 日志 ----------
+
+    def log(self, line):
+        """收一行插件日志。带速率限制：插件狂打日志不能拖垮宿主。"""
+        now = time.time()
+        with self._log_lock:
+            # 滑动窗口限流
+            self._log_window = [t for t in self._log_window if now - t < 1.0]
+            if len(self._log_window) >= PLUGIN_LOG_BURST:
+                # 已经在这个窗口里丢过行了就不重复记
+                if not self._logs or not self._logs[-1].endswith("(日志过多，已限流)"):
+                    self._logs.append(f"[{self.plugin_id}] …(日志过多，已限流)")
+                    if len(self._logs) > PLUGIN_LOG_RING:
+                        del self._logs[0]
+                return
+            self._log_window.append(now)
+            self._logs.append(f"[{self.plugin_id}] {line}")
+            if len(self._logs) > PLUGIN_LOG_RING:
+                del self._logs[0]
+
+    def get_logs(self, limit=80):
+        with self._log_lock:
+            return list(self._logs)[-limit:]
+
+    # ---------- 进程生命周期 ----------
+
+    def start(self, storage_snapshot=None):
+        """起 node 子进程 → 等 host.ready → 跑 plugin.register。
+
+        返回 register 的结果 dict（含 tools / promptProviders / warnings）。
+        失败抛 PluginHostError，调用方负责把插件落到 failed 态。
+        """
+        if not self.node_bin:
+            raise PluginHostError(
+                "E_CAPABILITY_UNAVAILABLE",
+                "找不到 node 可执行文件（Termux 需 pkg install nodejs）")
+        if not PLUGIN_HOST_JS.is_file():
+            raise PluginHostError(
+                "E_NOT_FOUND", f"缺少插件宿主壳: {PLUGIN_HOST_JS}")
+        entry = self.manifest.get("entry")
+        if not entry or not (self.plugin_dir / entry).is_file():
+            raise PluginHostError(
+                "E_NOT_FOUND", f"插件入口不存在: {self.plugin_dir / str(entry)}")
+
+        popen_kw = {}
+        if os.name == "posix":
+            # 自成进程组：kill 时能连插件可能 fork 的孙进程一起清掉，
+            # 否则 node 死了但它 spawn 的东西变孤儿（termux-api 那套已踩过这坑）
+            popen_kw["start_new_session"] = True
+
+        try:
+            self.proc = subprocess.Popen(
+                [self.node_bin, str(PLUGIN_HOST_JS), self.plugin_id],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, cwd=str(self.plugin_dir),
+                encoding="utf-8", errors="replace", bufsize=1, **popen_kw)
+        except OSError as e:
+            raise PluginHostError("E_INTERNAL", f"启动 node 失败: {e}")
+
+        self.pid = self.proc.pid
+        self.started_at = time.time()
+
+        # 入站请求的工作池：并发度 4 够了（storage/secrets 都是快操作，
+        # llm.generateText 慢但不会同时来很多）。队列不设上限会让内存失控，
+        # 但设太小又会在插件密集回调时抛 RejectedExecution —— 折中给 64。
+        self._work_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix=f"plg-{self.plugin_id}")
+
+        self._reader = threading.Thread(
+            target=self._read_stdout, name=f"plg-out-{self.plugin_id}", daemon=True)
+        self._errreader = threading.Thread(
+            target=self._read_stderr, name=f"plg-err-{self.plugin_id}", daemon=True)
+        self._reader.start()
+        self._errreader.start()
+
+        self._wait_ready(PLUGIN_READY_TIMEOUT)
+        return self.register(storage_snapshot or {})
+
+    def _wait_ready(self, timeout):
+        """等 plugin_host.cjs 发来的 host.ready 通知。
+
+        不等就绪信号就直接发 register 会撞竞态：node 进程 fork 出来了但
+        JS 还没跑到 readline 那一行，此时写入的请求会躺在管道缓冲里，
+        看起来「没响应」，实际只是还没开始读。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.dead:
+                raise PluginHostError(
+                    "E_INTERNAL", f"插件进程启动即退出: {self.dead_reason}")
+            if self.ready:
+                return
+            if self.proc is not None and self.proc.poll() is not None:
+                raise PluginHostError(
+                    "E_INTERNAL",
+                    f"插件进程退出码 {self.proc.returncode}（未见 host.ready）: "
+                    f"{self.dead_reason or '无 stderr 输出'}")
+            time.sleep(0.02)
+        raise PluginHostError("E_INTERNAL", f"等待 host.ready 超时 {timeout}s")
+
+    def register(self, storage_snapshot):
+        """跑插件的 register(ctx)，拿回它注册的工具与提示词 provider 清单。"""
+        storage_root = self.plugin_dir / "data"
+        try:
+            res = self.call("plugin.register", {
+                "manifest": self.manifest,
+                "pluginDir": str(self.plugin_dir),
+                "storageRoot": str(storage_root),
+                # storage 快照：PluginStorage.get 是**同步**契约，但 Python 在
+                # 进程外只能异步。解法是 register 时把整个 kv 一次性灌给 Node，
+                # 之后 get 读本地缓存、set 异步回写。契约语义得以保持。
+                "storageSnapshot": storage_snapshot,
+            }, timeout=PLUGIN_REGISTER_TIMEOUT)
+        except PluginHostError:
+            raise
+        except Exception as e:
+            raise PluginHostError("E_INTERNAL", f"register 失败: {type(e).__name__}: {e}")
+        if not isinstance(res, dict) or not res.get("ok"):
+            raise PluginHostError("E_INTERNAL", f"register 返回异常: {res!r}")
+        return res
+
+    def kill(self):
+        """硬杀进程组。用于崩溃回收与 dispose 失败后的兜底。"""
+        p = self.proc
+        if p is None:
+            return
+        try:
+            if os.name == "posix":
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except Exception:
+                    p.kill()
+            else:
+                p.kill()
+        except Exception:
+            pass
+        try:
+            p.wait(timeout=5)
+        except Exception:
+            pass
+
+    def dispose(self):
+        """优雅停止：先让 Node 跑 dispose（onDispose 逆序 + unregister），再关管道。
+
+        dispose 失败不等于停止失败 —— 插件可能已经崩了，但宿主必须把自己的
+        资源收干净，所以无论如何最后都 kill + 标记 dead。
+        """
+        errors = []
+        if self.proc is not None and self.proc.poll() is None and not self.dead:
+            try:
+                res = self.call("plugin.dispose", {}, timeout=PLUGIN_DISPOSE_TIMEOUT)
+                if isinstance(res, dict) and res.get("errors"):
+                    errors = list(res["errors"])
+            except Exception as e:
+                errors.append(f"dispose 调用失败: {type(e).__name__}: {e}")
+        self._shutdown()
+        return errors
+
+    def _shutdown(self):
+        """关管道 + 杀进程 + 唤醒所有等待者（否则它们会干等到超时）。"""
+        self.dead = True
+        p = self.proc
+        if p is not None:
+            for stream in (p.stdin, p.stdout, p.stderr):
+                try:
+                    if stream:
+                        stream.close()
+                except Exception:
+                    pass
+        self.kill()
+        pool = self._work_pool
+        if pool is not None:
+            try:
+                pool.shutdown(wait=False)
+            except Exception:
+                pass
+            self._work_pool = None
+        # 把所有在途请求全部失败掉。不这么做的话，正在等响应的 HTTP 线程
+        # 会一直等到自己的 timeout，表现为「停用插件后界面卡几十秒」。
+        with self._pending_lock:
+            for slot in self._pending.values():
+                slot["msg"] = {"error": {"code": "E_PLUGIN_STOPPING",
+                                         "message": "插件已停止"}}
+                slot["ev"].set()
+            self._pending.clear()
+
+    def send_event(self, event, payload):
+        """投递宿主事件（host:turn:finished 等）。单向，不等响应，失败静默。"""
+        if self.dead or not self.ready:
+            return
+        try:
+            self.notify("host.event", {"event": event, "payload": payload})
+        except Exception:
+            pass
+
+    # ---------- RPC ----------
+
+    def _send(self, obj):
+        """写一行 JSON 到 stdin。必须持锁：并发写会让行交错，Node 侧解析炸。"""
+        p = self.proc
+        if p is None or p.stdin is None or self.dead:
+            raise PluginHostError("E_PLUGIN_STOPPING", "插件进程未运行")
+        line = json.dumps(obj, ensure_ascii=False) + "\n"
+        with self._send_lock:
+            try:
+                p.stdin.write(line)
+                p.stdin.flush()
+            except (OSError, ValueError) as e:
+                self.dead = True
+                self.dead_reason = f"写入管道失败: {e}"
+                raise PluginHostError("E_PLUGIN_STOPPING", self.dead_reason)
+
+    def call(self, method, params=None, timeout=30.0):
+        """发请求并等响应。返回 result，error 分支抛 PluginHostError。"""
+        if self.dead:
+            raise PluginHostError("E_PLUGIN_STOPPING",
+                                  f"插件已停止（{self.dead_reason or '未知原因'}）")
+        with self._pending_lock:
+            rid = self._next_id
+            self._next_id += 1
+            slot = {"ev": threading.Event(), "msg": None}
+            self._pending[rid] = slot
+        try:
+            self._send({"jsonrpc": "2.0", "id": rid, "method": method,
+                        "params": params if isinstance(params, dict) else {}})
+        except PluginHostError:
+            with self._pending_lock:
+                self._pending.pop(rid, None)
+            raise
+
+        if not slot["ev"].wait(timeout):
+            with self._pending_lock:
+                self._pending.pop(rid, None)
+            raise PluginHostError(
+                "E_INTERNAL", f"{method} 超时 {timeout:.0f}s（插件可能挂死）")
+
+        msg = slot["msg"] or {}
+        with self._pending_lock:
+            self._pending.pop(rid, None)
+        if "error" in msg and msg["error"]:
+            err = msg["error"]
+            raise PluginHostError(err.get("code") or "E_INTERNAL",
+                                  err.get("message") or "(无错误信息)")
+        return msg.get("result")
+
+    def notify(self, method, params=None):
+        """单向通知（无 id，不等响应）。"""
+        self._send({"jsonrpc": "2.0", "method": method,
+                    "params": params if isinstance(params, dict) else {}})
+
+    # ---------- reader 线程 ----------
+
+    def _read_stdout(self):
+        """常驻读协议流。这个线程一旦退出，插件就等于失联。"""
+        p = self.proc
+        if p is None or p.stdout is None:
+            return
+        while True:
+            try:
+                line = p.stdout.readline()
+            except (OSError, ValueError):
+                break
+            if not line:
+                break                      # EOF：进程退了或管道被关
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                # 协议被污染。plugin_host.cjs 已把 console.* 改道 stderr，
+                # 走到这里说明有东西绕过改道直接写了 stdout（比如插件用了
+                # process.stdout.write）。记日志但**不能崩**：一行坏数据
+                # 不该让整个插件失联。
+                self.log(f"⚠ 协议流出现非 JSON 行（已忽略）: {line[:200]}")
+                continue
+            self._dispatch(msg)
+
+        # 走到这里 = 协议流断了
+        rc = p.poll()
+        self.dead = True
+        if not self.dead_reason:
+            self.dead_reason = f"协议流 EOF（进程退出码 {rc}）"
+        self._fail_all_pending(self.dead_reason)
+
+    def _read_stderr(self):
+        """常驻读 stderr 转宿主日志。不读会填满管道把 node 阻塞死。"""
+        p = self.proc
+        if p is None or p.stderr is None:
+            return
+        while True:
+            try:
+                line = p.stderr.readline()
+            except (OSError, ValueError):
+                break
+            if not line:
+                break
+            line = line.rstrip()
+            if line:
+                self.log(line)
+
+    def _fail_all_pending(self, reason):
+        """进程死了，把所有在途请求立即失败掉，别让调用方干等到超时。"""
+        with self._pending_lock:
+            slots = list(self._pending.values())
+            self._pending.clear()
+        for slot in slots:
+            slot["msg"] = {"error": {"code": "E_PLUGIN_STOPPING", "message": reason}}
+            slot["ev"].set()
+
+    def _dispatch(self, msg):
+        """分流一条协议消息：响应 → 唤醒等待者；请求 → 丢工作线程处理。"""
+        method = msg.get("method")
+        mid = msg.get("id")
+
+        if method is None:
+            # 响应
+            if mid is None:
+                # id=null 的错误 = plugin_host.cjs 启动期致命错误（fail()）
+                err = msg.get("error") or {}
+                self.dead = True
+                self.dead_reason = (f"{err.get('code') or 'E_INTERNAL'}: "
+                                    f"{err.get('message') or '未知启动错误'}")
+                self._fail_all_pending(self.dead_reason)
+                return
+            with self._pending_lock:
+                slot = self._pending.get(mid)
+            if slot is not None:
+                slot["msg"] = msg
+                slot["ev"].set()
+            return
+
+        # 请求或通知。host.ready 是通知（无 id），其余是 Node 发来的宿主服务调用。
+        if method == "host.ready":
+            params = msg.get("params") or {}
+            self.node_version = str(params.get("node") or "")
+            self.ready = True
+            self.log(f"host.ready node={self.node_version} pid={params.get('pid')}")
+            return
+
+        if mid is None:
+            # 通知（log 等），不需要应答，直接就地处理（都是快操作）
+            self._serve(method, msg.get("params") or {}, None)
+            return
+
+        # 需要应答的请求：必须丢工作线程。在 reader 线程里同步做会造成
+        # 嵌套死锁 —— 插件在 tool.execute 处理中回调 storage.get，
+        # 而 reader 正被 tool.execute 的响应链占着。
+        pool = self._work_pool
+        if pool is None:
+            self._reply_error(mid, "E_PLUGIN_STOPPING", "插件正在停止")
+            return
+        try:
+            pool.submit(self._serve, method, msg.get("params") or {}, mid)
+        except RuntimeError:
+            self._reply_error(mid, "E_PLUGIN_STOPPING", "插件正在停止")
+
+    def _reply(self, mid, result):
+        try:
+            self._send({"jsonrpc": "2.0", "id": mid, "result": result})
+        except Exception as e:
+            self.log(f"⚠ 回应答失败 id={mid}: {e}")
+
+    def _reply_error(self, mid, code, message):
+        try:
+            self._send({"jsonrpc": "2.0", "id": mid,
+                        "error": {"code": code, "message": message}})
+        except Exception:
+            pass
+
+    def _serve(self, method, params, mid):
+        """处理 Node 发来的宿主服务请求。mid=None 表示通知（无需应答）。
+
+        ⚠ 任何未实现的 method 都必须**回错误**，绝不能不回 ——
+        不回的话 Node 侧那个 Promise 会一直挂着直到超时，插件表现为
+        「莫名卡死」，极难排查。
+        """
+        try:
+            fn = self.host_services.get(method)
+            if fn is None:
+                if mid is not None:
+                    self._reply_error(
+                        mid, "E_CAPABILITY_UNAVAILABLE",
+                        f"宿主未实现服务: {method}")
+                return
+            result = fn(params)
+            if mid is not None:
+                self._reply(mid, result)
+        except PluginHostError as e:
+            if mid is not None:
+                self._reply_error(mid, e.code, str(e))
+        except Exception as e:
+            self.log(f"⚠ 服务 {method} 异常: {type(e).__name__}: {e}")
+            if mid is not None:
+                self._reply_error(mid, "E_INTERNAL", f"{type(e).__name__}: {e}")
+
+
+# ---------- 插件存储：storage（kv.json） ----------
+
+PLUGIN_STORAGE_LOCK = threading.Lock()
+
+
+def plugin_storage_path(pid):
+    return PLUGINS_DIR / pid / "data" / "kv.json"
+
+
+def plugin_storage_load(pid):
+    """读插件的 kv 存储。文件缺失/损坏都当空 —— 插件首次启动是正常情况，
+    不能因为「没有 kv.json」就让它 register 失败。"""
+    p = plugin_storage_path(pid)
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, ValueError, OSError):
+        return {}
+
+
+def plugin_storage_write(pid, kv):
+    """原子写：先落 .tmp 再 os.replace。
+
+    直接覆盖写会让「写到一半时服务被杀」留下半截 JSON，
+    下次加载解析失败 → 数据全丢。os.replace 在同一文件系统内是原子的。
+    """
+    p = plugin_storage_path(pid)
+    with PLUGIN_STORAGE_LOCK:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(kv, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            os.replace(tmp, p)
+            return True
+        except OSError:
+            return False
+
+
+# ---------- 插件 → TOOLS 的字段映射 ----------
+
+# 桌面端 PluginTool.risk 的取值集与手机端 TOOLS[*]["risk"] 完全一致，
+# 直接透传即可，不需要映射表。readonly 则手机端独有，按 risk 推导。
+PLUGIN_READONLY_RISKS = frozenset({"safe", "fs-read"})
+
+# 桌面端 risk → 面板图标。内置工具在 TOOLS 里自带 icon，插件工具没有，
+# 补一个按风险级的默认图标，让工具面板不至于显示成 ⚙ 一片。
+PLUGIN_RISK_ICONS = {
+    "safe": "🧩", "fs-read": "🧩", "fs-write": "🧩",
+    "shell": "🧩", "network": "🧩", "input-control": "🧩",
+}
+
+
+def plugin_tool_params(input_schema):
+    """PluginTool.inputSchema → 手机端 TOOLS[*]["params"]。
+
+    两边的形状差异（这是接线的核心，改之前先看清）：
+
+      桌面端 inputSchema（标准 JSON Schema）:
+        {"type":"object",
+         "properties": {"city": {"type":"string","description":"城市名"}},
+         "required": ["city"]}              ← required 是**并列的数组**
+
+      手机端 params（tool_schema 自己那套约定）:
+        {"city": {"type":"string","desc":"城市名","required":True}}
+                                             ← required 写在**每个 param 内部**
+
+    所以要做两件事：
+      1. required 数组回写进各 param 的 required 标记 —— tool_schema 靠
+         spec.get("required") 抽 required 列表，missing_required() 也靠它拦
+         「模型漏传必填参数」。不回写的话必填约束就整个丢了。
+      2. description → desc —— tool_schema 里 `if spec.get("desc")` 才会写回
+         description。插件用的是标准 JSON Schema 的 description，直接留着也行
+         （_NON_SCHEMA_KEYS 不剥它），但统一成 desc 更符合本文件的既有约定，
+         也避免「插件写了 description、内置工具写 desc」两套并存。
+    """
+    props = input_schema.get("properties") if isinstance(input_schema, dict) else None
+    props = props if isinstance(props, dict) else {}
+    req = input_schema.get("required") if isinstance(input_schema, dict) else None
+    req_set = {r for r in req if isinstance(r, str)} if isinstance(req, list) else set()
+
+    out = {}
+    for pname, spec in props.items():
+        if not isinstance(pname, str) or not pname:
+            continue
+        if not isinstance(spec, dict):
+            spec = {}
+        p = dict(spec)
+        # description → desc（保留原 description 也无害，tool_schema 会剥 desc）
+        if "desc" not in p and isinstance(p.get("description"), str):
+            p["desc"] = p["description"]
+        p["required"] = pname in req_set
+        out[pname] = p
+    return out
+
+
+def plugin_tool_to_spec(plugin_id, tool):
+    """一个 PluginTool 投影 → 手机端 TOOLS 条目。"""
+    tid = tool.get("id")
+    name = tool.get("name") or tid
+    desc = tool.get("description") or ""
+    risk = tool.get("risk") or "safe"
+    if risk not in PLUGIN_RISK_ICONS:
+        risk = "safe"
+
+    # desc 是模型唯一能看到的工具说明（见 tool_schema），所以要把显示名拼进去。
+    # 桌面端 name 与 description 是分开的两个字段，手机端只有一个 desc。
+    full_desc = f"{name}：{desc}" if name and desc and name != desc else (desc or name or tid)
+
+    return {
+        "desc": full_desc,
+        "icon": PLUGIN_RISK_ICONS.get(risk, "🧩"),
+        "readonly": risk in PLUGIN_READONLY_RISKS,
+        "risk": risk,
+        "params": plugin_tool_params(tool.get("inputSchema") or {}),
+        # handler 用 "plugin:<pid>:<tid>" 前缀标记。run_tool 看到这个前缀
+        # 就走桥接分支，而不是去 TOOL_HANDLERS 里找本地函数。
+        # 用字符串前缀而不是往 TOOL_HANDLERS 塞闭包，是为了保持 TOOLS
+        # 「纯数据、可 JSON 序列化、可被验证脚本静态检查」这个既有约定。
+        "handler": f"plugin:{plugin_id}:{tid}",
+        "plugin": plugin_id,
+        # modes 是手机端此前没有的字段（内置工具全模式可用）。
+        # 缺省 None = 全模式；有值时 build_system_prompt 按模式过滤。
+        "modes": tool.get("modes") if isinstance(tool.get("modes"), list) else None,
+        "needs_ctx": True,     # 插件工具要收 PluginToolContext（userQuery/mode/sid）
+        "effectKind": tool.get("effectKind") or "unknown",
+        "plugin_tool_name": name,
+    }
+
+
+# ---------- PluginManager ----------
+
+class PluginManager:
+    """插件生命周期管理：安装 / 启用 / 停用 / 卸载 / 状态查询。
+
+    与 BridgeClient 的分工：
+      BridgeClient = 一个插件的进程与协议通道（技术层）
+      PluginManager = 谁该起、谁该停、状态怎么落盘、工具怎么进出 TOOLS（业务层）
+
+    锁策略：只有一把 _lock，且**绝不在持锁期间做阻塞 IO**。
+    start/stop 里起进程、等 register 都是秒级操作，持锁会把 HTTP 线程全堵死
+    （这个坑 v7 的全局锁踩过，见文件头注释）。所以：
+      - 持锁只做字典读写与 TOOLS 增删
+      - 起进程/发 register 在锁外做，成功后再持锁登记
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._clients = {}        # pid -> BridgeClient
+        self._states = {}         # pid -> 状态字符串（PLUGIN_STATES 之一）
+        self._errors = {}         # pid -> 最近一次错误
+        self._manifests = {}      # pid -> manifest dict
+        self._tool_ids = {}       # pid -> [工具 id]，停用时要精确摘掉
+        self._providers = {}      # pid -> [provider dict]（P4 用）
+        self._fail_counts = {}    # pid -> 连续失败次数（熔断用，P3）
+
+    # ---------- 路径与清单 ----------
+
+    def plugin_dir(self, pid):
+        return PLUGINS_DIR / pid
+
+    def scan_installed(self):
+        """扫 plugins/ 目录，返回 {pid: manifest}。以磁盘为准，不信任台账。
+
+        台账（SETTINGS.plugins.registry）记的是「用户意图」（要不要启用），
+        磁盘记的是「事实」（装了什么）。两者不一致时以磁盘为准，
+        否则用户手删目录后台账还留着一条永远起不来的僵尸记录。
+        """
+        out = {}
+        if not PLUGINS_DIR.is_dir():
+            return out
+        for entry in sorted(PLUGINS_DIR.iterdir()):
+            try:
+                if not entry.is_dir():
+                    continue
+            except OSError:
+                continue
+            pid = entry.name
+            if not PLUGIN_ID_RE.match(pid):
+                continue
+            mf = self._read_manifest(entry)
+            if mf is not None:
+                out[pid] = mf
+        return out
+
+    def _read_manifest(self, pdir):
+        """读并校验 manifest.json。不合法返回 None（调用方决定怎么标状态）。"""
+        f = Path(pdir) / "manifest.json"
+        if not f.is_file():
+            return None
+        try:
+            mf = json.loads(f.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, ValueError, OSError):
+            return None
+        if not isinstance(mf, dict):
+            return None
+        pid = mf.get("id")
+        if not isinstance(pid, str) or not PLUGIN_ID_RE.match(pid):
+            return None
+        # manifest.id 必须与目录名一致：否则台账、密钥命名空间、路径三者会错位
+        if pid != Path(pdir).name:
+            return None
+        return mf
+
+    def check_support(self, mf):
+        """判断插件在本宿主上能不能跑。返回 (supported: bool, reason: str)。
+
+        不 supported 时面板应灰显并说明原因，**不给启用开关** ——
+        让用户点了再失败是很糟的体验。
+        """
+        api = mf.get("apiVersion")
+        if api != PLUGIN_API_VERSION:
+            return False, (f"插件要求 apiVersion={api}，本宿主只支持 "
+                           f"{PLUGIN_API_VERSION}")
+        if mf.get("entry") != "index.cjs" and not str(mf.get("entry", "")).endswith(".cjs"):
+            # 不是硬性拒绝，但值得提示：非 .cjs 入口可能是 ESM，require 会失败
+            pass
+        if not find_node_binary():
+            return False, "未找到 node 运行时（Termux 需 pkg install nodejs）"
+        if not PLUGIN_HOST_JS.is_file():
+            return False, f"缺少插件宿主壳 {PLUGIN_HOST_JS.name}"
+        return True, ""
+
+    # ---------- 状态 ----------
+
+    def state(self, pid):
+        with self._lock:
+            return self._states.get(pid, "not_installed")
+
+    def manifest(self, pid):
+        """某插件的 manifest（加锁读，读不到就现读磁盘）。
+
+        给 HTTP handler 用的公共入口。handler 直接摸 self._manifests 是**不加锁**
+        读内部字典，虽然 CPython 单键读本身原子，但与 start()/stop() 里的写
+        并发时语义不清；加个锁的成本是一次可重入判断，换来「handler 永远不
+        碰内部状态」这条干净的边界。
+        """
+        with self._lock:
+            mf = self._manifests.get(pid)
+        if isinstance(mf, dict):
+            return mf
+        return self._read_manifest(self.plugin_dir(pid))
+
+    def running_ids(self):
+        with self._lock:
+            return sorted(k for k, v in self._states.items() if v == "running")
+
+    def snapshot(self):
+        """全量状态快照，供 GET /plugins 与设置面板用。"""
+        installed = self.scan_installed()
+        reg = plugin_registry()
+        out = []
+        with self._lock:
+            for pid, mf in sorted(installed.items()):
+                supported, reason = self.check_support(mf)
+                client = self._clients.get(pid)
+                reg_e = reg.get(pid) if isinstance(reg.get(pid), dict) else {}
+                entry = {
+                    "id": pid,
+                    "name": mf.get("name") or pid,
+                    "version": str(mf.get("version") or ""),
+                    "author": str(mf.get("author") or ""),
+                    "description": str(mf.get("description") or ""),
+                    "icon": mf.get("icon") or None,
+                    "settingsPanel": mf.get("settingsPanel") or None,
+                    "deps": mf.get("deps") or [],
+                    "state": self._states.get(pid, "installed"),
+                    "enabled": bool(reg_e.get("enabled", False)),
+                    "supported": supported,
+                    "unsupportedReason": "" if supported else reason,
+                    "error": self._errors.get(pid, ""),
+                    "tools": list(self._tool_ids.get(pid, [])),
+                    "pid": client.pid if client else None,
+                    "nodeVersion": client.node_version if client else "",
+                    "startedAt": client.started_at if client else 0,
+                    # 安装时静态扫出的高危调用（pattern 名）。面板据此打黄标，
+                    # 让用户在点「启用」之前看得见这个包能干什么。
+                    "risky": list(reg_e.get("risky") or []),
+                    # 从哪装的（upload / url / inbox / market / local），以及装的时候
+                    # sha256 有没有被校验过 —— unverified 的包面板要单独提示一句。
+                    "source": str(reg_e.get("source") or ""),
+                    "installedAt": str(reg_e.get("installedAt") or ""),
+                    "verified": bool(reg_e.get("sha256")),
+                }
+                out.append(entry)
+        # 台账里有、磁盘上没有的（用户手删了目录）：报出来让用户知道
+        with self._lock:
+            for pid, entry in reg.items():
+                if pid not in installed:
+                    out.append({
+                        "id": pid, "name": pid, "version": entry.get("version", ""),
+                        "author": "", "description": "(插件目录已不存在)",
+                        "icon": None, "settingsPanel": None, "deps": [],
+                        "state": "not_installed",
+                        "enabled": bool(entry.get("enabled", False)),
+                        "supported": False,
+                        "unsupportedReason": "插件目录已被删除，台账残留",
+                        "error": entry.get("lastError", ""),
+                        "tools": [], "pid": None, "nodeVersion": "", "startedAt": 0,
+                        # 形状必须与上面那条分支一致：前端按同一套字段渲染，
+                        # 少一个就会读到 undefined，卡片上出现「undefined」字样。
+                        "risky": list(entry.get("risky") or []),
+                        "source": str(entry.get("source") or ""),
+                        "installedAt": str(entry.get("installedAt") or ""),
+                        "verified": bool(entry.get("sha256")),
+                    })
+        return out
+
+    # ---------- 安装 ----------
+
+    def install_from_dir(self, src_dir, source="local", sha256="",
+                         enable=False, allow_unverified=True):
+        """从本地目录安装插件（绕过市场，供 P1 自测与「扫描 inbox」通道用）。
+
+        返回 (ok: bool, info: dict|str)。
+
+        安全要点：
+          · 目标目录名**只能**来自校验过的 manifest.id，绝不用 src_dir 的名字
+            —— src_dir 可能叫 "../../etc" 之类，拿它拼路径就是穿越。
+          · id 必须过 PLUGIN_ID_RE（^[a-z0-9][a-z0-9._-]{0,63}$）。
+          · 复制时逐个成员校验落点必须在 plugins/<id>/ 内（防符号链接与 ../）。
+          · 已存在的同名插件先停进程再覆盖，否则会出现「磁盘是新版本、
+            内存里跑的是旧版本」的分裂状态。
+        """
+        src = Path(src_dir)
+        if not src.is_dir():
+            return False, f"源目录不存在: {src_dir}"
+
+        mf = self._read_manifest(src)
+        if mf is None:
+            # _read_manifest 会校验 id 形状与「id == 目录名」，但源目录名是任意的，
+            # 这里只需要 id 本身合法，所以单独再判一次给出准确原因。
+            raw = src / "manifest.json"
+            if not raw.is_file():
+                return False, "源目录缺少 manifest.json"
+            try:
+                probe = json.loads(raw.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, ValueError, OSError) as e:
+                return False, f"manifest.json 解析失败: {e}"
+            pid = probe.get("id") if isinstance(probe, dict) else None
+            if not isinstance(pid, str) or not PLUGIN_ID_RE.match(pid):
+                return False, (f"manifest.id 非法: {pid!r}"
+                               f"（要求小写字母数字开头，仅含 a-z 0-9 . _ -，≤64 字符）")
+            mf = probe
+            # 源目录名与 id 不一致是允许的（比如 inbox 里解压出的临时目录），
+            # 落位时统一按 id 命名。
+
+        pid = str(mf.get("id"))
+        api = mf.get("apiVersion")
+        if api != PLUGIN_API_VERSION:
+            return False, f"插件要求 apiVersion={api}，本宿主只支持 {PLUGIN_API_VERSION}"
+        entry = mf.get("entry")
+        if not isinstance(entry, str) or not entry or "/" in entry or "\\" in entry or ".." in entry:
+            return False, f"manifest.entry 必须是插件目录内的裸文件名，实际: {entry!r}"
+        if not (src / entry).is_file():
+            return False, f"入口文件不存在: {entry}"
+
+        # 覆盖安装：先停掉正在跑的旧实例
+        with self._lock:
+            old_state = self._states.get(pid)
+        if old_state in ("running", "starting", "stopping", "crashed", "failed"):
+            self.stop(pid, keep_registry=True)
+
+        dest = PLUGINS_DIR / pid
+        try:
+            PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+            dest.mkdir(parents=True, exist_ok=True)
+            copied, skipped = self._copy_tree_safe(src, dest, pid)
+        except OSError as e:
+            return False, f"复制插件文件失败: {e}"
+
+        # 装完立刻校验：manifest 与 entry 必须真的落位了
+        if not (dest / "manifest.json").is_file() or not (dest / entry).is_file():
+            return False, "复制后校验失败：manifest.json 或入口文件未落位"
+
+        self._save_registry(
+            pid,
+            version=str(mf.get("version") or ""),
+            # 对齐桌面端语义：用户插件首次安装后**默认停用**，启用需显式操作
+            enabled=bool(enable),
+            source=source,
+            sha256=sha256 if sha256 else "",
+            installedAt=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            lastError="" if allow_unverified else "未经 sha256 校验",
+        )
+        with self._lock:
+            self._states[pid] = "installed"
+            self._manifests[pid] = mf
+            self._errors.pop(pid, None)
+
+        supported, reason = self.check_support(mf)
+        # 静态高危扫描。放在 install_from_dir 里而不是各个导入通道里 ——
+        # 这里是**所有**安装路径的汇聚点（ZIP 上传 / URL / inbox / 市场 /
+        # 脚本直调 install_from_dir），放一处就全覆盖，不会漏掉某条通道。
+        # 扫的是已落位的目录：那才是真正会被 node 执行的那份。
+        try:
+            risky = self.scan_risky(dest)
+        except OSError:
+            risky = []
+        if risky:
+            # 只把 pattern 名写进台账（文件清单是「安装那一刻」给用户看的，
+            # 长期留在 .config.json 里没意义，而那文件还含 API key，别撑大它）。
+            # 台账留名字，面板重开后依然能显示黄标。
+            try:
+                self._save_registry(pid, risky=[r["pattern"] for r in risky])
+            except Exception:
+                pass            # 黄标写失败不该让一次成功的安装变成失败
+        info = {
+            "id": pid, "version": str(mf.get("version") or ""),
+            "name": mf.get("name") or pid, "files": copied, "skipped": skipped,
+            "enabled": bool(enable), "supported": supported,
+            "unsupportedReason": "" if supported else reason,
+            "verified": bool(sha256), "risky": risky,
+        }
+        if enable and supported:
+            good, res = self.start(pid)
+            info["startOk"] = bool(good)
+            info["startResult"] = res
+        return True, info
+
+    def _copy_tree_safe(self, src, dest, pid):
+        """递归复制插件目录，逐成员校验落点。返回 (copied, skipped)。
+
+        为什么不用 shutil.copytree：它的 dirs_exist_ok 在 3.8+ 才有，
+        而且对符号链接的默认行为（copytree 会跟随）在这里不安全 ——
+        插件包里放一个指向 /data/data/com.termux/files/home 的软链，
+        跟随复制就等于把宿主的家目录整个抄进插件目录。
+        这里显式跳过软链，并且每个落点都验一次是否在 dest 内。
+        """
+        src = Path(src)
+        dest = Path(dest)
+        dest_root = dest.resolve()
+        copied, skipped = 0, []
+        for item in sorted(src.rglob("*")):
+            try:
+                rel = item.relative_to(src)
+            except ValueError:
+                skipped.append(str(item))
+                continue
+            target = (dest / rel)
+            # 落点必须严格在 dest 内。rglob 不会产出 ../，但软链解析后可能
+            # 指向外面，所以 resolve 之后再比一次。
+            #
+            # ⚠ 用 is_relative_to 而不是 str.startswith：startswith 会把
+            #   "/plugins/foobar/x" 判成在 "/plugins/foo" 之内（前缀撞名），
+            #   那等于这道防线形同虚设。Python 3.9+ 有 is_relative_to，
+            #   本机 3.12 / 手机 3.14 都支持；保留 parts 兜底只为极端老版本。
+            try:
+                resolved = target.resolve()
+                if hasattr(resolved, "is_relative_to"):
+                    inside = resolved.is_relative_to(dest_root)
+                else:
+                    inside = dest_root.parts == resolved.parts[:len(dest_root.parts)]
+                if not inside:
+                    skipped.append(f"{rel}(越出插件目录)")
+                    continue
+            except OSError:
+                skipped.append(f"{rel}(路径不可解析)")
+                continue
+            if item.is_symlink():
+                skipped.append(f"{rel}(符号链接，已跳过)")
+                continue
+            if item.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if not item.is_file():
+                continue
+            # data/ 是插件运行时数据目录，安装时不该从源包带过来
+            # （覆盖安装会抹掉用户已有的 kv.json）
+            parts = rel.parts
+            if parts and parts[0] == "data":
+                skipped.append(f"{rel}(运行时数据，已跳过)")
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(item), str(target))
+            copied += 1
+        return copied, skipped
+
+    # ---------- 导入：ZIP 解包（P6 内核，三条通道共用） ----------
+
+    def scan_risky(self, pdir):
+        """静态扫插件目录里的 .cjs/.js，报告高危调用。**只提示，不阻断**。
+
+        插件与宿主同权限（node 子进程没有沙箱，桌面端 README 也明示「审核不构成
+        担保」），所以扫描的价值不是拦截，而是让用户在点「启用」之前看得见
+        这个包能干什么。返回 [{"pattern","why","files":[...]}]。
+
+        只读文件头 512 KB：插件源码通常几十 KB，读全量既慢又可能被巨型文件拖住。
+        用 os.walk 而不是 rglob：walk 能**原地剪枝** node_modules（del dirs[:]），
+        rglob 会先把几千个第三方文件全遍历出来再靠 parts 判断跳过，白跑一趟。
+        """
+        hits = {}
+        pdir = Path(pdir)
+        if not pdir.is_dir():
+            return []
+        for cur, dirs, names in os.walk(str(pdir)):
+            # 剪枝：node_modules 里是第三方代码，不算插件作者的意图，且量极大
+            dirs[:] = [d for d in dirs if d not in ("node_modules", ".git")]
+            for nm in sorted(names):
+                if not nm.lower().endswith((".cjs", ".js", ".mjs")):
+                    continue
+                f = Path(cur) / nm
+                try:
+                    with open(f, "rb") as fh:
+                        text = fh.read(512 * 1024).decode("utf-8", "replace")
+                except OSError:
+                    continue
+                try:
+                    rel = str(f.relative_to(pdir))
+                except ValueError:
+                    rel = nm
+                for pat, why in PLUGIN_RISKY_PATTERNS:
+                    if pat in text:
+                        slot = hits.setdefault(pat, {"pattern": pat, "why": why, "files": []})
+                        if len(slot["files"]) < 8:
+                            slot["files"].append(rel)
+        return [hits[p] for p, _ in PLUGIN_RISKY_PATTERNS if p in hits]
+
+    def _unpack_zip_safe(self, data, work_dir):
+        """把 ZIP 字节安全解到 work_dir。返回 (root_dir, stats) 或抛 ValueError。
+
+        root_dir 是探测出的**插件根**（含 manifest.json 的那一层）。市场 ZIP 有两种
+        常见结构：直接是 manifest.json，或者包一层 `<id>/manifest.json`。
+        不探测就会让 install_from_dir 报「源目录缺少 manifest.json」，而用户看到的
+        是一个跟真实原因无关的错误。
+
+        四道防线，缺一就有真实攻击面：
+          1. 成员名归一化（_zip_safe_relpath）→ 拒 `../`、绝对路径、盘符、反斜杠
+          2. 落点 resolve() 后必须 is_relative_to(work_dir) → 兜住归一化没想到的形状
+          3. 软链成员直接拒（_zip_member_is_symlink）
+          4. 边解边算累计字节与成员数 → zip bomb 在写满磁盘之前就中止
+        """
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(data))
+        except (zipfile.BadZipFile, ValueError) as e:
+            raise ValueError(f"不是合法的 ZIP 文件: {e}")
+
+        max_bytes = PLUGIN_UNPACK_MAX_MB * 1024 * 1024
+        with zf:
+            infos = zf.infolist()
+            if len(infos) > PLUGIN_ZIP_MAX_FILES:
+                raise ValueError(
+                    f"压缩包内文件数 {len(infos)} 超过上限 {PLUGIN_ZIP_MAX_FILES}")
+            # 先用声明的 file_size 预筛一遍：zip bomb 的特征就是声明体积巨大，
+            # 这一步能在真正写盘之前就拒掉，比边解边算更早失败。
+            declared = sum(int(getattr(i, "file_size", 0) or 0) for i in infos)
+            if declared > max_bytes:
+                raise ValueError(
+                    f"解压后总大小 {declared // (1024*1024)} MB 超过上限 "
+                    f"{PLUGIN_UNPACK_MAX_MB} MB")
+
+            work_root = Path(work_dir).resolve()
+            written, total = 0, 0
+            for info in infos:
+                if _zip_member_is_symlink(info):
+                    raise ValueError(f"压缩包内含符号链接成员，已拒绝: {info.filename}")
+                rel = _zip_safe_relpath(info.filename)
+                if rel is None:
+                    raise ValueError(f"压缩包内路径不安全，已拒绝: {info.filename!r}")
+                target = work_root / rel
+                # 第二道防线：归一化过了也要再验一次落点
+                try:
+                    resolved = target.resolve()
+                    inside = (resolved.is_relative_to(work_root)
+                              if hasattr(resolved, "is_relative_to")
+                              else work_root.parts == resolved.parts[:len(work_root.parts)])
+                except OSError:
+                    inside = False
+                if not inside:
+                    raise ValueError(f"压缩包内路径越出解包目录，已拒绝: {info.filename!r}")
+
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                # 流式写 + 边写边累计：不整块读进内存（单文件也可能很大）
+                with zf.open(info, "r") as src, open(target, "wb") as dst:
+                    while True:
+                        chunk = src.read(256 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise ValueError(
+                                f"解压过程中超过上限 {PLUGIN_UNPACK_MAX_MB} MB，已中止"
+                                f"（疑似 zip bomb）")
+                        dst.write(chunk)
+                written += 1
+
+        root = self._find_plugin_root(work_root)
+        if root is None:
+            raise ValueError(
+                "压缩包里找不到 manifest.json（插件根目录下必须有）。"
+                f"已检查 {work_root}")
+        return root, {"files": written, "unpackedBytes": total,
+                      "declaredBytes": declared}
+
+    @staticmethod
+    def _find_plugin_root(work_root):
+        """在解包结果里找含 manifest.json 的**最浅**那一层目录（BFS 逐层展开）。
+
+        为什么取最浅：ZIP 里可能同时有 `manifest.json` 与 `docs/sample/manifest.json`，
+        取最浅的才是插件本体。
+
+        为什么不用 rglob("*")：市场包（minecraft-bot）里 node_modules 有几千个文件，
+        全量遍历每层都跑一遍会明显卡住。逐层 iterdir 只碰需要碰的目录，
+        并且**不下探 node_modules**（那里面全是 package.json，也可能有别人的
+        manifest.json，下探既慢又会误判）。
+
+        限深 3 层：够覆盖「直接是根」与「包一层 <id>/」两种常见结构，
+        再深的基本可以判定这个包不是插件。
+        """
+        work_root = Path(work_root)
+        if (work_root / "manifest.json").is_file():
+            return work_root
+        frontier = [work_root]
+        for _ in range(3):
+            nxt = []
+            for d in frontier:
+                try:
+                    entries = sorted(d.iterdir(), key=lambda x: str(x))
+                except OSError:
+                    continue
+                for p in entries:
+                    if not p.is_dir() or p.name in ("node_modules", ".git"):
+                        continue
+                    if (p / "manifest.json").is_file():
+                        return p
+                    nxt.append(p)
+            if not nxt:
+                break
+            frontier = nxt
+        return None
+
+    def import_zip_bytes(self, data, source="upload", expect_sha256=None,
+                         enable=False, progress_key=None):
+        """从 ZIP 字节安装插件。三条导入通道（上传 / URL / inbox）都调这里。
+
+        返回 (ok: bool, info: dict|str)。校验顺序是**先便宜的、后昂贵的**：
+        体积 → sha256 → 解包 → manifest 校验（在 install_from_dir 里）→ 落位。
+        sha256 放在解包之前，坏包根本不用碰磁盘。
+
+        ⚠ 不自己做 manifest 校验：install_from_dir 已经做全了（id 形状、apiVersion
+        精确等于 1、entry 是裸文件名且存在、覆盖安装先停旧进程、装后校验落位）。
+        这里重写一遍只会出现两份不一致的校验逻辑。
+        """
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            return False, "空数据"
+        max_zip = PLUGIN_ZIP_MAX_MB * 1024 * 1024
+        if len(data) > max_zip:
+            return False, (f"压缩包 {len(data) // (1024*1024)} MB 超过上限 "
+                           f"{PLUGIN_ZIP_MAX_MB} MB")
+
+        actual_sha = hashlib.sha256(bytes(data)).hexdigest()
+        if expect_sha256:
+            want = str(expect_sha256).strip().lower()
+            if want != actual_sha:
+                # 留证：把实际值报出去，用户才知道是「包被篡改」还是「自己填错了 hash」
+                if progress_key:
+                    _progress_set(progress_key, "failed",
+                                  message=f"sha256 不匹配: 期望 {want[:16]}… 实际 {actual_sha[:16]}…")
+                return False, {
+                    "error": "sha256 校验失败，包内容与预期不符（可能被篡改或 hash 填错）",
+                    "expected": want, "actual": actual_sha,
+                }
+        if progress_key:
+            _progress_set(progress_key, "verifying", done=len(data), total=len(data),
+                          message=f"sha256 {actual_sha[:12]}…")
+
+        # 临时目录必须在 PLUGIN_TMP_ROOT（= ~/cyrene/_plugin_tmp）下：
+        # Termux 的 /tmp 不可写、$PREFIX/tmp 的 SELinux 标签不同也写不了。
+        work_dir = None
+        try:
+            PLUGIN_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+            work_dir = Path(tempfile.mkdtemp(prefix="imp_", dir=str(PLUGIN_TMP_ROOT)))
+            if progress_key:
+                _progress_set(progress_key, "unpacking", message="解包中")
+            try:
+                root, stats = self._unpack_zip_safe(bytes(data), work_dir)
+            except ValueError as e:
+                if progress_key:
+                    _progress_set(progress_key, "failed", message=str(e))
+                return False, str(e)
+            except (zipfile.BadZipFile, OSError) as e:
+                msg = f"解包失败: {type(e).__name__}: {e}"
+                if progress_key:
+                    _progress_set(progress_key, "failed", message=msg)
+                return False, msg
+
+            if progress_key:
+                _progress_set(progress_key, "installing",
+                              done=stats["files"], total=stats["files"],
+                              message="校验并落位中")
+            ok, info = self.install_from_dir(
+                root, source=source, sha256=actual_sha,
+                enable=enable,
+                # 有 expect_sha256 且已通过 = 已验证；上传/inbox 通道通常没有 hash
+                allow_unverified=not bool(expect_sha256))
+            if not ok:
+                if progress_key:
+                    _progress_set(progress_key, "failed",
+                                  message=info if isinstance(info, str) else str(info))
+                return False, info
+
+            if isinstance(info, dict):
+                info["sha256"] = actual_sha
+                info["verified"] = bool(expect_sha256)
+                info["unpacked"] = stats
+                # risky 由 install_from_dir 统一扫描并塞进 info（那是所有安装
+                # 路径的汇聚点），这里不重复扫 —— 重复扫等于同一个目录走两遍
+                # os.walk，白花时间。
+            if progress_key:
+                _progress_set(progress_key, "done", message=f"已安装 {info.get('id', '')}")
+            return True, info
+        except OSError as e:
+            msg = f"临时目录创建失败: {e}"
+            if progress_key:
+                _progress_set(progress_key, "failed", message=msg)
+            return False, msg
+        finally:
+            # 无论成败都要清干净：解包出来的东西一次都不该留在磁盘上
+            if work_dir is not None:
+                shutil.rmtree(str(work_dir), ignore_errors=True)
+
+    def import_zip_file(self, path, source="inbox", expect_sha256=None,
+                        enable=False, progress_key=None):
+        """从磁盘上的 ZIP 文件安装（inbox 与 URL 下载后都走这里）。
+
+        流式读 + 分块喂 sha256，不把整个文件读进内存两遍 —— minecraft-bot
+        是 9.1 MB，读两遍就是 18 MB 常驻，手机内存本来就紧。
+        """
+        p = Path(path)
+        if not p.is_file():
+            return False, f"文件不存在: {path}"
+        size = p.stat().st_size
+        max_zip = PLUGIN_ZIP_MAX_MB * 1024 * 1024
+        if size > max_zip:
+            return False, (f"压缩包 {size // (1024*1024)} MB 超过上限 "
+                           f"{PLUGIN_ZIP_MAX_MB} MB")
+        if size <= 0:
+            return False, "文件是空的（0 字节）"
+        try:
+            with open(p, "rb") as fh:
+                data = fh.read(max_zip + 1)
+        except OSError as e:
+            return False, f"读取失败: {e}"
+        return self.import_zip_bytes(data, source=source,
+                                     expect_sha256=expect_sha256, enable=enable,
+                                     progress_key=progress_key)
+
+    def scan_inbox(self):
+        """扫 inbox 目录，列出可导入的 ZIP 候选（不安装）。
+
+        顺带尽量读出每个包的插件名与版本，让用户在列表里认得出是哪个插件，
+        而不是面对一堆文件名。读不出来就标 unknown，不因为一个坏包让整个扫描失败。
+        """
+        d = PLUGIN_INBOX_DIR
+        if not d.is_dir():
+            return {"dir": str(d), "dirExists": False, "items": []}
+        items = []
+        for f in sorted(d.iterdir()):
+            if not f.is_file() or f.suffix.lower() != ".zip":
+                continue
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            entry = {"filename": f.name, "size": st.st_size,
+                     "mtime": int(st.st_mtime), "id": "", "version": "",
+                     "name": "", "readable": False, "error": ""}
+            try:
+                with zipfile.ZipFile(str(f)) as zf:
+                    mf_name = None
+                    for n in zf.namelist():
+                        rel = _zip_safe_relpath(n)
+                        if rel is None:
+                            continue
+                        if rel == "manifest.json" or rel.endswith("/manifest.json"):
+                            # 取最浅的那个
+                            if mf_name is None or rel.count("/") < mf_name.count("/"):
+                                mf_name = rel
+                    if mf_name:
+                        mf = json.loads(zf.read(mf_name).decode("utf-8", "replace"))
+                        if isinstance(mf, dict):
+                            entry["id"] = str(mf.get("id") or "")
+                            entry["name"] = str(mf.get("name") or "")
+                            entry["version"] = str(mf.get("version") or "")
+                            entry["readable"] = True
+                    else:
+                        entry["error"] = "包内没有 manifest.json"
+            except (zipfile.BadZipFile, ValueError, OSError, json.JSONDecodeError) as e:
+                entry["error"] = f"{type(e).__name__}: {e}"
+            entry["oversize"] = st.st_size > PLUGIN_ZIP_MAX_MB * 1024 * 1024
+            items.append(entry)
+        return {"dir": str(d), "dirExists": True, "items": items}
+
+    def uninstall(self, pid, remove_data=False):
+        """卸载插件：停进程 → 摘工具 → 删目录 → 清台账。
+
+        remove_data=False（默认）时保留 data/ 与 secrets ——
+        对齐桌面端语义「重新导入新版 ZIP 即可，插件数据（存储、密钥）不会丢失」。
+        彻底删除需要用户在面板二次确认后显式传 True。
+        """
+        if not isinstance(pid, str) or not PLUGIN_ID_RE.match(pid):
+            return False, f"非法插件 id: {pid!r}"
+
+        self.stop(pid, keep_registry=False)
+        self._unregister_tools(pid)
+
+        dest = PLUGINS_DIR / pid
+        removed = False
+        if dest.is_dir():
+            if remove_data:
+                try:
+                    shutil.rmtree(str(dest))
+                    removed = True
+                except OSError as e:
+                    return False, f"删除插件目录失败: {e}"
+            else:
+                # 只删代码，留 data/。先备份 data 再删目录再放回去，
+                # 比逐个挑文件删更简单也更不容易漏（插件可能还有别的运行时文件）。
+                keep = dest / "data"
+                tmp_keep = None
+                if keep.is_dir():
+                    tmp_keep = PLUGINS_DIR / f".{pid}.data-keep"
+                    try:
+                        if tmp_keep.exists():
+                            shutil.rmtree(str(tmp_keep))
+                        shutil.move(str(keep), str(tmp_keep))
+                    except OSError:
+                        tmp_keep = None      # 搬不动就退化成全删（数据会丢，但卸载能成）
+                try:
+                    shutil.rmtree(str(dest))
+                    removed = True
+                except OSError as e:
+                    return False, f"删除插件目录失败: {e}"
+                if tmp_keep is not None:
+                    try:
+                        dest.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(tmp_keep), str(dest / "data"))
+                    except OSError:
+                        pass                 # 恢复失败不阻断卸载，数据仍在 .{pid}.data-keep
+
+        # 清 secrets（remove_data 时才清，否则保留以便重装后继续用）
+        if remove_data:
+            with SETTINGS_LOCK:
+                sec = SETTINGS.get("plugins", {}).get("secrets", {})
+                if isinstance(sec, dict) and pid in sec:
+                    del sec[pid]
+                save_settings_to_disk()
+        self._clear_registry(pid)
+        with self._lock:
+            self._states.pop(pid, None)
+            self._errors.pop(pid, None)
+            self._manifests.pop(pid, None)
+            self._fail_counts.pop(pid, None)
+        return True, {"id": pid, "removed": removed, "dataKept": not remove_data}
+
+    # ---------- 台账持久化 ----------
+
+    def _save_registry(self, pid, **fields):
+        """更新台账里某个插件的字段并落盘。
+
+        ⚠ 必须持 SETTINGS_LOCK：save_settings_to_disk 写的是整个 SETTINGS，
+        两个插件同时启停会互相覆盖（后写的把先写的改动抹掉）。
+        """
+        with SETTINGS_LOCK:
+            reg = SETTINGS.setdefault("plugins", {}).setdefault("registry", {})
+            cur = reg.get(pid) if isinstance(reg.get(pid), dict) else {}
+            cur.update(fields)
+            reg[pid] = cur
+            return save_settings_to_disk()
+
+    def _clear_registry(self, pid):
+        with SETTINGS_LOCK:
+            reg = SETTINGS.setdefault("plugins", {}).setdefault("registry", {})
+            if pid in reg:
+                del reg[pid]
+                return save_settings_to_disk()
+        return True
+
+    # ---------- 宿主服务投影（Node → Python 的回调） ----------
+
+    def _build_host_services(self, client):
+        """给一个 BridgeClient 装上宿主服务实现。
+
+        这些方法在 client 的**工作线程**里跑（不是 reader 线程），所以可以
+        做阻塞 IO，但不能无限阻塞 —— 每个都要有超时或明确的快路径。
+        """
+        pid = client.plugin_id
+
+        def svc_storage_get(params):
+            key = params.get("key")
+            if not isinstance(key, str) or not key:
+                raise PluginHostError("E_INVALID_ARGUMENT", "storage.get 需要非空 key")
+            # Node 侧已有快照缓存，正常不会走到这里；走到说明插件在
+            # register 之后又主动查了一次（或快照没覆盖到）。以磁盘为准。
+            return plugin_storage_load(pid).get(key)
+
+        def svc_storage_set(params):
+            key = params.get("key")
+            if not isinstance(key, str) or not key:
+                raise PluginHostError("E_INVALID_ARGUMENT", "storage.set 需要非空 key")
+            kv = plugin_storage_load(pid)
+            kv[key] = params.get("value")
+            if not plugin_storage_write(pid, kv):
+                raise PluginHostError("E_STORAGE_UNAVAILABLE", "写入 kv.json 失败")
+            return {"ok": True}
+
+        def svc_secrets_get(params):
+            key = params.get("key")
+            if not isinstance(key, str) or not key:
+                raise PluginHostError("E_INVALID_ARGUMENT", "secrets.get 需要非空 key")
+            # 命名空间隔离：只在本插件的 dict 里找，插件读不到别人的密钥
+            return plugin_secrets(pid).get(key)
+
+        def svc_secrets_set(params):
+            key = params.get("key")
+            if not isinstance(key, str) or not key:
+                raise PluginHostError("E_INVALID_ARGUMENT", "secrets.set 需要非空 key")
+            with SETTINGS_LOCK:
+                sec = SETTINGS.setdefault("plugins", {}).setdefault("secrets", {})
+                kv = sec.get(pid) if isinstance(sec.get(pid), dict) else {}
+                kv[key] = params.get("value")
+                sec[pid] = kv
+                ok = save_settings_to_disk()
+            if not ok:
+                raise PluginHostError("E_STORAGE_UNAVAILABLE", "写入 .config.json 失败")
+            return {"ok": True}
+
+        def svc_secrets_delete(params):
+            key = params.get("key")
+            if not isinstance(key, str) or not key:
+                raise PluginHostError("E_INVALID_ARGUMENT", "secrets.delete 需要非空 key")
+            with SETTINGS_LOCK:
+                sec = SETTINGS.setdefault("plugins", {}).setdefault("secrets", {})
+                kv = sec.get(pid) if isinstance(sec.get(pid), dict) else {}
+                existed = key in kv
+                kv.pop(key, None)
+                sec[pid] = kv
+                save_settings_to_disk()
+            return existed
+
+        def svc_events_emit(params):
+            # P2 才接事件总线。这里先收下并记日志，回 ok ——
+            # 不能报 E_CAPABILITY_UNAVAILABLE，因为 events.emit 在契约里
+            # 是插件自有事件，宿主本来就只是转发，没有「不可用」一说。
+            client.log(f"emit {params.get('event')}")
+            return {"ok": True}
+
+        def svc_log(params):
+            args = params.get("args")
+            if isinstance(args, list):
+                client.log(" ".join(str(a) for a in args))
+            else:
+                client.log(str(args))
+            return None
+
+        return {
+            "storage.get": svc_storage_get,
+            "storage.set": svc_storage_set,
+            "secrets.get": svc_secrets_get,
+            "secrets.set": svc_secrets_set,
+            "secrets.delete": svc_secrets_delete,
+            "events.emit": svc_events_emit,
+            "log": svc_log,
+            # 以下在 P2 接真实现。现在回 E_CAPABILITY_UNAVAILABLE 而不是
+            # 静默 undefined —— 契约要求插件能靠 code 分支判断。
+            "llm.generateText": _plugin_svc_unavailable("llm", "generateText"),
+            "llm.runGoal": _plugin_svc_unavailable("llm", "runGoal"),
+            "conversations.list": _plugin_svc_unavailable("conversations", "list"),
+            "conversations.getMessages": _plugin_svc_unavailable("conversations", "getMessages"),
+            "workspace.getBinding": lambda p: None,   # 契约允许返回 null
+        }
+
+    # ---------- 启停 ----------
+
+    def start(self, pid):
+        """启用插件。返回 (ok: bool, info: dict|str)。
+
+        失败时把插件落到 failed 态并记 lastError，**不抛异常** ——
+        一个插件坏了不该让 HTTP 请求 500。
+        """
+        if not plugins_cfg("enabled", True):
+            return False, "插件总开关已关闭（settings.plugins.enabled=false）"
+
+        with self._lock:
+            if self._states.get(pid) == "running":
+                return True, {"already": True, "tools": list(self._tool_ids.get(pid, []))}
+            self._states[pid] = "starting"
+            self._errors.pop(pid, None)
+
+        pdir = self.plugin_dir(pid)
+        mf = self._read_manifest(pdir)
+        if mf is None:
+            return self._mark_failed(pid, "manifest.json 缺失或非法（id 需与目录名一致）")
+
+        supported, reason = self.check_support(mf)
+        if not supported:
+            with self._lock:
+                self._states[pid] = "unsupported"
+            self._save_registry(pid, enabled=True, lastError=reason,
+                                version=str(mf.get("version") or ""))
+            return False, reason
+
+        client = BridgeClient(pid, pdir, mf)
+        client.host_services = self._build_host_services(client)
+        try:
+            res = client.start(storage_snapshot=plugin_storage_load(pid))
+        except PluginHostError as e:
+            client.kill()
+            return self._mark_failed(pid, f"{e.code}: {e}")
+        except Exception as e:
+            client.kill()
+            return self._mark_failed(pid, f"{type(e).__name__}: {e}")
+
+        tools = res.get("tools") if isinstance(res.get("tools"), list) else []
+        providers = res.get("promptProviders") if isinstance(res.get("promptProviders"), list) else []
+        warnings = res.get("warnings") if isinstance(res.get("warnings"), list) else []
+
+        # 把插件工具挂进 TOOLS。冲突处理见 _register_tools。
+        added, conflicts = self._register_tools(pid, tools)
+
+        with self._lock:
+            self._clients[pid] = client
+            self._states[pid] = "running"
+            self._manifests[pid] = mf
+            self._providers[pid] = providers
+            self._fail_counts[pid] = 0
+
+        self._save_registry(pid, enabled=True, lastError="",
+                            version=str(mf.get("version") or ""),
+                            installedAt=str((plugin_registry().get(pid) or {}).get("installedAt") or ""))
+
+        info = {
+            "tools": added,
+            "toolCount": len(added),
+            "conflicts": conflicts,
+            "promptProviders": [p.get("id") for p in providers if isinstance(p, dict)],
+            "warnings": list(warnings) + ([f"工具 id 与内置冲突，已跳过: {c}" for c in conflicts] if conflicts else []),
+            "pid": client.pid,
+            "nodeVersion": client.node_version,
+        }
+        client.log(f"已启用：注册 {len(added)} 个工具"
+                   + (f"，{len(conflicts)} 个 id 冲突被跳过" if conflicts else ""))
+        return True, info
+
+    def _mark_failed(self, pid, message):
+        with self._lock:
+            self._states[pid] = "failed"
+            self._errors[pid] = message
+        self._save_registry(pid, lastError=message)
+        return False, message
+
+    def _register_tools(self, pid, tools):
+        """插件工具 → TOOLS / TOOL_HANDLERS。返回 (added_ids, conflict_ids)。
+
+        冲突策略：跳过冲突的那个工具，但**不拒整个插件**。理由是一个插件
+        可能注册 5 个工具，只有 1 个撞名，因为 1 个把 5 个全废掉太粗暴；
+        跳过 + 在 warnings 里报出来，用户和插件作者都能看到。
+        """
+        added, conflicts = [], []
+        with self._lock:
+            for t in tools:
+                if not isinstance(t, dict):
+                    continue
+                tid = t.get("id")
+                if not isinstance(tid, str) or not tid:
+                    continue
+                # 工具 id 不套 PLUGIN_ID_RE：桌面端插件的 id 形如
+                # "weather-tool_query"（插件id + 下划线 + 工具名），
+                # 而 PLUGIN_ID_RE 是给「会拼进文件路径」的插件 id 用的。
+                # 工具 id 只进 TOOLS 字典与 FC schema，不落盘，形状约束
+                # 交给端点的 schema 校验兜住比在这里猜规则更可靠。
+                # 但仍要挡掉会破坏协议的值：空白与超长。
+                if tid != tid.strip() or len(tid) > 64 or "\n" in tid:
+                    conflicts.append(f"{tid}(id 非法，已跳过)")
+                    continue
+                if tid in BUILTIN_TOOL_IDS:
+                    conflicts.append(tid)
+                    continue
+                if t.get("enabled") is False:
+                    continue          # 插件自己声明不启用，不占 TOOLS
+                TOOLS[tid] = plugin_tool_to_spec(pid, t)
+                added.append(tid)
+            self._tool_ids[pid] = added
+            # 工具开关默认值：新工具按「启用」入库，用户可在面板单独关
+            tools_cfg = SETTINGS.setdefault("tools", {})
+            for tid in added:
+                tools_cfg.setdefault(tid, True)
+        return added, conflicts
+
+    def _unregister_tools(self, pid):
+        """从 TOOLS 摘掉某插件的全部工具。停用/卸载/崩溃都要走这里。
+
+        不摘的后果：TOOLS 里留着一个 handler 指向已死进程的条目，
+        模型调用它会拿到 E_PLUGIN_STOPPING，而且 /tools 面板永远显示
+        一个关不掉的幽灵工具。
+        """
+        with self._lock:
+            ids = self._tool_ids.pop(pid, [])
+            for tid in ids:
+                TOOLS.pop(tid, None)
+            self._providers.pop(pid, None)
+            return list(ids)
+
+    def stop(self, pid, keep_registry=True, set_disabled=True):
+        """停用插件。返回 (ok, info)。幂等：已经停着的直接返回 ok。
+
+        keep_registry  台账条目要不要留（uninstall 传 False = 连条目一起删）
+        set_disabled   留台账时要不要把 enabled 写成 False。
+                       ⚠ 这两个参数必须分开：调用方的意图是相反的。
+                         · disable 端点 —— 用户明确要求停用，enabled=False 是对的。
+                         · shutdown_all（atexit / SIGTERM）—— 宿主自己要退了，
+                           跟用户的启用意图无关，必须原样保留 enabled=True，
+                           否则重启后 plugin_boot_async 看到 False 就不会拉起，
+                           用户装的插件「重启一次就再也起不来」，且面板上
+                           显示的是「已停用」，看起来像用户自己关的，极难排查。
+                       早期版本这里写死 enabled=False，注释还写着「保留 enabled
+                       意图」—— 代码与注释相反，是个真 bug，已在 P1-7 真机实测暴露
+                       （install_from_dir(enable=True) 后台账内存是 true、
+                       经 shutdown_all 落盘变成 false）。
+        """
+        with self._lock:
+            client = self._clients.pop(pid, None)
+            state = self._states.get(pid)
+            if client is None and state in (None, "installed", "not_installed"):
+                return True, {"already": True}
+            self._states[pid] = "stopping"
+
+        errors = []
+        if client is not None:
+            try:
+                errors = client.dispose() or []
+            except Exception as e:
+                errors.append(f"{type(e).__name__}: {e}")
+            finally:
+                # dispose 失败也必须收干净：进程、线程池、管道
+                client._shutdown()
+
+        removed = self._unregister_tools(pid)
+
+        with self._lock:
+            self._states[pid] = "installed"
+            self._errors.pop(pid, None)
+        if keep_registry:
+            if set_disabled:
+                self._save_registry(pid, enabled=False, lastError="")
+            else:
+                # 宿主退场：只清 lastError（上次跑成功结束的，不算错误），
+                # enabled 一个字都不碰。
+                self._save_registry(pid, lastError="")
+        return True, {"unregisteredTools": removed, "disposeErrors": errors}
+
+    def logs(self, pid, limit=None):
+        """某插件的宿主日志环 + 当前状态。GET /plugins/<id>/logs 用。
+
+        日志只活在 BridgeClient 的内存环里（进程一死就没了），所以 state 与
+        error 必须一起回传 —— 否则用户看到空日志会以为「插件没输出」，
+        而真相是「插件早就死了」。logsLost 把这个区别显式说出来。
+        """
+        with self._lock:
+            client = self._clients.get(pid)
+            state = self._states.get(pid, "not_installed")
+            error = self._errors.get(pid, "")
+        try:
+            n = int(limit) if limit else PLUGIN_LOG_RING
+        except (TypeError, ValueError):
+            n = PLUGIN_LOG_RING
+        n = max(1, min(n, PLUGIN_LOG_RING))
+        return {
+            "id": pid,
+            "state": state,
+            "error": error,
+            "logs": client.get_logs(n) if client is not None else [],
+            "logsLost": client is None,
+        }
+
+    def patrol(self):
+        """对所有 running 插件做一轮崩溃巡检。返回被判定 crashed 的 id 列表。
+
+        手机上不开常驻轮询线程（多一份线程就是多一份电），改由两个时机按需触发：
+        工具执行失败路径（crash_check）与面板查询（GET /plugins）。
+        这里只是把「逐个 crash_check」收成一次调用，方便面板一次性刷新真相。
+        """
+        with self._lock:
+            pids = [pid for pid, st in self._states.items() if st == "running"]
+        return [pid for pid in pids if self.crash_check(pid) == "crashed"]
+
+    def crash_check(self, pid):
+        """巡检：进程死了但状态还是 running → 标 crashed 并摘工具。
+
+        由 /plugins 查询与工具执行失败路径触发。不做常驻轮询线程 ——
+        手机上多一个常驻线程就是多一份电，按需检查足够。
+        """
+        with self._lock:
+            client = self._clients.get(pid)
+            if client is None:
+                return None
+            if self._states.get(pid) != "running":
+                return self._states.get(pid)
+            alive = (client.proc is not None and client.proc.poll() is None
+                     and not client.dead)
+            if alive:
+                return "running"
+            # 确认死了
+            self._clients.pop(pid, None)
+            self._states[pid] = "crashed"
+            reason = client.dead_reason or f"进程退出码 {client.proc.poll() if client.proc else '?'}"
+            self._errors[pid] = reason
+        self._unregister_tools(pid)
+        self._save_registry(pid, lastError=f"进程崩溃: {reason}")
+        return "crashed"
+
+    def execute_tool(self, pid, tid, args, tool_ctx):
+        """跑一个插件工具。返回 (outcome, text)，与 handler 型工具同构。
+
+        这一层负责把桥接的异常翻译成四态 outcome —— run_tool 只认这个。
+        """
+        with self._lock:
+            client = self._clients.get(pid)
+        if client is None:
+            return OUTCOME_NOT_EXECUTED, f"(插件 {pid} 未运行)"
+
+        timeout = float(agent_cfg("stepTimeout") or 30)
+        # 插件工具可能自己发网络请求（weather-tool 就是），stepTimeout 是
+        # 给 termux-api 广播定的，对网络型插件偏紧。给到 3 倍但不超过 120s。
+        timeout = min(max(timeout * 3, 30.0), 120.0)
+        try:
+            res = client.call("tool.execute", {
+                "toolId": tid,
+                "args": args if isinstance(args, dict) else {},
+                "ctx": tool_ctx if isinstance(tool_ctx, dict) else {},
+            }, timeout=timeout)
+        except PluginHostError as e:
+            if e.code == "E_PLUGIN_STOPPING":
+                self.crash_check(pid)
+                return OUTCOME_NOT_EXECUTED, f"(插件 {pid} 已停止: {e})"
+            # 超时归 unknown：插件可能已经产生了副作用（发了请求、写了文件），
+            # 报 failure 会让模型以为「没生效」而重放，那才是真危险。
+            if "超时" in str(e):
+                return OUTCOME_UNKNOWN, f"(插件工具超时 {timeout:.0f}s: {e})"
+            return OUTCOME_FAILURE, f"(插件工具失败 {e.code}: {e})"
+        except Exception as e:
+            return OUTCOME_FAILURE, f"(插件工具异常: {type(e).__name__}: {e})"
+
+        text = res.get("text") if isinstance(res, dict) else None
+        if not isinstance(text, str):
+            text = "" if text is None else str(text)
+        return OUTCOME_SUCCESS, text
+
+    def shutdown_all(self):
+        """宿主退出时收干净全部子进程。atexit 与 SIGTERM 都要挂。
+
+        不做这一步的后果：Python 服务退了，node 子进程变孤儿常驻，
+        手机内存被一点点吃光，而且下次启动端口/资源可能撞车。
+        """
+        with self._lock:
+            pids = list(self._clients.keys())
+        for pid in pids:
+            try:
+                # set_disabled=False：宿主退场不改用户的启用意图，
+                # 重启后 plugin_boot_async 才能按台账把它们重新拉起。
+                # （这里曾经写死 enabled=False，导致「重启一次插件就再也起不来」，
+                #  详见 stop() 的 docstring。）
+                self.stop(pid, keep_registry=True, set_disabled=False)
+            except Exception:
+                with self._lock:
+                    c = self._clients.pop(pid, None)
+                if c is not None:
+                    c._shutdown()
+
+
+def _plugin_svc_unavailable(cap, method):
+    """造一个「按契约报 E_CAPABILITY_UNAVAILABLE」的服务占位实现。
+
+    为什么不用 lambda 直接返回 None：契约明确插件靠 isPluginHostError(e.code)
+    分支，静默返回 undefined 会让插件以为调用成功，走进错误路径 ——
+    比如 long-term-memory 拿到 undefined 的会话列表，会以为「没有历史」
+    然后把记忆清空。抛带 code 的错才是诚实的。
+    """
+    def _svc(params):
+        raise PluginHostError(
+            "E_CAPABILITY_UNAVAILABLE",
+            f'宿主能力 "{cap}" 在手机端未实现（调用 {cap}.{method}）')
+    return _svc
+
+
+# 内置工具 id 的冻结快照。插件工具注册时要拿它查重，防止插件覆盖内置工具
+# （比如注册一个叫 "shell" 的工具把真的 shell 顶掉 —— 那是提权）。
+# 必须在 TOOLS 定义之后、任何插件启动之前取，所以放在这里模块级求值。
+BUILTIN_TOOL_IDS = frozenset(TOOLS.keys())
+
+PLUGIN_MANAGER = PluginManager()
+
+
+# ========== 插件市场（P5） ==========
+#
+# 源仓库 Playa-Cyrene/Cyrene-Plugins 的结构：
+#   registry.json          {apiVersion, updatedAt, plugins:[{id,name,description,
+#                           author,homepage,version,zip,sha256,downloads}]}
+#   plugins/<id>/          源码目录（manifest.json + index.cjs + README.md …）
+#   marketplace/<id>.json  详情弹窗数据（只有 4 个插件有）
+#   zips/<id>-<ver>.zip    分发包
+#
+# 两个已核实的现实约束，代码里都要照顾到：
+#   ① registry.json 只登记 13 个**带 ZIP** 的插件；weather-tool 等四个官方示例
+#      标注「示例，不分发」，没有 ZIP —— 装它们只能走 install_from_source
+#      （逐个拉 plugins/<id>/ 下的文件）。
+#   ② registry 里的 zip 字段是**绝对直链且全部指向 Gitee**。所以主源用 Gitee
+#      时直链原样可用；一旦回退到 GitHub，就得把直链的 Gitee 前缀换成 GitHub
+#      base，否则「列表从 GitHub 来、下载却打 Gitee」，回退等于没回退。
+
+MARKET_CACHE = {"at": 0.0, "source": "", "base": "", "data": None, "error": ""}
+MARKET_CACHE_LOCK = threading.Lock()
+
+
+def _assert_http_url(url):
+    """只放行 http/https，其余协议一律拒。
+
+    与 _net_open 开头那段检查是同一套白名单。这里单独写一份是因为市场下载
+    要**流式落盘**（_net_open 会整块读进内存，32 MB 上限的包在手机上是负担），
+    不能直接复用它；但 SSRF 防线必须一模一样，所以照抄语义并显式标注。
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise NetError("(URL 为空)")
+    scheme = urlparse(url.strip()).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise NetError(f"(只支持 http/https，拒绝 {scheme or '(无协议)'}:// —— "
+                       f"file/ftp 等协议可能读取本地文件)")
+    return url.strip()
+
+
+def _ver_tuple(v):
+    """把版本字符串拆成可比较的元组。脏值不抛异常，返回全 0。
+
+    市场里版本号并不总是严格 SemVer（可能有 -beta、v 前缀），所以只做
+    「尽力解析」：解析不出来的段当 0。比较结果只用于决定要不要显示
+    「有更新」徽标，判错了顶多是徽标不准，不会造成数据损坏。
+    """
+    s = str(v or "").strip().lstrip("vV")
+    s = re.split(r"[-+]", s, 1)[0]
+    out = []
+    for part in s.split("."):
+        m = re.match(r"^(\d+)", part)
+        out.append(int(m.group(1)) if m else 0)
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out[:3])
+
+
+def _market_zip_url(zip_field, base, source_name):
+    """把 registry 里的 zip 字段解析成当前源下真正能下的 URL。
+
+    绝对直链指向 Gitee 而当前源是 GitHub 时，改写 host+路径前缀；
+    其余情况（相对路径、或直链本来就属于当前源）按需拼接。
+    """
+    z = str(zip_field or "").strip()
+    if not z:
+        return ""
+    if not z.startswith("http"):
+        return base.rstrip("/") + "/" + z.lstrip("/")
+    if source_name == "github" and "gitee.com" in z:
+        # 取最后的 zips/<file> 部分，接到 GitHub base 上
+        tail = z.split("/raw/", 1)[-1]
+        tail = tail.split("/", 1)[-1] if "/" in tail else tail
+        if not tail.startswith("zips/"):
+            tail = "zips/" + tail.rsplit("/", 1)[-1]
+        return base.rstrip("/") + "/" + tail
+    if source_name == "gitee" and "raw.githubusercontent.com" in z:
+        tail = z.split("/main/", 1)[-1]
+        if not tail.startswith("zips/"):
+            tail = "zips/" + tail.rsplit("/", 1)[-1]
+        return base.rstrip("/") + "/" + tail
+    return z
+
+
+def _market_fetch_registry(force_refresh=False):
+    """拉 registry.json，带 5 分钟缓存与双源回退。
+
+    返回 dict：{ok, source, base, fellBack, updatedAt, plugins[], error, fromCache}
+
+    回退策略：主源（Gitee）失败才试回退源（GitHub）；两个都失败时，
+    如果缓存里有旧数据就**返回旧数据并标注 stale**——手机上网络本来就飘，
+    让面板直接白屏不如显示 5 分钟前的列表并告诉用户「这是缓存」。
+    """
+    now = time.time()
+    with MARKET_CACHE_LOCK:
+        fresh = (MARKET_CACHE["data"] is not None
+                 and (now - MARKET_CACHE["at"]) < PLUGIN_MARKET_TTL)
+        if fresh and not force_refresh:
+            cached = MARKET_CACHE["data"]
+            out = dict(cached)
+            out["fromCache"] = True
+            out["cacheAge"] = int(now - MARKET_CACHE["at"])
+            return out
+
+    errors = []
+    for idx, (name, base) in enumerate(PLUGIN_MARKET_SOURCES):
+        url = base.rstrip("/") + "/registry.json"
+        try:
+            _st, _hdr, body, truncated = _net_open(
+                url, PLUGIN_MARKET_MAX_BYTES, timeout=PLUGIN_MARKET_TIMEOUT)
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+            continue
+        if truncated:
+            errors.append(f"{name}: registry.json 超过 {PLUGIN_MARKET_MAX_BYTES // (1024*1024)} MB，已拒收")
+            continue
+        try:
+            raw = json.loads(body.decode("utf-8", "replace"))
+        except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+            errors.append(f"{name}: registry.json 解析失败 {type(e).__name__}")
+            continue
+        if not isinstance(raw, dict):
+            errors.append(f"{name}: registry.json 顶层不是对象")
+            continue
+        api = raw.get("apiVersion")
+        if api != PLUGIN_API_VERSION:
+            # 整份拒收：apiVersion 不匹配说明市场契约变了，字段含义可能全变，
+            # 硬着头皮解析会给用户看一份错乱的列表，比报错更糟。
+            errors.append(f"{name}: 市场 apiVersion={api}，本宿主只支持 {PLUGIN_API_VERSION}")
+            continue
+        items = raw.get("plugins")
+        if not isinstance(items, list):
+            errors.append(f"{name}: registry.plugins 不是数组")
+            continue
+        plugins = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            pid = str(it.get("id") or "").strip()
+            # id 会拼进文件路径与 URL，形状不对的直接丢（与本地台账同一把尺）
+            if not PLUGIN_ID_RE.match(pid):
+                continue
+            plugins.append({
+                "id": pid,
+                "name": _as_str(it.get("name"), pid)[:80],
+                "description": _as_str(it.get("description"), "")[:600],
+                "author": _as_str(it.get("author"), "")[:80],
+                "homepage": _as_str(it.get("homepage"), "")[:300],
+                "version": _as_str(it.get("version"), "")[:40],
+                "zip": _as_str(it.get("zip"), "")[:600],
+                "sha256": _as_str(it.get("sha256"), "").strip().lower()[:64],
+                "downloads": it.get("downloads") if isinstance(it.get("downloads"), int) else 0,
+                "zipUrl": _market_zip_url(it.get("zip"), base, name),
+            })
+        data = {
+            "ok": True, "source": name, "base": base, "fellBack": idx > 0,
+            "updatedAt": _as_str(raw.get("updatedAt"), "")[:40],
+            "plugins": plugins, "error": "", "fromCache": False, "stale": False,
+        }
+        with MARKET_CACHE_LOCK:
+            MARKET_CACHE.update({"at": now, "source": name, "base": base,
+                                 "data": data, "error": ""})
+        return data
+
+    # 所有源都失败：能给缓存就给缓存，并明说是旧的
+    with MARKET_CACHE_LOCK:
+        if MARKET_CACHE["data"] is not None:
+            out = dict(MARKET_CACHE["data"])
+            out.update({"stale": True, "fromCache": True,
+                        "cacheAge": int(now - MARKET_CACHE["at"]),
+                        "error": "所有市场源都不可达，显示的是缓存： " + " | ".join(errors)})
+            return out
+    return {"ok": False, "source": "", "base": "", "fellBack": False,
+            "updatedAt": "", "plugins": [], "stale": False, "fromCache": False,
+            "error": "所有市场源都不可达： " + " | ".join(errors)}
+
+
+def market_overview(force_refresh=False):
+    """市场列表 + 与本地已装状态合并成三态。
+
+    三态：not_installed / installed / update_available。
+    合并在**这一层**做而不是前端做：前端要同时拿到本地台账与 registry 版本
+    才能比，而本地台账里有 sha256、source 等不该随便撒给前端的细节，
+    在后端算完只回一个状态字符串最省事也最安全。
+    """
+    reg = _market_fetch_registry(force_refresh)
+    if not reg.get("ok"):
+        return reg
+    local = plugin_registry()
+    installed = PLUGIN_MANAGER.scan_installed()
+    out_items = []
+    for p in reg["plugins"]:
+        pid = p["id"]
+        item = dict(p)
+        le = local.get(pid) if isinstance(local.get(pid), dict) else {}
+        has_dir = pid in installed
+        item["localInstalled"] = bool(has_dir)
+        item["localVersion"] = _as_str(le.get("version"), "")[:40]
+        item["localEnabled"] = bool(le.get("enabled"))
+        item["localSource"] = _as_str(le.get("source"), "")[:20]
+        if not has_dir and not le:
+            item["status"] = "not_installed"
+        elif item["version"] and item["localVersion"] and \
+                _ver_tuple(item["version"]) > _ver_tuple(item["localVersion"]):
+            item["status"] = "update_available"
+        else:
+            item["status"] = "installed"
+        item["state"] = PLUGIN_MANAGER.state(pid)
+        out_items.append(item)
+    result = dict(reg)
+    result["plugins"] = out_items
+    result["counts"] = {
+        "total": len(out_items),
+        "installed": sum(1 for i in out_items if i["status"] == "installed"),
+        "updateAvailable": sum(1 for i in out_items if i["status"] == "update_available"),
+        "notInstalled": sum(1 for i in out_items if i["status"] == "not_installed"),
+    }
+    return result
+
+
+def _market_find(pid, force_refresh=False):
+    """在 registry 里找一个插件条目。返回 (entry|None, reg_dict)。"""
+    reg = _market_fetch_registry(force_refresh)
+    if not reg.get("ok"):
+        return None, reg
+    for p in reg["plugins"]:
+        if p["id"] == pid:
+            return p, reg
+    return None, reg
+
+
+def market_detail(pid):
+    """插件详情：优先 marketplace/<id>.json，没有则回落 plugins/<id>/README.md。
+
+    registry 里只有 4 个插件有 marketplace 详情文件，其余的详情就是 README。
+    两次网络请求都可能失败，失败不抛，返回带 error 的结构让面板自己显示。
+    """
+    entry, reg = _market_find(pid)
+    if entry is None:
+        return {"ok": False, "id": pid,
+                "error": reg.get("error") or f"市场里没有这个插件: {pid}"}
+    base = reg["base"]
+    out = {"ok": True, "id": pid, "entry": entry,
+           "source": reg["source"], "detail": None, "readme": "",
+           "detailKind": "none", "error": ""}
+
+    url = base.rstrip("/") + f"/marketplace/{pid}.json"
+    try:
+        _st, _h, body, _tr = _net_open(url, PLUGIN_MARKET_MAX_BYTES,
+                                       timeout=PLUGIN_MARKET_TIMEOUT)
+        raw = json.loads(body.decode("utf-8", "replace"))
+        if isinstance(raw, dict) and raw:
+            out["detail"] = raw
+            out["detailKind"] = "marketplace"
+    except Exception:
+        pass        # 没有详情文件是常态（13 个里只有 4 个有），不算错误
+
+    if out["detail"] is None:
+        url2 = base.rstrip("/") + f"/plugins/{pid}/README.md"
+        try:
+            _st, _h, body, _tr = _net_open(url2, 512 * 1024,
+                                           timeout=PLUGIN_MARKET_TIMEOUT)
+            text = body.decode("utf-8", "replace")
+            if text.strip():
+                out["readme"] = text[:200000]
+                out["detailKind"] = "readme"
+        except Exception as e:
+            out["error"] = f"详情与 README 都取不到: {e}"
+    return out
+
+
+def _market_download_stream(url, dest_path, max_bytes, progress_key=None):
+    """流式下载 url 到 dest_path，边下边算 sha256 与报进度。返回 (sha256, size)。
+
+    为什么不用 _net_open：它把整个 body 读进内存。市场里 minecraft-bot 是
+    9.1 MB，上限是 32 MB —— 在已经跑着若干个 node 子进程（每个 30-50 MB）的
+    手机上，再叠一个 32 MB 的 bytes 对象是实打实的 OOM 风险。流式写盘让内存
+    占用恒定在 chunk 大小。
+
+    超限处理：读到 max_bytes+1 就中止并删掉半成品，抛 ValueError。
+    """
+    url = _assert_http_url(url)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": NET_UA,
+        "Accept": "*/*",
+    })
+    h = hashlib.sha256()
+    total = 0
+    try:
+        with urllib.request.urlopen(req, timeout=PLUGIN_MARKET_TIMEOUT) as r:
+            declared = 0
+            try:
+                declared = int(r.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                declared = 0
+            if progress_key:
+                _progress_set(progress_key, "downloading", 0, declared, "开始下载")
+            with open(dest_path, "wb") as fh:
+                while True:
+                    chunk = r.read(256 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(
+                            f"下载超过上限 {max_bytes // (1024*1024)} MB，已中止")
+                    h.update(chunk)
+                    fh.write(chunk)
+                    if progress_key:
+                        _progress_set(progress_key, "downloading", total, declared,
+                                      f"已下载 {total // 1024} KB")
+    except urllib.error.HTTPError as e:
+        raise NetError(f"(HTTP {e.code} 错误：{e.reason})")
+    except urllib.error.URLError as e:
+        raise NetError(f"(连不上目标：{getattr(e, 'reason', e)})")
+    except ValueError:
+        raise
+    except Exception as e:
+        raise NetError(f"(下载失败：{type(e).__name__}: {e})")
+    return h.hexdigest(), total
+
+
+def market_install(pid, enable=False, progress_key=None, force_refresh=False):
+    """从市场装插件：下载 ZIP → sha256 强校验 → 走 P6 导入内核。
+
+    sha256 是**强校验**：registry 里有值就必须匹配，不匹配直接拒装并留证。
+    这条不能松——市场是远端内容，中间人换一个包，用户看到的就是「我装的
+    明明是官方插件」。registry 里没有 sha256 时才允许 unverified，并显式标注。
+    """
+    if not PLUGIN_ID_RE.match(pid or ""):
+        return False, f"非法插件 id: {pid!r}"
+    entry, reg = _market_find(pid, force_refresh)
+    if entry is None:
+        return False, reg.get("error") or f"市场里没有这个插件: {pid}"
+    zip_url = entry.get("zipUrl") or ""
+    if not zip_url:
+        return False, (f"插件 {pid} 在 registry 里没有 zip 字段（可能是「示例，不分发」"
+                       f"的插件）。这类插件请改用 install-from-source 通道。")
+
+    max_bytes = PLUGIN_ZIP_MAX_MB * 1024 * 1024
+    tmp_file = None
+    try:
+        PLUGIN_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix="mkt_", suffix=".zip",
+                                        dir=str(PLUGIN_TMP_ROOT))
+        os.close(fd)
+        tmp_file = Path(tmp_name)
+        if progress_key:
+            _progress_set(progress_key, "downloading", 0, 0, f"下载 {pid}")
+        try:
+            actual_sha, size = _market_download_stream(
+                zip_url, tmp_file, max_bytes, progress_key=progress_key)
+        except (NetError, ValueError) as e:
+            if progress_key:
+                _progress_set(progress_key, "failed", message=str(e))
+            return False, f"下载失败 {e}"
+
+        expect = entry.get("sha256") or ""
+        if expect and expect.lower() != actual_sha:
+            msg = (f"sha256 校验失败：registry 声明 {expect[:16]}…，"
+                   f"实际下到 {actual_sha[:16]}…。包可能被篡改或源不同步，已拒装。")
+            if progress_key:
+                _progress_set(progress_key, "failed", message=msg)
+            # 留证：把两个值都写进宿主日志，事后能查是哪一边的问题
+            print(f"插件市场: {msg} (url={zip_url} size={size})")
+            return False, {"error": msg, "expected": expect, "actual": actual_sha,
+                           "url": zip_url, "size": size}
+
+        ok, info = PLUGIN_MANAGER.import_zip_file(
+            tmp_file, source="market", expect_sha256=expect or None,
+            enable=enable, progress_key=progress_key)
+        if ok and isinstance(info, dict):
+            info["market"] = {"source": reg.get("source"), "version": entry.get("version"),
+                              "verified": bool(expect), "downloads": entry.get("downloads")}
+        return ok, info
+    except OSError as e:
+        if progress_key:
+            _progress_set(progress_key, "failed", message=str(e))
+        return False, f"临时文件创建失败: {e}"
+    finally:
+        if tmp_file is not None:
+            try:
+                tmp_file.unlink()
+            except OSError:
+                pass
+
+
+def market_install_from_source(pid, enable=False, progress_key=None,
+                               force_refresh=False):
+    """从市场的**源码目录**装插件（逐个拉 plugins/<id>/ 下的文件）。
+
+    这是装 weather-tool / long-term-memory / scheduled-automation /
+    local-asr-contract 这四个「示例，不分发」插件的**唯一途径**——它们在
+    registry 里没有 zip 字段。
+
+    没有 sha256 可校验，所以响应标 unverified=True，前端要二次确认。
+
+    文件清单靠 GitHub/Gitee 的目录 API 拿不到（两个源的 API 形状不同，
+    且 raw 端点不提供列目录能力），所以这里按 manifest 声明的 entry 加上
+    一组约定文件名去试。拉不到的就跳过，最后由 install_from_dir 校验
+    「manifest.json 与 entry 必须都在」来兜底。
+    """
+    if not PLUGIN_ID_RE.match(pid or ""):
+        return False, f"非法插件 id: {pid!r}"
+    entry, reg = _market_find(pid, force_refresh)
+    if entry is None:
+        return False, reg.get("error") or f"市场里没有这个插件: {pid}"
+    base = reg["base"].rstrip("/")
+
+    work_dir = None
+    try:
+        PLUGIN_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix="src_", dir=str(PLUGIN_TMP_ROOT)))
+
+        # 第一步：manifest.json 是必须的，拿不到就直接失败
+        mf_path = work_dir / "manifest.json"
+        try:
+            _st, _h, body, _tr = _net_open(
+                f"{base}/plugins/{pid}/manifest.json", 512 * 1024,
+                timeout=PLUGIN_MARKET_TIMEOUT)
+        except Exception as e:
+            if progress_key:
+                _progress_set(progress_key, "failed", message=f"取不到 manifest.json: {e}")
+            return False, f"取不到 plugins/{pid}/manifest.json: {e}"
+        mf_path.write_bytes(body)
+        try:
+            mf = json.loads(body.decode("utf-8", "replace"))
+        except (json.JSONDecodeError, ValueError) as e:
+            return False, f"manifest.json 解析失败: {e}"
+        if not isinstance(mf, dict):
+            return False, "manifest.json 顶层不是对象"
+
+        if progress_key:
+            _progress_set(progress_key, "downloading", 1, 0, "拉取源码文件")
+
+        # 第二步：entry 必须拉得到
+        entry_name = str(mf.get("entry") or "")
+        wanted = []
+        if entry_name and "/" not in entry_name and "\\" not in entry_name \
+                and ".." not in entry_name:
+            wanted.append(entry_name)
+        # 约定文件名：市场里的插件基本都有这些（有就拉，404 就跳过）
+        for nm in ("index.cjs", "README.md", "ui.html", "icon.png", "package.json"):
+            if nm not in wanted:
+                wanted.append(nm)
+
+        got = []
+        for nm in wanted:
+            dest = work_dir / nm
+            try:
+                _st, _h, body2, _tr = _net_open(
+                    f"{base}/plugins/{pid}/{nm}", 8 * 1024 * 1024,
+                    timeout=PLUGIN_MARKET_TIMEOUT)
+            except Exception:
+                continue        # 拉不到就跳过，最后由 install_from_dir 兜底校验
+            # 落点必须在 work_dir 内（nm 已过滤过分隔符与 ..，这里再验一次）
+            try:
+                if not dest.resolve().is_relative_to(work_dir.resolve()):
+                    continue
+            except (OSError, AttributeError):
+                continue
+            try:
+                dest.write_bytes(body2)
+                got.append(nm)
+            except OSError:
+                continue
+
+        if entry_name and entry_name not in got:
+            msg = f"入口文件 {entry_name} 拉取失败，无法安装"
+            if progress_key:
+                _progress_set(progress_key, "failed", message=msg)
+            return False, msg
+
+        if progress_key:
+            _progress_set(progress_key, "installing", len(got), len(got), "校验并落位")
+        ok, info = PLUGIN_MANAGER.install_from_dir(
+            work_dir, source="market-src", sha256="", enable=enable,
+            allow_unverified=True)
+        if ok and isinstance(info, dict):
+            info["unverified"] = True
+            info["fetchedFiles"] = got
+            info["market"] = {"source": reg.get("source"),
+                              "version": entry.get("version")}
+            if progress_key:
+                _progress_set(progress_key, "done", message=f"已安装 {pid}（未经 sha256 校验）")
+        elif progress_key:
+            _progress_set(progress_key, "failed",
+                          message=info if isinstance(info, str) else str(info))
+        return ok, info
+    except OSError as e:
+        if progress_key:
+            _progress_set(progress_key, "failed", message=str(e))
+        return False, f"临时目录创建失败: {e}"
+    finally:
+        if work_dir is not None:
+            shutil.rmtree(str(work_dir), ignore_errors=True)
+
+
+def plugin_boot_async():
+    """宿主启动后在后台线程拉起 enabled=true 的插件。
+
+    为什么必须异步：起一个插件要 spawn node + 等 host.ready + 跑 register，
+    实测 1-3 秒（node 冷启动占大头）。放在 main() 主流程里做，
+    /health 就要等所有插件起完才返回 —— 而守护器判定服务健康的超时是固定的，
+    插件多起来会直接被判死重启，进入循环。
+
+    失败隔离：单个插件起不来只落它自己的 failed 态并记 lastError，
+    不影响其他插件，更不影响 HTTP 服务。用户能在面板看到原因并重试。
+    """
+    if not plugins_cfg("enabled", True):
+        print("插件: 总开关已关闭，跳过加载")
+        return
+
+    def _boot():
+        reg = plugin_registry()
+        want = [pid for pid, e in reg.items() if isinstance(e, dict) and e.get("enabled")]
+        if not want:
+            print("插件: 无已启用插件")
+            return
+        installed = PLUGIN_MANAGER.scan_installed()
+        ok_n = 0
+        for pid in want:
+            if pid not in installed:
+                # 台账说启用了，但目录没了（用户手删 / 部署没带上）。
+                # 落 not_installed 并记原因 —— 这不是插件坏了，是文件不在，
+                # 标 failed 会误导用户去「重试」，而重试永远不可能成功。
+                with PLUGIN_MANAGER._lock:
+                    PLUGIN_MANAGER._states[pid] = "not_installed"
+                    PLUGIN_MANAGER._errors[pid] = "插件目录不存在（台账残留）"
+                continue
+            good, info = PLUGIN_MANAGER.start(pid)
+            if good:
+                ok_n += 1
+                n = info.get("toolCount", 0) if isinstance(info, dict) else 0
+                print(f"  ✓ 插件 {pid} 已启用（{n} 个工具）")
+            else:
+                print(f"  ⚠ 插件 {pid} 启用失败: {info}")
+
+        # ⚠ 必须重建系统提示：SYSTEM_PROMPTS 是模块导入期就构建好的文本快照
+        # （见文件里 `SYSTEM_PROMPTS = {m: build_system_prompt(m) for m in MODES}`），
+        # 而插件是在 main() 之后、由本线程异步注册进 TOOLS 的。不重建的话
+        # 「=== 可用工具 ===」清单里永远没有插件工具 —— FC schema 每轮现算所以
+        # 工具仍能调通，但提示明写着「只能用上面列出的工具名」，模型会因此拒调。
+        if ok_n:
+            try:
+                chars = rebuild_system_prompt()
+                print(f"  提示词已重建: " +
+                      "  ".join(f"{m}={n}" for m, n in chars.items()))
+            except Exception as e:
+                print(f"  ⚠ 提示词重建失败: {type(e).__name__}: {e}")
+
+        print(f"插件: {ok_n}/{len(want)} 启用成功")
+
+    t = threading.Thread(target=_boot, name="plugin-boot", daemon=True)
+    t.start()
+
+
+# 宿主退出时收干净 node 子进程。不做这一步的后果：Python 服务退了，
+# node 变孤儿常驻，手机内存被一点点吃光（每个 ~30-50MB），
+# 而且下次启动可能与残留进程抢资源。
+#
+# 除了 atexit 还要挂 SIGTERM：守护器与 /service/stop 都是用信号停服务的，
+# 而 atexit 在收到未处理的 SIGTERM 时**不会执行**（默认动作是立即终止）。
+def _plugin_atexit():
+    try:
+        PLUGIN_MANAGER.shutdown_all()
+    except Exception:
+        pass
+
+
+atexit.register(_plugin_atexit)
+
+
+def _plugin_on_sigterm(signum, frame):
+    """收到 SIGTERM 时先收插件，再按默认语义退出（这样 atexit 也会跑）。"""
+    try:
+        PLUGIN_MANAGER.shutdown_all()
+    except Exception:
+        pass
+    # 交回默认处理：sys.exit 会触发 atexit，_plugin_atexit 再跑一次是幂等的
+    # （shutdown_all 对已停的插件直接返回 already）。
+    sys.exit(0)
+
+
+try:
+    signal.signal(signal.SIGTERM, _plugin_on_sigterm)
+except (ValueError, OSError, AttributeError):
+    # ValueError: 不在主线程注册信号（单元测试导入时会遇到）
+    # 注册失败不影响主功能，只是 SIGTERM 时靠 node 自己检测父进程消失后退出
+    pass
+
+
 def run_tool(name, args_dict=None, ctx=None):
     """执行一个工具，返回结构化结果 dict：
 
@@ -3195,20 +5935,58 @@ def run_tool(name, args_dict=None, ctx=None):
                         f"(手机硬件通道刚有调用超时，暂时不可用，约 {int(left)}s 后恢复。"
                         f"本次未执行 {name}；请改用其他方式或直接告知用户稍后再试)")
 
-    # ---------- handler 型工具（文件/网络）：进程内直接跑 Python ----------
+    # ---------- handler 型工具（文件/网络/插件）：进程内直接跑 Python ----------
     # 不 fork 子进程，所以：没有孤儿进程、不受广播熔断牵连、不需要进程组 kill。
     # 代价是它跑在服务进程里，必须自己控住资源上限（读 4MiB / 扫 2万条）。
+    #
+    # 插件工具也走这个分支，但 handler 名是 "plugin:<pid>:<tid>" 前缀标记，
+    # 不在 TOOL_HANDLERS 里 —— 它要通过 BridgeClient 跨进程调到 node 那边。
+    # 必须先于 TOOL_HANDLERS 查表拦截，否则会误报「工具实现缺失」。
     handler_name = TOOLS[name].get("handler")
     if handler_name:
         with USAGE_LOCK:
             USAGE["toolCalls"] += 1
+
+        if isinstance(handler_name, str) and handler_name.startswith("plugin:"):
+            parts = handler_name.split(":", 2)
+            if len(parts) != 3:
+                return done(OUTCOME_FAILURE, f"(插件工具标记损坏: {handler_name})")
+            _, plug_id, tool_id = parts
+            # 崩溃巡检：进程可能已经死了但状态还是 running。
+            # 在这里顺手查一次，比常驻轮询线程省电（手机上多一个线程就是多一份电）。
+            st = PLUGIN_MANAGER.crash_check(plug_id)
+            if st != "running":
+                return done(OUTCOME_NOT_EXECUTED,
+                            f"(插件 {plug_id} 当前状态 {st}，未执行本工具)")
+            # PluginToolContext（桌面端契约）：userQuery / conversationId / mode / runId
+            tool_ctx = {
+                "userQuery": ctx.get("userQuery", "") if isinstance(ctx, dict) else "",
+                "conversationId": ctx.get("sid") if isinstance(ctx, dict) else None,
+                "runId": ctx.get("runId") if isinstance(ctx, dict) else None,
+                "mode": ctx.get("mode") if isinstance(ctx, dict) else None,
+                "permissionMode": "normal",
+            }
+            try:
+                # 插件工具吃**原生类型**参数（resolve_typed），与内置 handler 型
+                # 一致 —— node 那边 args.city 拿到的是字符串还是数字，取决于
+                # inputSchema 的声明，不做归一会让插件的类型判断失效。
+                typed = resolve_typed(name, args_dict)
+            except Exception as e:
+                return done(OUTCOME_FAILURE, f"(参数归一失败: {type(e).__name__}: {e})")
+            outcome, text = PLUGIN_MANAGER.execute_tool(plug_id, tool_id, typed, tool_ctx)
+            if outcome not in (OUTCOME_SUCCESS, OUTCOME_FAILURE, OUTCOME_UNKNOWN,
+                               OUTCOME_NOT_EXECUTED):
+                outcome = OUTCOME_FAILURE
+            text = text if isinstance(text, str) else str(text)
+            return done(outcome, _truncate_output(text) if text.strip() else "(无输出)")
+
         fn = TOOL_HANDLERS.get(handler_name)
         if fn is None:
             return done(OUTCOME_FAILURE, f"(工具实现缺失: {handler_name})")
         try:
             typed = resolve_typed(name, args_dict)
-            # needs_ctx 的 handler 多收一个上下文字典（目前只有 sid）。
-            # 其余 handler 签名不变，避免为了两个工具去改已有 9 个。
+            # needs_ctx 的 handler 多收一个上下文字典（见 _loop_ctx：sid / mode /
+            # userQuery / runId）。其余 handler 签名不变，避免为了几个工具去改已有的。
             if TOOLS[name].get("needs_ctx"):
                 outcome, text = fn(typed, ctx)
             else:
@@ -3629,14 +6407,56 @@ class Throttle:
         self.last = time.time()
 
 
-def enabled_tool_names():
+def enabled_tool_names(mode=None):
     """当前开关下真正可用的工具名（按 TOOLS 声明顺序）。
 
     loop 期间应当冻结这份清单：中途改开关会让前后轮的 tools 数组不一致，
     模型可能引用一个已经消失的工具。
+
+    mode 用于插件工具的模式过滤：桌面端 PluginTool.modes 声明该工具只在
+    某些模式出现（取值 learn/code/work）。内置工具没有 modes 键 = 全模式可用。
+    不传 mode 时不过滤（保持既有行为，验证脚本与单元测试依赖这一点）。
     """
     t = SETTINGS.get("tools", {})
-    return [n for n in TOOLS if t.get(n, True)]
+    out = []
+    for n, spec in TOOLS.items():
+        if not t.get(n, True):
+            continue
+        modes = spec.get("modes")
+        if mode and isinstance(modes, list) and modes and mode not in modes:
+            continue
+        out.append(n)
+    return out
+
+
+def _loop_ctx(sid, history, mode=None):
+    """构造本次 loop 的工具调用上下文。
+
+    这份 ctx 一路传到 run_tool → 插件工具的 PluginToolContext（桌面端契约）。
+    内置 handler 只读 sid，多出来的键对它们无害。
+
+    为什么在 loop 开头构造一次并冻结，而不是每轮重算：
+      · userQuery 语义是「本轮用户提出的问题」，整个 loop 里不变。
+        若每轮从 work 里取最后一条 user 消息，中途注入的「[系统] 检测到重复调用」
+        这类合成消息会被当成用户问题传给插件 —— 那是错的。
+      · runId 必须在整个 loop 里稳定，否则插件无法把多次工具调用关联成一次运行。
+    """
+    user_query = ""
+    for m in reversed(history if isinstance(history, list) else []):
+        if isinstance(m, dict) and m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, str):
+                user_query = c
+            break
+    if mode is None:
+        s = _session_get(sid)
+        mode = (s or {}).get("mode") if isinstance(s, dict) else None
+    return {
+        "sid": sid,                       # 内置 handler 用（update_todo / ask_user）
+        "mode": mode,
+        "userQuery": user_query,
+        "runId": uuid.uuid4().hex[:12],
+    }
 
 
 def call_signature(name, args):
@@ -3706,9 +6526,18 @@ def run_agent_loop(sid, client, prompt, history, allow_tools, cfg=None):
 
     # 工具清单在 loop 期间**冻结**：中途改开关会让前后轮 tools 数组不一致，
     # 模型可能引用一个已经消失的工具，端点直接 400。
-    tool_names = enabled_tool_names() if allow_tools else []
+    #
+    # 会话模式也在 loop 开头取一次：插件工具可以声明 modes（只在某些模式出现），
+    # 过滤依据必须与 tools_payload 用同一个 mode 值，否则会出现「schema 里
+    # 声明了某工具、执行时又被过滤掉」的错位。
+    _sess = _session_get(sid)
+    loop_mode = (_sess or {}).get("mode") if isinstance(_sess, dict) else None
+    tool_names = enabled_tool_names(loop_mode) if allow_tools else []
     use_fc = bool(tool_names)
     tools_payload = tool_schemas(tool_names) if use_fc else None
+
+    # 工具调用上下文同样冻结（见 _loop_ctx 的说明：userQuery/runId 整个 loop 不变）
+    loop_ctx = _loop_ctx(sid, history, loop_mode)
 
     work = list(history)     # 本次 loop 的完整工作上下文（含中间轮次）
     steps = []               # 落库用的中间步骤
@@ -3811,7 +6640,7 @@ def run_agent_loop(sid, client, prompt, history, allow_tools, cfg=None):
                                     "请根据已有信息直接回答，不要再重复调用。"})
             break
 
-        results, excl_hit = dispatch_exclusive(calls, max_parallel, {"sid": sid})
+        results, excl_hit = dispatch_exclusive(calls, max_parallel, loop_ctx)
         tool_call_total += len(calls)
         if excl_hit is not None:
             # 只有 ask_user **校验通过**才算真命中：参数不合法时 handler 返回
@@ -4076,6 +6905,26 @@ class Handler(BaseHTTPRequestHandler):
     def _html(self, html):
         self._send(html.encode(), "text/html; charset=utf-8")
 
+    def _send_extra(self, body, ctype, extra_headers, code=200):
+        """带自定义响应头的 _send。
+
+        为什么不直接给 _send 加参数：_send 被静态资源、JSON、HTML 三处共用，
+        改签名要动所有调用点，回归面大。插件面板是唯一需要额外头（CSP）的地方，
+        单开一个方法把影响面锁死在新增代码里。
+        """
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        try:
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
     def _static(self, name):
         ctype = STATIC_FILES.get(name)   # dict 精确匹配 = 白名单，穿越串命中不了
         if ctype is None:
@@ -4172,8 +7021,19 @@ class Handler(BaseHTTPRequestHandler):
                 # 工作笔记随会话一起回传：刷新页面 / 切换会话后进度条不丢
                 todos = list(s.get("todos") or []) if s else []
                 ask = s.get("pendingAsk") if s else None
+                # inflight：这一轮是否还在后台生成。前端据此决定「刷新后要不要
+                # 轮询重载」—— 用户中止/刷新时后端可能还没落库，此刻读到的
+                # messages/todos/ask 是旧的；告诉前端「还在跑」，它就能等
+                # 后端真正落库后重新拉一次，避免选项/进度条凭空消失。
+                inflight = bool(INFLIGHT.get(seg[1]))
+            # settleBudget：前端该等 inflight 落 false 多久（秒）。由后端按
+            # totalTimeout + request_timeout + 余量算，前端不硬编码 —— 硬编码的
+            # 90s 兜不住默认 180s 的 totalTimeout，长轮次会提前放弃轮询。
+            # 放锁外：只读 SETTINGS，不碰会话结构。
+            budget = settle_budget()
             self._json({"messages": msgs, "title": title, "mode": mode,
-                        "todos": todos, "ask": ask})
+                        "todos": todos, "ask": ask, "inflight": inflight,
+                        "settleBudget": budget})
         elif path == "/modes":
             self._json({
                 "modes": [{"id": k, "label": v["label"], "icon": v["icon"],
@@ -4187,6 +7047,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"tools": self._tool_list()})
         elif path == "/skills":
             self._json({"skills": self._skill_list()})
+        elif path == "/plugins":
+            self._json(self._plugin_overview())
+        elif path == "/plugins/market":
+            # ?refresh=1 强制刷新，绕过 5 分钟缓存
+            q = urllib.parse.parse_qs(urlparse(self.path).query)
+            force = _bool_arg((q.get("refresh") or ["0"])[0], False)
+            self._handle_plugin_market(force)
+        elif len(seg) == 4 and seg[0] == "plugins" and seg[1] == "market" \
+                and seg[3] == "detail":
+            self._handle_plugin_market_detail(seg[2])
+        elif len(seg) == 3 and seg[0] == "plugins" and seg[1] == "install-progress":
+            self._json(_progress_get(seg[2]))
+        elif len(seg) == 3 and seg[0] == "plugins" and seg[2] == "panel":
+            self._handle_plugin_panel(seg[1])
+        elif len(seg) == 3 and seg[0] == "plugins" and seg[2] == "logs":
+            self._handle_plugin_logs(seg[1])
         elif path == "/usage":
             self._json(usage_snapshot())
         elif path == "/config":
@@ -4204,6 +7080,24 @@ class Handler(BaseHTTPRequestHandler):
         s = json.loads(json.dumps(SETTINGS))
         m = s.get("model", {})
         m["api_key_set"] = bool(m.pop("api_key", ""))
+
+        # ⚠ 插件密钥脱敏。s 是 SETTINGS 的全量深拷贝，plugins.secrets 里存的是
+        # 插件通过 ctx.deps.secrets.set() 写入的真实凭据（OpenWeather key 之类）。
+        # 不脱敏就等于把密钥原样吐给任何能打开设置面板的人 —— 而这个服务默认
+        # bind 在局域网可达的地址上。
+        # 只回传 key 名 + 是否已设置，值一律替换成占位符。
+        # ⚠ 占位符必须用 PLUGIN_SECRET_MASK 常量：deep_merge_settings 靠比对
+        #   同一个常量来识别「前端没改这个值」，两边字面量漂移就会真写进配置。
+        pl = s.get("plugins")
+        if isinstance(pl, dict):
+            raw_sec = pl.get("secrets") if isinstance(pl.get("secrets"), dict) else {}
+            pl["secrets"] = {
+                pid: {k: PLUGIN_SECRET_MASK for k in kv.keys()} if isinstance(kv, dict) else {}
+                for pid, kv in raw_sec.items()
+            }
+            # registry 里的 lastError 可能含路径片段，但那是排障必需的，保留；
+            # sha256 不是秘密，保留供前端比对市场版本。
+
         s["info"] = {
             "data_dir": str(DATA_DIR),
             "skills_dir": str(SKILLS_DIR),
@@ -4218,6 +7112,17 @@ class Handler(BaseHTTPRequestHandler):
             "agent_ranges": {k: {"min": v[0], "max": v[1], "default": v[2]}
                              for k, v in AGENT_RANGES.items()},
             "tool_count": len(TOOLS),
+            # 插件运行态。node_available=False 时前端应把 Node 插件标 unsupported，
+            # 而不是让用户点了启用再失败。
+            "plugins": {
+                "dir": str(PLUGINS_DIR),
+                "node_bin": find_node_binary(),
+                "node_available": bool(find_node_binary()),
+                "api_version": PLUGIN_API_VERSION,
+                "host_shell_exists": PLUGIN_HOST_JS.is_file(),
+                "running": PLUGIN_MANAGER.running_ids(),
+                "installed": len(plugin_registry()),
+            },
         }
         s["usage"] = usage_snapshot()
         return s
@@ -4261,6 +7166,350 @@ class Handler(BaseHTTPRequestHandler):
                 "body_len": info["body_len"],
             })
         return out
+
+    def _plugin_overview(self):
+        """GET /plugins 的载荷：宿主环境 + 每个插件的状态。
+
+        顺手做崩溃巡检：进程可能已经死了而内存状态还写着 running。
+        面板打开的瞬间就把真相刷出来，而不是等用户调工具时才发现。
+        巡检放在 snapshot() 之前 —— snapshot 读的就是巡检后的状态。
+        """
+        try:
+            PLUGIN_MANAGER.patrol()
+        except Exception:
+            pass            # 巡检失败不该让整个面板 404
+        node_bin = find_node_binary()
+        return {
+            "host": {
+                "enabled": bool(plugins_cfg("enabled", True)),
+                "dir": str(PLUGINS_DIR),
+                "dirExists": PLUGINS_DIR.is_dir(),
+                "nodeBin": node_bin,
+                "nodeAvailable": bool(node_bin),
+                "apiVersion": PLUGIN_API_VERSION,
+                "hostShell": str(PLUGIN_HOST_JS),
+                "hostShellExists": PLUGIN_HOST_JS.is_file(),
+                "running": PLUGIN_MANAGER.running_ids(),
+                "states": list(PLUGIN_STATES),
+                # 面板靠这个值决定要不要显示「不支持，请先装 Node」的横幅
+                "unsupportedReason": "" if node_bin else "未找到 node 可执行文件",
+                # 导入面板要的三件事：inbox 在哪（用户得知道把 ZIP 放哪儿）、
+                # 体积上限（前端好提前拦下过大的包）、市场源（顶部标出来）
+                "inboxDir": str(PLUGIN_INBOX_DIR),
+                "inboxExists": PLUGIN_INBOX_DIR.is_dir(),
+                "zipMaxMb": PLUGIN_ZIP_MAX_MB,
+                "marketSources": [{"name": n, "base": b} for n, b in PLUGIN_MARKET_SOURCES],
+                "apiVersionRequired": PLUGIN_API_VERSION,
+            },
+            "plugins": PLUGIN_MANAGER.snapshot(),
+            # 插件工具已经并进 TOOLS，这里单独列一份，前端不必自己从 /tools 里挑
+            "tools": [
+                {"id": tid, "plugin": spec.get("plugin"),
+                 "desc": spec.get("desc", ""), "risk": spec.get("risk", "safe"),
+                 "modes": spec.get("modes"),
+                 "enabled": bool(SETTINGS.get("tools", {}).get(tid, True))}
+                for tid, spec in TOOLS.items() if spec.get("plugin")
+            ],
+        }
+
+    def _handle_plugin_logs(self, pid):
+        if not PLUGIN_ID_RE.match(pid or ""):
+            self._json({"error": f"非法插件 id: {pid}"}, 400); return
+        q = urllib.parse.parse_qs(urlparse(self.path).query)
+        raw = (q.get("limit") or [None])[0]
+        self._json(PLUGIN_MANAGER.logs(pid, raw))
+
+    # ---------- 插件面板 HTML（settingsPanel，P7） ----------
+
+    def _handle_plugin_panel(self, pid):
+        """serve 插件 manifest 里声明的 settingsPanel HTML。
+
+        前端用 <iframe sandbox="allow-scripts"> 承载（不给 allow-same-origin），
+        这里再加一道 CSP：插件 HTML 是第三方内容，两层限制缺一不可。
+        iframe 沙箱防它摸同源存储，CSP 防它往外发数据 / 加载远程脚本。
+        """
+        if not PLUGIN_ID_RE.match(pid or ""):
+            self._json({"error": f"非法插件 id: {pid}"}, 400); return
+        mf = PLUGIN_MANAGER.manifest(pid)
+        if not isinstance(mf, dict):
+            self._json({"error": f"插件未安装或 manifest 不可读: {pid}"}, 404); return
+        rel = mf.get("settingsPanel")
+        if not rel:
+            self._json({"error": f"插件 {pid} 没有声明 settingsPanel"}, 404); return
+        # rel 来自插件自己的 manifest —— 不可信输入，按 entry 同一套规则校验：
+        # 必须是目录内的裸文件名，不许分隔符与 ..
+        if not isinstance(rel, str) or "/" in rel or "\\" in rel or ".." in rel:
+            self._json({"error": f"settingsPanel 必须是插件目录内的裸文件名: {rel!r}"},
+                       400); return
+        p = PLUGIN_MANAGER.plugin_dir(pid) / rel
+        # 落点再验一次在插件目录内（防 rel 是奇怪形状时拼出目录外路径）
+        try:
+            root = PLUGIN_MANAGER.plugin_dir(pid).resolve()
+            resolved = p.resolve()
+            inside = (resolved.is_relative_to(root)
+                      if hasattr(resolved, "is_relative_to")
+                      else root.parts == resolved.parts[:len(root.parts)])
+        except OSError:
+            inside = False
+        if not inside or not p.is_file():
+            self._json({"error": f"面板文件不存在: {rel}"}, 404); return
+        try:
+            data = p.read_bytes()
+        except OSError as e:
+            self._json({"error": f"面板文件读取失败: {e}"}, 500); return
+        ctype = "text/html; charset=utf-8" if p.suffix.lower() in (".html", ".htm") \
+            else "text/plain; charset=utf-8"
+        self._send_extra(data, ctype, {
+            # unsafe-inline 是必须的：插件面板通常把 <script> 内联在 HTML 里。
+            # connect-src 'self' 让它只能打回本服务，不能把数据发到外站。
+            "Content-Security-Policy":
+                "default-src 'self' 'unsafe-inline'; connect-src 'self'; "
+                "img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+                "script-src 'self' 'unsafe-inline'",
+            "X-Frame-Options": "SAMEORIGIN",
+            "X-Content-Type-Options": "nosniff",
+        })
+
+    # ---------- 插件市场（P5） ----------
+
+    def _handle_plugin_market(self, force_refresh=False):
+        try:
+            data = market_overview(force_refresh=force_refresh)
+        except Exception as e:
+            self._json({"ok": False, "plugins": [],
+                        "error": f"市场读取失败: {type(e).__name__}: {e}"}, 502)
+            return
+        if not data.get("ok"):
+            # 源不可达不是客户端错误也不是服务端 bug，用 502（上游不可用）
+            self._json(data, 502); return
+        self._json(data)
+
+    def _handle_plugin_market_detail(self, pid):
+        if not PLUGIN_ID_RE.match(pid or ""):
+            self._json({"error": f"非法插件 id: {pid}"}, 400); return
+        try:
+            data = market_detail(pid)
+        except Exception as e:
+            self._json({"ok": False, "id": pid,
+                        "error": f"详情读取失败: {type(e).__name__}: {e}"}, 502)
+            return
+        self._json(data, 200 if data.get("ok") else 404)
+
+    # ---------- 导入（P6）：三条通道 ----------
+
+    def _plugin_write_gate(self, action):
+        """导入类操作的统一本机门。返回 True 表示放行。
+
+        为什么导入必须加本机门（而 enable/disable 不加）：导入 = 往手机写文件
+        + 之后可以执行其中的任意 Node 代码，等价于远程代码执行。服务默认
+        bind 0.0.0.0 且无鉴权，同一 WiFi 下任意设备都能打到这个端点。
+        enable/disable 的破坏力只等同既有的 /tools/<tid> 开关（那个历史上就
+        没加本机门），加了反而让面板行为不一致。
+        """
+        if self._is_local_client():
+            return True
+        self._json({"error": f"仅本机可{action}插件（会写入文件并可执行其中的代码，"
+                             f"不开放给局域网其他设备）"}, 403)
+        return False
+
+    def _start_install_job(self, kind, label, worker):
+        """把一个安装动作丢到后台线程，立刻回 job key。
+
+        为什么不直接在请求线程里做完：市场下载 9.1 MB 的包 + 解包 + 可能还要
+        spawn node 做 register，实测能到几十秒。浏览器 fetch 没有超时设置，
+        但用户会以为卡死了；而且请求线程被占住期间 ThreadingHTTPServer 还要
+        再开线程服务其他请求，手机上没必要这么浪费。
+
+        统一异步还有个好处：前端只有一条「拿 job key → 轮询 install-progress」
+        的路径，四条导入通道共用同一套进度条代码。
+        """
+        job = f"{kind}-{uuid.uuid4().hex[:12]}"
+        _progress_set(job, "downloading", 0, 0, f"{label} 排队中")
+
+        def run():
+            try:
+                ok, info = worker(job)
+                stage = "done" if ok else "failed"
+                msg = ""
+                if isinstance(info, dict):
+                    msg = str(info.get("error") or info.get("id") or "")
+                elif info:
+                    msg = str(info)
+                # info 传给 _progress_set 让它落到进度记录里，前端轮询时能拿到
+                # 完整安装结果（含 risky / sha256 / verified）
+                _progress_set(job, stage, message=msg or ("成功" if ok else "失败"),
+                              info={"ok": bool(ok),
+                                    "info": info if isinstance(info, (dict, str)) else str(info)})
+                if ok:
+                    # TOOLS 变了，系统提示里的工具清单是文本快照，必须重建
+                    rebuild_system_prompt()
+            except Exception as e:
+                _progress_set(job, "failed",
+                              message=f"{type(e).__name__}: {e}",
+                              info={"ok": False, "info": f"{type(e).__name__}: {e}"})
+
+        t = threading.Thread(target=run, name=f"plg-import-{job}", daemon=True)
+        t.start()
+        self._json({"ok": True, "job": job, "kind": kind, "label": label})
+
+    def _handle_plugin_import(self, body):
+        """POST /plugins/import —— 浏览器选文件，base64 JSON 上传。
+
+        ⚠ 与原设计的偏离（已在计划里标注）：原计划写 multipart/form-data。
+        手机端 _body() 只解析 JSON，multipart 要自己写 boundary 解析器。
+        改用 base64 JSON 能复用现有管道与前端 apiPost，代价是体积涨 4/3，
+        所以这里的上限按「base64 字符串长度」算，不是按原始字节算。
+        """
+        if not self._plugin_write_gate("导入"):
+            return
+        b64 = body.get("dataBase64")
+        if not isinstance(b64, str) or not b64:
+            self._json({"error": "缺少 dataBase64 字段（ZIP 的 base64 编码）"}, 400); return
+        # 先按 base64 长度粗筛：解码前就拒掉超大的，避免白白 decode 一次 43 MB
+        max_b64 = int(PLUGIN_ZIP_MAX_MB * 1024 * 1024 * 4 / 3) + 4096
+        if len(b64) > max_b64:
+            self._json({"error": f"上传内容超过上限 {PLUGIN_ZIP_MAX_MB} MB"
+                                 f"（base64 长度 {len(b64)}）"}, 413); return
+        try:
+            data = base64.b64decode(b64, validate=False)
+        except (ValueError, TypeError) as e:
+            self._json({"error": f"base64 解码失败: {e}"}, 400); return
+        if not data:
+            self._json({"error": "解码后是空的（0 字节）"}, 400); return
+        if len(data) > PLUGIN_ZIP_MAX_MB * 1024 * 1024:
+            self._json({"error": f"压缩包 {len(data)//(1024*1024)} MB 超过上限 "
+                                 f"{PLUGIN_ZIP_MAX_MB} MB"}, 413); return
+
+        fn = _as_str(body.get("filename"), "upload.zip")[:120]
+        want_sha = _as_str(body.get("sha256"), "").strip().lower() or None
+        enable = _bool_arg(body.get("enable"), False)
+
+        def worker(job):
+            return PLUGIN_MANAGER.import_zip_bytes(
+                data, source="upload", expect_sha256=want_sha,
+                enable=enable, progress_key=job)
+
+        self._start_install_job("upload", fn, worker)
+
+    def _handle_plugin_import_url(self, body):
+        """POST /plugins/import-url —— 贴 ZIP 直链，后端流式下载再装。"""
+        if not self._plugin_write_gate("导入"):
+            return
+        url = _as_str(body.get("url"), "").strip()
+        if not url:
+            self._json({"error": "缺少 url 字段"}, 400); return
+        try:
+            _assert_http_url(url)
+        except NetError as e:
+            self._json({"error": f"URL 不被接受 {e}"}, 400); return
+        want_sha = _as_str(body.get("sha256"), "").strip().lower() or None
+        enable = _bool_arg(body.get("enable"), False)
+        label = url.rsplit("/", 1)[-1][:60] or url[:60]
+
+        def worker(job):
+            tmp = None
+            try:
+                PLUGIN_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+                fd, name = tempfile.mkstemp(prefix="url_", suffix=".zip",
+                                            dir=str(PLUGIN_TMP_ROOT))
+                os.close(fd)
+                tmp = Path(name)
+                try:
+                    _market_download_stream(
+                        url, tmp, PLUGIN_ZIP_MAX_MB * 1024 * 1024, progress_key=job)
+                except (NetError, ValueError) as e:
+                    _progress_set(job, "failed", message=str(e))
+                    return False, f"下载失败 {e}"
+                return PLUGIN_MANAGER.import_zip_file(
+                    tmp, source="url", expect_sha256=want_sha,
+                    enable=enable, progress_key=job)
+            except OSError as e:
+                return False, f"临时文件失败: {e}"
+            finally:
+                if tmp is not None:
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+
+        self._start_install_job("url", label, worker)
+
+    def _handle_plugin_scan_inbox(self, body):
+        """POST /plugins/scan-inbox —— 只列出候选，不安装（安装走 import-inbox）。
+
+        用 POST 而不是 GET：与其它导入端点保持同一方法，前端一组代码；
+        且它没有副作用，重复点无妨。
+        """
+        if not self._plugin_write_gate("导入"):
+            return
+        try:
+            data = PLUGIN_MANAGER.scan_inbox()
+        except OSError as e:
+            self._json({"error": f"扫描失败: {e}"}, 500); return
+        data["ok"] = True
+        # 顺手把上限告诉前端，让它能直接标出「这个包太大装不了」
+        data["maxMb"] = PLUGIN_ZIP_MAX_MB
+        self._json(data)
+
+    def _handle_plugin_import_inbox(self, body):
+        """POST /plugins/import-inbox —— 装 inbox 里指定的那个 ZIP。"""
+        if not self._plugin_write_gate("导入"):
+            return
+        fn = _as_str(body.get("filename"), "").strip()
+        if not fn:
+            self._json({"error": "缺少 filename 字段"}, 400); return
+        # filename 会拼进路径，必须过白名单：只准裸文件名，且必须真的在 inbox 里。
+        # 不做这一步的话 "?filename=../../.config.json" 就能读到配置文件。
+        if "/" in fn or "\\" in fn or ".." in fn or fn.startswith("."):
+            self._json({"error": f"非法文件名: {fn!r}"}, 400); return
+        p = PLUGIN_INBOX_DIR / fn
+        try:
+            inside = p.resolve().is_relative_to(PLUGIN_INBOX_DIR.resolve()) \
+                if hasattr(p.resolve(), "is_relative_to") else True
+        except OSError:
+            inside = False
+        if not inside:
+            self._json({"error": f"文件名越出 inbox 目录: {fn!r}"}, 400); return
+        if not p.is_file():
+            self._json({"error": f"inbox 里没有这个文件: {fn}"
+                                 f"（目录 {PLUGIN_INBOX_DIR}）"}, 404); return
+        want_sha = _as_str(body.get("sha256"), "").strip().lower() or None
+        enable = _bool_arg(body.get("enable"), False)
+        delete_after = _bool_arg(body.get("deleteAfter"), False)
+
+        def worker(job):
+            ok, info = PLUGIN_MANAGER.import_zip_file(
+                p, source="inbox", expect_sha256=want_sha,
+                enable=enable, progress_key=job)
+            # 装完删源文件：inbox 是「待装队列」，装成功还留着会让用户
+            # 下次扫描又看到它、以为没装上。失败则保留，方便重试。
+            if ok and delete_after:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            return ok, info
+
+        self._start_install_job("inbox", fn, worker)
+
+    def _handle_plugin_market_install(self, pid, from_source, body):
+        """POST /plugins/market/<id>/install[-from-source]。"""
+        if not self._plugin_write_gate("从市场安装"):
+            return
+        if not PLUGIN_ID_RE.match(pid or ""):
+            self._json({"error": f"非法插件 id: {pid}"}, 400); return
+        enable = _bool_arg(body.get("enable"), False)
+        force = _bool_arg(body.get("refresh"), False)
+        if from_source:
+            def worker(job):
+                return market_install_from_source(
+                    pid, enable=enable, progress_key=job, force_refresh=force)
+            self._start_install_job("market-src", pid, worker)
+        else:
+            def worker2(job):
+                return market_install(
+                    pid, enable=enable, progress_key=job, force_refresh=force)
+            self._start_install_job("market", pid, worker2)
 
     def _route_post(self, path):
         global CURRENT_SID
@@ -4310,6 +7559,32 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_skill_toggle(seg[1], body)
             return
 
+        # 插件启停/卸载：POST /plugins/<id>/<action>
+        # 三段路径，与上面两段的 tools/skills 分支不会撞。
+        if len(seg) == 3 and seg[0] == "plugins":
+            self._handle_plugin_action(seg[1], seg[2], body)
+            return
+
+        # 插件导入：四条两段路径，全是精确匹配，彼此不会撞，也不会被上面那条
+        # len==3 的 <id>/<action> 截胡（段数不同）。
+        if path == "/plugins/import":
+            self._handle_plugin_import(body)
+            return
+        if path == "/plugins/import-url":
+            self._handle_plugin_import_url(body)
+            return
+        if path == "/plugins/scan-inbox":
+            self._handle_plugin_scan_inbox(body)
+            return
+        if path == "/plugins/import-inbox":
+            self._handle_plugin_import_inbox(body)
+            return
+        # 市场安装：四段路径 /plugins/market/<id>/install[-from-source]
+        if len(seg) == 4 and seg[0] == "plugins" and seg[1] == "market" \
+                and seg[3] in ("install", "install-from-source"):
+            self._handle_plugin_market_install(seg[2], seg[3] == "install-from-source", body)
+            return
+
         if path == "/tts":
             ok, msg = tts_speak(body.get("text", ""))
             self._json({"ok": ok, "message": msg})
@@ -4355,6 +7630,59 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self._json({"error": "not found"}, 404)
+
+    def _handle_plugin_action(self, pid, action, body):
+        """POST /plugins/<id>/<action> —— enable / disable / uninstall。
+
+        ⚠ 三个动作之后都必须 rebuild_system_prompt()：TOOLS 变了，而系统提示里的
+        「=== 可用工具 ===」清单是**文本快照**。不重建的话模型在提示里看不到新工具
+        （FC schema 是每轮现算的，所以工具其实能调 —— 但提示与 schema 不一致
+        会让模型困惑，也可能因为提示里明写「只能用上面列出的工具名」而拒绝调用）。
+        """
+        if not PLUGIN_ID_RE.match(pid or ""):
+            self._json({"error": f"非法插件 id: {pid}"}, 400); return
+
+        if action not in ("enable", "disable", "uninstall"):
+            self._json({"error": f"unknown action: {action}"
+                                 f"（支持 enable / disable / uninstall）"}, 404); return
+
+        # 卸载会删文件，不可逆。与 /service/* 一样只允许本机发起 ——
+        # 服务默认 bind 0.0.0.0 且无鉴权，同一 WiFi 下任意设备都能打到这里。
+        # enable/disable 不在此列：它们的破坏力等同于既有的 /tools/<tid> 开关
+        # （那个端点历史上就没加本机门），加了反而会让面板行为不一致。
+        if action == "uninstall" and not self._is_local_client():
+            self._json({"error": "仅本机可卸载插件（删除文件不可逆）"}, 403); return
+
+        if action == "enable":
+            if not PLUGIN_MANAGER.plugin_dir(pid).is_dir():
+                self._json({"error": f"插件未安装: {pid}"}, 404); return
+            ok, info = PLUGIN_MANAGER.start(pid)
+            rebuild_system_prompt()
+            self._json({"ok": ok, "id": pid, "action": action,
+                        "info": info if ok else str(info),
+                        "state": PLUGIN_MANAGER.state(pid),
+                        "toolCount": len(TOOLS)},
+                       200 if ok else 502)
+            return
+
+        if action == "disable":
+            ok, info = PLUGIN_MANAGER.stop(pid, keep_registry=True)
+            rebuild_system_prompt()
+            self._json({"ok": ok, "id": pid, "action": action,
+                        "info": info if isinstance(info, dict) else str(info),
+                        "state": PLUGIN_MANAGER.state(pid),
+                        "toolCount": len(TOOLS)})
+            return
+
+        # uninstall：removeData=true 才连 data/ 与 secrets 一起删（对齐桌面端语义，
+        # 默认保留数据，重装插件不丢配置）。
+        remove_data = _bool_arg(body.get("removeData"), False)
+        ok, info = PLUGIN_MANAGER.uninstall(pid, remove_data=remove_data)
+        rebuild_system_prompt()
+        self._json({"ok": ok, "id": pid, "action": action,
+                    "info": info if isinstance(info, dict) else str(info),
+                    "toolCount": len(TOOLS)},
+                   200 if ok else 500)
 
     def _handle_settings(self, body):
         with SETTINGS_LOCK:
@@ -4437,6 +7765,13 @@ class Handler(BaseHTTPRequestHandler):
             if INFLIGHT.get(sid):
                 self._json({"error": "busy", "aborted": True}, 409); return
             INFLIGHT[sid] = True
+            # 清掉上一轮可能残留的中止标记，且必须与 INFLIGHT 置位在同一把锁内原子完成。
+            # 若放到锁外（构造 client/prompt 之后）再清，会留一个窗口：用户恰好在
+            # 「INFLIGHT 已置位、clear_abort 尚未执行」之间点了停止，那次 abort 会被
+            # 这里的 clear 吞掉，loop 再也收不到中止信号，一路空转到 totalTimeout。
+            # 直接操作 ABORT（不调 clear_abort）——STORE_LOCK 是不可重入 Lock，锁内
+            # 再调会死锁。
+            ABORT.pop(sid, None)
             s = SESSIONS.get(sid)
             if not s:
                 s = {"id": sid, "title": "新对话", "messages": [], "created": time.time(),
@@ -4478,9 +7813,9 @@ class Handler(BaseHTTPRequestHandler):
             client = LLMClient(SETTINGS)
             prompt = get_system_prompt(mode)
 
-            # 开跑前清掉可能残留的中止标记（上次异常退出留下的），
-            # 否则这一轮会在开头就被自己的旧标记掐断。
-            clear_abort(sid)
+            # 残留中止标记已在上面置 INFLIGHT 的同一把锁内清掉（见 ABORT.pop）。
+            # 这里不再清 —— 否则又会开出「INFLIGHT 已置位、标记被清」的窗口，
+            # 用户在这中间点的停止会被吞掉。
 
             res = run_agent_loop(sid, client, prompt, history,
                                  mode_allows_tools)
@@ -4515,11 +7850,13 @@ class Handler(BaseHTTPRequestHandler):
                         s["pendingAsk"] = res["ask"]
                     s["messages"].append(entry)
                     save_sessions(SESSIONS)
-                todos_out = []
-                with STORE_LOCK:
-                    s2 = SESSIONS.get(sid)
-                    if s2 is not None:
-                        todos_out = list(s2.get("todos") or [])
+                # ⚠ 这里绝不能再写 with STORE_LOCK —— 已经在外层锁内，而
+                #   STORE_LOCK 是不可重入的 threading.Lock，同线程二次 acquire
+                #   会永久死锁：handler 卡在落库、到不了 finally，INFLIGHT 永不
+                #   清零，前端 settle 轮询永远等不到 inflight=false，中止/刷新后
+                #   提问卡选项与进度条就再也回不来（本 bug 的最底层根因）。
+                #   s 即 SESSIONS.get(sid)，与重新取一次是同一个对象，直接复用。
+                todos_out = list((s or {}).get("todos") or [])
 
             self._json({
                 "response": resp,
@@ -4689,6 +8026,14 @@ def main():
             pass
         print("  ⚠ 已对局域网开放，且 shell 工具可执行任意命令")
         print("    不需要外部访问时，在设置 → 服务里改成 127.0.0.1")
+
+    # 插件拉起必须在 server 建好之后、serve_forever 之前：
+    #   · 之前 —— 插件 register 时宿主会回调 storage/secrets（进程内直调，
+    #     不依赖 HTTP），但若插件失败，前端要能立刻 GET /plugins 拿到原因，
+    #     HTTP 还没监听就什么都看不到。
+    #   · 异步 —— 见 plugin_boot_async 的 docstring：守护器判活的超时是固定的，
+    #     node 冷启动 1-3s，同步做会连累 /health。
+    plugin_boot_async()
 
     print("\n按 Ctrl+C 停止\n")
     try:

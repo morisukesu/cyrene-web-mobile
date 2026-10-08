@@ -18,6 +18,20 @@ var chat = $('chat'), input = $('input'), sendBtn = $('send-btn'),
     saveStatus = $('save-status');
 
 var currentSid = null, busy = false, aborter = null, timer = null, secs = 0, t0 = 0;
+/* settleTimer/settleTries：中止或刷新后，轮询后端「这一轮落库了没」的定时器与计数。
+   为什么需要轮询：abort 只是给后端置了个中止标记，run_agent_loop 要跑到下一个
+   检查点才优雅退出并落库（ask/todos/assistant 消息）。前端若不等一下就直接渲染，
+   读到的是旧 session，提问卡选项、进度条会「凭空消失」。等 inflight 落为 false
+   再拉一次，状态才和后端一致。 */
+var settleTimer = null, settleTries = 0;
+/* 轮询上限优先用后端回传的 settleBudget（秒）：它按 totalTimeout + request_timeout
+   + 余量算，前端不该自己猜。曾经硬编码 75 次 ≈ 90s，而 totalTimeout 默认就有
+   180s —— 长轮次（开思考链时单次请求显著变慢，最容易撞上）会在后端还在跑的时候
+   就放弃轮询、把旧画面定格下来，提问卡选项和进度条依旧「消失」。
+   SETTLE_MAX_TRIES 只在拿不到后端值时兜底（315s ≈ 180+120+15，与后端默认一致）。 */
+var SETTLE_INTERVAL_MS = 1200;
+var SETTLE_BUDGET_SEC = 0;                                  /* 0 = 还没从后端拿到 */
+var SETTLE_MAX_TRIES = Math.ceil(315000 / SETTLE_INTERVAL_MS);
 var CODE_STORE = {}, CODE_SEQ = 0;
 var SETTINGS = null;                 // 服务端配置的本地镜像
 var MODES = [], DEFAULT_MODE = 'chat', currentMode = 'chat';
@@ -704,20 +718,95 @@ function loadSessions() {
     if (!currentSid) { currentSid = d.current; return loadChat(); }
   });
 }
+/* 渲染一次 GET /chat 的回包。renderChat 内部 chat.innerHTML='' 全量重建，
+   所以重复调用幂等 —— settle 轮询里反复 applyChatData 不会叠加气泡或提问卡。 */
+function applyChatData(d) {
+  if (d.mode) { currentMode = d.mode; applyModeUI(d.mode); }
+  renderChat(d.messages, d.title);
+  renderTodos(d.todos);
+  /* 待答提问：后端 session.pendingAsk 还在，说明用户刷新前没答。
+     补一张可交互的卡片到末尾，让他接着答。
+     renderChat 里那些历史卡是定格的，不会和这张重复响应点击。 */
+  if (d.ask && d.ask.questions && d.ask.questions.length) {
+    var stick = atBottom();
+    chat.appendChild(makeAskCard(d.ask, true).row);
+    scrollBottom(stick);
+  }
+}
+
+function stopSettle() {
+  if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
+  settleTries = 0;
+}
+
+/* 中止 / 刷新后，后端那一轮可能还在后台收尾落库（assistant 消息、pendingAsk、
+   todos）。此时 GET /chat 读到的是旧状态，直接渲染就会让「提问卡选项、进度条
+   凭空消失」。这里轮询等 inflight 落为 false，每轮都用 applyChatData 全量重渲染，
+   后端一落库，选项 / 进度条就回来了。幂等，不会叠加。 */
+function settleAfterLoad(sid) {
+  stopSettle();
+  function poll() {
+    settleTries++;
+    /* 用户切走了、或又发了新消息 → 交给新流程，别再刷这个会话 */
+    if (sid !== currentSid || busy) { stopSettle(); return; }
+    api('/chat/' + encodeURIComponent(sid)).then(function (d) {
+      if (sid !== currentSid || busy) { stopSettle(); return; }
+      /* 后端每次都会带上「该等多久」，用它而不是前端写死的值 */
+      if (d.settleBudget) SETTLE_BUDGET_SEC = d.settleBudget;
+      var limit = SETTLE_BUDGET_SEC
+        ? Math.ceil(SETTLE_BUDGET_SEC * 1000 / SETTLE_INTERVAL_MS)
+        : SETTLE_MAX_TRIES;
+      /* 还在后台跑且预算没烧完：先不动 DOM（保留「正在收尾」提示，也避免半截
+         状态闪一下），继续等。等 inflight 落 false 再一次性渲染真实内容。 */
+      if (d.inflight && settleTries < limit) {
+        settleTimer = setTimeout(poll, SETTLE_INTERVAL_MS);
+        return;
+      }
+      var waitedSec = Math.round(settleTries * SETTLE_INTERVAL_MS / 1000);
+      applyChatData(d);
+      stopSettle();
+      /* 预算烧完了后端还在跑（totalTimeout 被调大、或单次请求异常慢）。
+         此前这里静默定格在旧画面，用户看到的就是「选项/进度条没了」，只能手动
+         刷新 —— 现在明确告诉他后端还在收尾，并给一个就地重等的入口。
+         已等秒数必须在 stopSettle 之前取：它会把 settleTries 归零。 */
+      if (d.inflight) addSettleGiveUpNotice(sid, waitedSec);
+    }).catch(function () { stopSettle(); });
+  }
+  /* 首次稍等一下再查，给后端一点落库时间，别立刻又读到「还在跑」 */
+  settleTimer = setTimeout(poll, 800);
+}
+
+/* 轮询到上限而后端仍在生成时的提示。必须紧跟在 applyChatData 之后调用 ——
+   renderChat 内部 chat.innerHTML='' 全量重建，先追加的节点会被清掉。 */
+function addSettleGiveUpNotice(sid, waitedSec) {
+  var p = makeBubble('bot');
+  p.bub.textContent = '（后端这一轮还在收尾，已经等了 ' + waitedSec + 's。'
+    + '结果落库后才会显示，不用刷新页面。）';
+  var acts = document.createElement('div'); acts.className = 'ask-box__acts';
+  var btn = document.createElement('button');
+  btn.type = 'button'; btn.className = 'btn btn--primary btn--sm';
+  btn.textContent = '再等一会儿';
+  btn.addEventListener('click', function () {
+    /* 切走了或已经在生成中就别重启，交给新流程 */
+    if (sid !== currentSid || busy) { p.row.remove(); return; }
+    p.row.remove();          /* 提示是临时的，重等一轮就不该留在历史里 */
+    settleAfterLoad(sid);    /* stopSettle 会把 settleTries 归零，能等满一个新预算 */
+  });
+  acts.appendChild(btn);
+  p.bub.appendChild(acts);
+  var stick = atBottom();
+  chat.appendChild(p.row);
+  scrollBottom(stick);
+}
+
 function loadChat() {
   if (!currentSid) return Promise.resolve();
+  stopSettle();
   return api('/chat/' + encodeURIComponent(currentSid)).then(function (d) {
-    if (d.mode) { currentMode = d.mode; applyModeUI(d.mode); }
-    renderChat(d.messages, d.title);
-    renderTodos(d.todos);
-    /* 待答提问：后端 session.pendingAsk 还在，说明用户刷新前没答。
-       补一张可交互的卡片到末尾，让他接着答。
-       renderChat 里那些历史卡是定格的，不会和这张重复响应点击。 */
-    if (d.ask && d.ask.questions && d.ask.questions.length) {
-      var stick = atBottom();
-      chat.appendChild(makeAskCard(d.ask, true).row);
-      scrollBottom(stick);
-    }
+    applyChatData(d);
+    /* 后端这一轮还在后台跑（刷新时常见，或刚点过停止）：先渲染已有历史，
+       再轮询等它落库后重渲染，选项 / 进度条才不会停在旧画面。 */
+    if (d.inflight) settleAfterLoad(currentSid);
   });
 }
 function newChat() {
@@ -785,8 +874,17 @@ function setBusy(on) {
 
 function onSend() {
   if (busy) {
-    /* abort() 只断开浏览器到服务的连接；服务端 urlopen 无法被外部中断，
-       那次调用会继续跑完。文案如实说明，不谎称「已停止生成」。 */
+    /* 「停止」= 两件事，缺一不可：
+       1) POST /chat/<sid>/abort 通知后端置中止标记 —— run_agent_loop 会在下一个
+          检查点优雅退出并落库（assistant 消息 / pendingAsk / todos）。不通知的话
+          后端一无所知，继续跑到 totalTimeout，这一轮迟迟不落库，刷新也看不到。
+       2) aborter.abort() 断开本地 fetch —— 前端立刻从转圈中解放，不干等后端。
+       断开后 sendTurn 的 catch 走 AbortError 分支，触发 settleAfterLoad 轮询后端
+       落库状态，把这一轮的提问卡 / 进度条自动捞回来。 */
+    if (currentSid) {
+      apiPost('/chat/' + encodeURIComponent(currentSid) + '/abort', {})
+        .catch(function () { /* 中止通知失败也不影响断本地连接 */ });
+    }
     if (aborter) { aborter.abort(); aborter = null; }
     return;
   }
@@ -803,6 +901,10 @@ function onSend() {
 function sendTurn(text, isRetry) {
   setBusy(true);
   showThinking();
+  /* 新一轮开始：先停掉可能还在跑的 settle 轮询，避免它和这一轮的渲染交错
+     （poll 里的 applyChatData 是全量重建，和 sendTurn 成功后的 addSegmented
+     抢 DOM 会让气泡 / 提问卡错乱）。 */
+  stopSettle();
   aborter = new AbortController();
   t0 = Date.now();
 
@@ -855,8 +957,12 @@ function sendTurn(text, isRetry) {
     setStatus('error');
     var msg;
     if (e && e.name === 'AbortError') {
-      msg = '（已取消等待，耗时 ' + Math.round((Date.now() - t0) / 1000)
-        + 's。回复可能仍在后台生成，稍后刷新会话可看到。）';
+      msg = '（已停止等待，耗时 ' + Math.round((Date.now() - t0) / 1000)
+        + 's。这一轮可能还在后台收尾，稍等会自动刷新出结果。）';
+      /* 用户主动中止：后端收到 /abort 后会尽快落库这一轮。启动 settle 轮询，
+         等 inflight 落 false 就重渲染，把这一轮的提问卡 / 进度条捞回来，
+         不用让用户手动刷新。 */
+      if (currentSid) settleAfterLoad(currentSid);
     } else if (e && e.status === 409) {
       msg = '（上一条还在后台生成中，等它跑完再发吧。）';
     } else {
@@ -897,6 +1003,7 @@ var SETTINGS_TABS = [
   { key: 'mode',       label: '模式' },
   { key: 'reasoning',  label: '思考' },
   { key: 'tools',      label: '工具' },
+  { key: 'plugins',    label: '插件' },
   { key: 'skills',     label: '技能' },
   { key: 'tts',        label: '语音' },
   { key: 'usage',      label: '用量' },
@@ -1485,6 +1592,617 @@ PANELS.skills = function (host, S) {
     grid.innerHTML = '<div class="alert alert--err">技能列表读取失败: '
       + escHtml(e.message || e) + '</div>';
   });
+};
+
+/* ================= 插件（P7） ================= */
+/* 后端契约见 cyrene_web.py 的 _plugin_overview / market_overview：
+   GET /plugins            → {host, plugins[], tools[]}
+   GET /plugins/market     → {ok, source, fellBack, plugins[], counts, stale, error}
+   GET /plugins/<id>/logs  → {state, error, logs[], logsLost}
+   POST /plugins/<id>/<enable|disable|uninstall>（同步，enable 要等 node 冷启动）
+   POST /plugins/import|import-url|scan-inbox|import-inbox（导入，返回 job 后轮询）
+   POST /plugins/market/<id>/install[-from-source]（返回 job 后轮询）
+   GET /plugins/install-progress/<job> → {stage, done, total, message, info}
+   GET /plugins/<id>/panel → 插件自带 HTML，用 iframe sandbox 承载 */
+
+/* 插件状态七态中文化。与后端 PLUGIN_STATES 对齐，多出来的 unsupported 也在这。 */
+var PLUGIN_STATE_ZH = {
+  not_installed: '未安装', installed: '已安装', starting: '启动中',
+  running: '运行中', stopping: '停止中', failed: '启动失败',
+  crashed: '已崩溃', unsupported: '不支持'
+};
+function pluginStateZh(s) { return PLUGIN_STATE_ZH[s] || s || '未知'; }
+/* 状态徽标配色：复用 tool-card__badge，再叠一个语义 class。
+   running 绿、failed/crashed 红、其余灰。CSS 里没有的 class 就靠内联兜底。 */
+function pluginStateColor(s) {
+  if (s === 'running') return '#2e9e5b';
+  if (s === 'failed' || s === 'crashed') return '#d9534f';
+  if (s === 'unsupported') return '#c8860d';
+  if (s === 'starting' || s === 'stopping') return '#4a90d9';
+  return '#8a8f98';
+}
+
+/* 轮询一个安装 job 的进度，直到 done/failed 或超时。
+   导入与市场安装都是「后端丢后台线程、立刻回 job key」的异步模型，
+   前端靠这个轮询驱动进度条。240 次 × 1s ≈ 4 分钟上限，够下 32MB 的包。 */
+function pluginPollJob(job, onTick, onEnd) {
+  var tries = 0;
+  var iv = setInterval(function () {
+    tries++;
+    api('/plugins/install-progress/' + encodeURIComponent(job)).then(function (p) {
+      if (onTick) onTick(p);
+      if (p.stage === 'done' || p.stage === 'failed') {
+        clearInterval(iv); if (onEnd) onEnd(p, false);
+      } else if (tries > 240) {
+        clearInterval(iv);
+        if (onEnd) onEnd({ stage: 'failed', message: '等待超时（超过 4 分钟）' }, true);
+      }
+    }).catch(function () {
+      /* 单次查询失败不中断（后端可能正好在重启），只在超时后收尾 */
+      if (tries > 240) {
+        clearInterval(iv);
+        if (onEnd) onEnd({ stage: 'failed', message: '进度查询失败' }, true);
+      }
+    });
+  }, 1000);
+  return iv;
+}
+
+/* 读文件成 base64（去掉 data:...;base64, 前缀）。上传通道用。
+   后端 POST /plugins/import 收的是 {dataBase64}，不是 multipart。 */
+function pluginReadFileAsBase64(file) {
+  return new Promise(function (resolve, reject) {
+    var fr = new FileReader();
+    fr.onload = function () {
+      var s = String(fr.result || '');
+      var i = s.indexOf(',');
+      resolve(i >= 0 ? s.slice(i + 1) : s);
+    };
+    fr.onerror = function () { reject(new Error('读取文件失败')); };
+    fr.readAsDataURL(file);
+  });
+}
+
+/* 弹层：用 iframe sandbox 承载插件自带的 settingsPanel HTML。
+   sandbox 只给 allow-scripts，**不给 allow-same-origin** —— 插件 HTML 是第三方
+   内容，不给同源就意味着它读不到本站 cookie/localStorage，也发不出带凭据的请求。
+   后端那头还叠了 CSP（connect-src 'self'），两层缺一不可。 */
+function openPluginIframe(id, name) {
+  var old = document.getElementById('plugin-panel-overlay');
+  if (old) old.remove();
+  var ov = document.createElement('div');
+  ov.id = 'plugin-panel-overlay';
+  ov.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.6);'
+    + 'display:flex;align-items:center;justify-content:center;padding:16px';
+  var box = document.createElement('div');
+  box.style.cssText = 'background:var(--cy-card-bg,#1e1e1e);border-radius:14px;'
+    + 'width:100%;max-width:520px;max-height:86vh;display:flex;flex-direction:column;'
+    + 'overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.4)';
+  var bar = document.createElement('div');
+  bar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;'
+    + 'padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.08)';
+  var t = document.createElement('strong');
+  t.textContent = (name || id) + ' · 设置面板';
+  t.style.cssText = 'font-size:15px;color:var(--cy-text,#eee)';
+  var x = btn('关闭', function () { ov.remove(); }, 'btn--ghost btn--sm');
+  bar.appendChild(t); bar.appendChild(x);
+  var fr = document.createElement('iframe');
+  fr.setAttribute('sandbox', 'allow-scripts');   // 刻意不含 allow-same-origin
+  fr.src = '/plugins/' + encodeURIComponent(id) + '/panel';
+  fr.style.cssText = 'flex:1;width:100%;border:0;background:#fff;min-height:320px';
+  fr.title = (name || id) + ' 插件面板';
+  box.appendChild(bar); box.appendChild(fr);
+  ov.appendChild(box);
+  ov.addEventListener('click', function (e) { if (e.target === ov) ov.remove(); });
+  document.body.appendChild(ov);
+}
+
+/* 把「403 仅本机」这类后端语义错误翻译成人话，别把原始 HTTP 文本甩给用户。
+   api() 抛的 Error 带 e.status 与 e.payload，这里据此分流。 */
+function pluginErrMsg(e, fallback) {
+  if (e && e.status === 403) {
+    return (e.payload && e.payload.error) || '仅本机可执行此操作（不能在局域网其他设备上做）';
+  }
+  if (e && e.status === 413) {
+    return (e.payload && e.payload.error) || '文件太大，超过上限';
+  }
+  return (e && (e.message || e.payload && e.payload.error)) || fallback || '操作失败';
+}
+
+PANELS.plugins = function (host, S) {
+  var sub = 'installed';           // 子视图：已安装 / 市场
+  var body = document.createElement('div');
+  host.appendChild(segmented(sub, [
+    { value: 'installed', label: '已安装' },
+    { value: 'market', label: '插件市场' }
+  ], function (v) { sub = v; body.innerHTML = ''; draw(); }));
+  host.appendChild(body);
+
+  function draw() {
+    if (sub === 'market') drawMarket(body);
+    else drawInstalled(body);
+  }
+
+  /* ---------- 已安装视图 ---------- */
+  function drawInstalled(root) {
+    root.innerHTML = '<div class="tool-panel__empty">加载中…</div>';
+    api('/plugins').then(function (d) {
+      root.innerHTML = '';
+      var h = d.host || {}, list = d.plugins || [];
+
+      /* Node 不可用横幅：置顶，因为这种情况下所有插件都跑不起来 */
+      if (h.nodeAvailable === false) {
+        var w = document.createElement('div'); w.className = 'alert alert--warn';
+        w.textContent = '未找到 Node 运行时，插件无法启动。请在 Termux 执行 '
+          + 'pkg install nodejs 后重启服务。' + (h.unsupportedReason ? '（' + h.unsupportedReason + '）' : '');
+        root.appendChild(w);
+      }
+      if (h.enabled === false) {
+        var w2 = document.createElement('div'); w2.className = 'alert alert--info';
+        w2.textContent = '插件总开关已关闭（.config.json 的 plugins.enabled=false），所有插件都不会加载。';
+        root.appendChild(w2);
+      }
+
+      /* 宿主状态卡 */
+      var c = card();
+      c.appendChild(row('Node 运行时', h.nodeAvailable ? '可用' : '缺失',
+        null, { notice: h.nodeAvailable ? '' : '需要 pkg install nodejs' }));
+      c.appendChild(row('运行中', (h.running || []).length + ' 个', null));
+      c.appendChild(row('插件目录', String(h.dir || ''), null));
+      c.appendChild(row('Plugin API', 'v' + (h.apiVersion || 1)
+        + (h.hostShellExists ? '' : '（宿主壳缺失！）'), null));
+      root.appendChild(section('宿主', null, c));
+
+      /* 导入区：选文件 / 贴链接 / 扫描 inbox */
+      var imp = card();
+      var prog = document.createElement('div');   // 进度条挂这里
+      imp.appendChild(row('从文件导入', '选一个插件 ZIP（≤' + (h.zipMaxMb || 32)
+        + 'MB）。上传后后台安装，进度见下方', null));
+      var fileIn = document.createElement('input');
+      fileIn.type = 'file'; fileIn.accept = '.zip,application/zip';
+      fileIn.className = 'form-input';
+      fileIn.style.cssText = 'margin:8px 14px';
+      fileIn.setAttribute('aria-label', '选择插件 ZIP');
+      imp.appendChild(fileIn);
+      var acts = document.createElement('div');
+      acts.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;padding:4px 14px 12px';
+      acts.appendChild(btn('上传安装', function () { doUpload(fileIn, prog, draw); }, 'btn--primary btn--sm'));
+      acts.appendChild(btn('贴链接导入', function () { doImportUrl(prog, draw); }, 'btn--ghost btn--sm'));
+      acts.appendChild(btn('扫描 inbox', function () { doScanInbox(imp, prog, draw); }, 'btn--ghost btn--sm'));
+      imp.appendChild(acts);
+      imp.appendChild(prog);
+      var inboxHint = document.createElement('div');
+      inboxHint.className = 'cy-settings-general__notice';
+      inboxHint.style.cssText = 'padding:0 14px 12px';
+      inboxHint.textContent = 'inbox 目录：' + (h.inboxDir || '~/cyrene/plugins_inbox')
+        + (h.inboxExists ? '' : '（尚未创建）') + ' —— 用 adb push 或 Termux 把 ZIP 放进去再扫描。';
+      imp.appendChild(inboxHint);
+      root.appendChild(section('导入', null, imp));
+
+      /* 插件卡片：按状态分组 */
+      var groups = [
+        { key: 'running', title: '运行中' },
+        { key: 'installed', title: '已安装（未运行）' },
+        { key: 'other', title: '异常 / 不支持' }
+      ];
+      var any = false;
+      groups.forEach(function (g) {
+        var items = list.filter(function (p) {
+          if (g.key === 'running') return p.state === 'running' || p.state === 'starting';
+          if (g.key === 'installed') return p.state === 'installed' || p.state === 'stopping' || p.state === 'not_installed';
+          return ['failed', 'crashed', 'unsupported'].indexOf(p.state) >= 0;
+        });
+        if (!items.length) return;
+        any = true;
+        var gt = document.createElement('div'); gt.className = 'tool-panel__count';
+        gt.textContent = g.title + '（' + items.length + '）';
+        root.appendChild(gt);
+        var grid = document.createElement('div'); grid.className = 'tool-panel__grid';
+        items.forEach(function (p) { grid.appendChild(pluginCard(p, h, draw)); });
+        root.appendChild(grid);
+      });
+      if (!any) {
+        var e = document.createElement('div'); e.className = 'tool-panel__empty';
+        e.textContent = '还没有安装任何插件。去「插件市场」看看，或用上面的导入。';
+        root.appendChild(e);
+      }
+
+      /* 插件工具区（只读展示，开关去「工具」页做，避免两处写冲突） */
+      var pt = (d.tools || []);
+      if (pt.length) {
+        var tc = card();
+        pt.forEach(function (t) {
+          tc.appendChild(row(t.id, (t.plugin ? '来自 ' + t.plugin + ' · ' : '')
+            + '风险 ' + (t.risk || 'safe') + (t.enabled ? ' · 已启用' : ' · 已停用'), null));
+        });
+        root.appendChild(section('插件注册的工具', '开关请到「工具」页操作', tc));
+      }
+    }).catch(function (e) {
+      root.innerHTML = '<div class="alert alert--err">插件列表读取失败: '
+        + escHtml(pluginErrMsg(e)) + '</div>';
+    });
+  }
+
+  /* 单个插件卡片 */
+  function pluginCard(p, h, redraw) {
+    var el = document.createElement('div');
+    el.className = 'tool-card' + (p.state === 'running' ? '' : ' is-off');
+    var ic = document.createElement('span'); ic.className = 'tool-card__icon';
+    ic.textContent = p.icon ? '' : '🔌';
+    if (p.icon) { ic.style.cssText = 'background-size:cover;background-image:url(' + p.icon + ')'; }
+    var bd = document.createElement('div'); bd.className = 'tool-card__body';
+
+    var nm = document.createElement('div'); nm.className = 'tool-card__name';
+    nm.textContent = p.name || p.id;
+    var stb = document.createElement('span'); stb.className = 'tool-card__badge';
+    stb.textContent = pluginStateZh(p.state);
+    stb.style.color = pluginStateColor(p.state);
+    stb.style.border = '1px solid ' + pluginStateColor(p.state);
+    nm.appendChild(stb);
+    if (p.version) {
+      var vb = document.createElement('span'); vb.className = 'tool-card__badge';
+      vb.textContent = 'v' + p.version; nm.appendChild(vb);
+    }
+    if (p.risky && p.risky.length) {
+      var rb = document.createElement('span'); rb.className = 'tool-card__badge';
+      rb.textContent = '⚠ 高危调用'; rb.style.color = '#c8860d';
+      rb.title = '静态扫描发现：' + p.risky.join(', ');
+      nm.appendChild(rb);
+    }
+    if (p.verified === false && p.source) {
+      var ub = document.createElement('span'); ub.className = 'tool-card__badge';
+      ub.textContent = '未经 sha256'; ub.style.color = '#c8860d'; nm.appendChild(ub);
+    }
+    bd.appendChild(nm);
+
+    var ds = document.createElement('div'); ds.className = 'tool-card__desc';
+    ds.style.whiteSpace = 'normal';
+    ds.textContent = p.description || '';
+    bd.appendChild(ds);
+
+    if (p.author || (p.tools && p.tools.length)) {
+      var meta = document.createElement('div'); meta.className = 'tool-card__desc';
+      meta.textContent = (p.author ? '作者 ' + p.author : '')
+        + (p.tools && p.tools.length ? '  ·  工具 ' + p.tools.join(', ') : '');
+      bd.appendChild(meta);
+    }
+    if (!p.supported && p.unsupportedReason) {
+      var ur = document.createElement('div'); ur.className = 'tool-card__desc';
+      ur.style.color = '#d9534f'; ur.textContent = '不支持：' + p.unsupportedReason;
+      bd.appendChild(ur);
+    }
+    if (p.error) {
+      var er = document.createElement('div'); er.className = 'tool-card__desc';
+      er.style.color = '#d9534f'; er.textContent = '错误：' + p.error;
+      bd.appendChild(er);
+    }
+
+    /* 操作按钮行 */
+    var acts = document.createElement('div');
+    acts.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;margin-top:8px';
+
+    /* 启用/停用：只有 supported 才给开关（不支持的点了必失败，体验差） */
+    if (p.supported) {
+      var running = (p.state === 'running' || p.state === 'starting');
+      acts.appendChild(btn(running ? '停用' : '启用', function (ev) {
+        var b = ev.currentTarget; b.disabled = true;
+        var old = b.textContent; b.textContent = running ? '停止中…' : '启动中…';
+        apiPost('/plugins/' + encodeURIComponent(p.id) + '/' + (running ? 'disable' : 'enable'))
+          .then(function () { redraw(); })
+          .catch(function (e) { b.disabled = false; b.textContent = old; alert(pluginErrMsg(e)); });
+      }, running ? 'btn--ghost btn--sm' : 'btn--primary btn--sm'));
+    }
+    if (p.settingsPanel) {
+      acts.appendChild(btn('面板', function () { openPluginIframe(p.id, p.name); }, 'btn--ghost btn--sm'));
+    }
+    acts.appendChild(btn('日志', function (ev) { toggleLogs(el, p, ev.currentTarget); }, 'btn--ghost btn--sm'));
+    if (p.state !== 'not_installed') {
+      acts.appendChild(btn('卸载', function () {
+        if (!confirm('卸载插件「' + (p.name || p.id) + '」？插件文件会被删除，不可恢复。')) return;
+        var rm = confirm('是否连同插件数据一起删除？\n\n「确定」= 连 data/ 与密钥一起删（重装要重新配置）\n「取消」= 保留数据（重装后配置还在）');
+        apiPost('/plugins/' + encodeURIComponent(p.id) + '/uninstall', { removeData: rm })
+          .then(function () { redraw(); })
+          .catch(function (e) { alert(pluginErrMsg(e)); });
+      }, 'btn--danger btn--sm'));
+    }
+    bd.appendChild(acts);
+
+    el.appendChild(ic); el.appendChild(bd);
+    return el;
+  }
+
+  /* 卡片内联展开日志（再点收起）。不做弹层，够用且省事。 */
+  function toggleLogs(cardEl, p, btnEl) {
+    var exist = cardEl.querySelector('.plugin-logs');
+    if (exist) { exist.remove(); btnEl.textContent = '日志'; return; }
+    btnEl.textContent = '加载中…';
+    api('/plugins/' + encodeURIComponent(p.id) + '/logs?limit=200').then(function (d) {
+      btnEl.textContent = '收起日志';
+      var box = document.createElement('div'); box.className = 'plugin-logs';
+      box.style.cssText = 'margin-top:8px';
+      if (d.logsLost) {
+        var lw = document.createElement('div'); lw.className = 'alert alert--warn';
+        lw.textContent = '插件进程已退出，日志随内存丢失（当前状态：' + pluginStateZh(d.state) + '）。';
+        box.appendChild(lw);
+      }
+      if (d.error) {
+        var le = document.createElement('div'); le.className = 'alert alert--err';
+        le.textContent = d.error; box.appendChild(le);
+      }
+      var pre = document.createElement('pre');
+      pre.style.cssText = 'max-height:220px;overflow:auto;background:rgba(0,0,0,.25);'
+        + 'padding:8px;border-radius:8px;font-size:12px;white-space:pre-wrap;'
+        + 'word-break:break-all;margin:0';
+      var lines = d.logs || [];
+      pre.textContent = lines.length ? lines.join('\n') : '（无日志输出）';
+      box.appendChild(pre);
+      cardEl.appendChild(box);
+    }).catch(function (e) {
+      btnEl.textContent = '日志';
+      alert('日志读取失败: ' + pluginErrMsg(e));
+    });
+  }
+
+  /* 上传安装 */
+  function doUpload(fileIn, prog, redraw) {
+    var f = fileIn.files && fileIn.files[0];
+    if (!f) { alert('先选一个 ZIP 文件'); return; }
+    var maxMb = 32;
+    if (f.size > maxMb * 1024 * 1024) {
+      alert('文件 ' + (f.size / 1024 / 1024).toFixed(1) + 'MB 超过上限 ' + maxMb + 'MB');
+      return;
+    }
+    prog.innerHTML = '';
+    var bar = makeProgress(prog);
+    bar.set(0, '读取文件…');
+    pluginReadFileAsBase64(f).then(function (b64) {
+      bar.set(0.05, '上传中…');
+      return apiPost('/plugins/import', { filename: f.name, dataBase64: b64, enable: false });
+    }).then(function (r) {
+      watchJob(r.job, bar, redraw, fileIn);
+    }).catch(function (e) {
+      bar.fail(pluginErrMsg(e));
+    });
+  }
+
+  /* 贴链接导入 */
+  function doImportUrl(prog, redraw) {
+    var url = prompt('粘贴插件 ZIP 的直链（http/https）：');
+    if (!url || !url.trim()) return;
+    var sha = prompt('（可选）填 sha256 强校验，留空跳过：') || '';
+    prog.innerHTML = '';
+    var bar = makeProgress(prog);
+    bar.set(0, '提交下载任务…');
+    apiPost('/plugins/import-url', { url: url.trim(), sha256: sha.trim().toLowerCase(), enable: false })
+      .then(function (r) { watchJob(r.job, bar, redraw); })
+      .catch(function (e) { bar.fail(pluginErrMsg(e)); });
+  }
+
+  /* 扫描 inbox → 列出候选 → 逐个可装 */
+  function doScanInbox(imp, prog, redraw) {
+    apiPost('/plugins/scan-inbox').then(function (d) {
+      var old = imp.querySelector('.inbox-list');
+      if (old) old.remove();
+      var box = document.createElement('div'); box.className = 'inbox-list';
+      box.style.cssText = 'padding:0 14px 12px';
+      var items = d.items || [];
+      if (!items.length) {
+        box.innerHTML = '<div class="tool-panel__empty">inbox 里没有 ZIP：'
+          + escHtml(d.dir || '') + '</div>';
+        imp.appendChild(box); return;
+      }
+      var tt = document.createElement('div'); tt.className = 'tool-panel__count';
+      tt.textContent = 'inbox 发现 ' + items.length + ' 个包';
+      box.appendChild(tt);
+      items.forEach(function (it) {
+        var r = document.createElement('div');
+        r.style.cssText = 'display:flex;align-items:center;justify-content:space-between;'
+          + 'gap:8px;padding:6px 0;border-top:1px solid rgba(255,255,255,.06)';
+        var lab = document.createElement('span');
+        lab.style.cssText = 'font-size:13px;word-break:break-all';
+        lab.textContent = it.filename + (it.id ? '  (' + it.id + (it.version ? ' v' + it.version : '') + ')' : '')
+          + (it.error ? '  ⚠ ' + it.error : '') + (it.oversize ? '  ⚠ 超过上限' : '');
+        var b = btn('安装', function () {
+          if (it.error || it.oversize) { alert('这个包有问题：' + (it.error || '超过体积上限')); return; }
+          prog.innerHTML = '';
+          var bar = makeProgress(prog);
+          bar.set(0, '安装 ' + it.filename + '…');
+          apiPost('/plugins/import-inbox', { filename: it.filename, enable: false, deleteAfter: false })
+            .then(function (rr) { watchJob(rr.job, bar, redraw); })
+            .catch(function (e) { bar.fail(pluginErrMsg(e)); });
+        }, 'btn--ghost btn--sm');
+        r.appendChild(lab); r.appendChild(b);
+        box.appendChild(r);
+      });
+      imp.appendChild(box);
+    }).catch(function (e) { alert('扫描失败: ' + pluginErrMsg(e)); });
+  }
+
+  /* 盯着一个 job 直到结束 */
+  function watchJob(job, bar, redraw, fileIn) {
+    pluginPollJob(job, function (p) {
+      var pct = p.total > 0 ? Math.min(1, p.done / p.total) : 0.1;
+      bar.set(pct, pluginStateZh2(p.stage) + (p.message ? ' · ' + p.message : ''));
+    }, function (p, timedOut) {
+      if (p.stage === 'done') {
+        bar.ok((p.info && p.info.info && p.info.info.id ? '已安装 ' + p.info.info.id : '安装完成')
+          + ((p.info && p.info.info && p.info.info.risky && p.info.info.risky.length)
+            ? '（⚠ 含高危调用，见卡片黄标）' : ''));
+        if (fileIn) fileIn.value = '';
+        redraw();
+      } else {
+        var msg = p.message || '安装失败';
+        if (p.info && p.info.info) {
+          var ii = p.info.info;
+          if (ii.expected && ii.actual) {
+            msg = 'sha256 校验失败：期望 ' + ii.expected.slice(0, 12) + '… 实际 ' + ii.actual.slice(0, 12) + '…';
+          } else if (typeof ii === 'string') { msg = ii; }
+          else if (ii.error) { msg = ii.error; }
+        }
+        bar.fail(msg);
+      }
+    });
+  }
+  function pluginStateZh2(stage) {
+    return { downloading: '下载中', verifying: '校验中', unpacking: '解包中',
+      installing: '安装中', done: '完成', failed: '失败' }[stage] || stage || '处理中';
+  }
+
+  /* 进度条（纯内联样式，不动 settings.css） */
+  function makeProgress(root) {
+    var wrap = document.createElement('div');
+    wrap.style.cssText = 'padding:8px 14px 12px';
+    var track = document.createElement('div');
+    track.style.cssText = 'height:6px;border-radius:3px;background:rgba(255,255,255,.12);overflow:hidden';
+    var fill = document.createElement('div');
+    fill.style.cssText = 'height:100%;width:0%;background:#e86a92;transition:width .3s';
+    track.appendChild(fill);
+    var txt = document.createElement('div');
+    txt.style.cssText = 'font-size:12px;margin-top:6px;color:var(--cy-text-dim,#aaa);word-break:break-all';
+    wrap.appendChild(track); wrap.appendChild(txt);
+    root.appendChild(wrap);
+    return {
+      set: function (pct, msg) {
+        fill.style.width = Math.max(0, Math.min(1, pct)) * 100 + '%';
+        txt.style.color = 'var(--cy-text-dim,#aaa)';
+        txt.textContent = msg || '';
+      },
+      ok: function (msg) { fill.style.width = '100%'; fill.style.background = '#2e9e5b'; txt.style.color = '#2e9e5b'; txt.textContent = '✓ ' + (msg || '完成'); },
+      fail: function (msg) { fill.style.background = '#d9534f'; txt.style.color = '#d9534f'; txt.textContent = '✗ ' + (msg || '失败'); }
+    };
+  }
+
+  /* ---------- 市场视图 ---------- */
+  function drawMarket(root) {
+    root.innerHTML = '<div class="tool-panel__empty">加载市场…</div>';
+    loadMarket(root, false);
+  }
+  function loadMarket(root, refresh) {
+    // 守卫：市场安装是异步的，完成回调里会重新 loadMarket。若用户此刻已切走
+    // tab（renderSettingsPanel 把 settingsBody.innerHTML 清空），root 会脱离文档、
+    // 甚至 grid.parentNode 变 null。不拦就会在 null.innerHTML 上崩。
+    if (!root || !root.isConnected) return;
+    api('/plugins/market' + (refresh ? '?refresh=1' : '')).then(function (d) {
+      if (!root.isConnected) return;   // 异步回来时可能已切走
+      root.innerHTML = '';
+      /* 顶部：源标识 + 刷新 + 搜索 */
+      var bar = document.createElement('div');
+      bar.style.cssText = 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:4px 0 8px';
+      var src = document.createElement('span');
+      src.className = 'tool-card__badge';
+      src.textContent = '源：' + (d.source || '?') + (d.fellBack ? '（已回退）' : '')
+        + (d.stale ? ' · 缓存' : '');
+      src.style.color = d.fellBack || d.stale ? '#c8860d' : '#8a8f98';
+      bar.appendChild(src);
+      bar.appendChild(btn('刷新', function () { loadMarket(root, true); }, 'btn--ghost btn--sm'));
+      root.appendChild(bar);
+
+      if (d.error) {
+        var ew = document.createElement('div');
+        ew.className = 'alert ' + (d.stale ? 'alert--warn' : 'alert--err');
+        ew.textContent = d.error; root.appendChild(ew);
+      }
+      var counts = d.counts || {};
+      var cs = document.createElement('div'); cs.className = 'tool-panel__count';
+      cs.textContent = '共 ' + (counts.total || 0) + ' 个 · 已装 ' + (counts.installed || 0)
+        + ' · 可更新 ' + (counts.updateAvailable || 0);
+      root.appendChild(cs);
+
+      var si = document.createElement('input');
+      si.className = 'tool-panel__search'; si.placeholder = '搜索市场插件…';
+      si.style.cssText = 'margin:6px 0'; si.setAttribute('aria-label', '搜索市场插件');
+      root.appendChild(si);
+      var grid = document.createElement('div'); grid.className = 'tool-panel__grid';
+      root.appendChild(grid);
+
+      function paint() {
+        var kw = si.value.trim().toLowerCase();
+        var items = (d.plugins || []).filter(function (p) {
+          return !kw || (p.id + ' ' + p.name + ' ' + p.description).toLowerCase().indexOf(kw) >= 0;
+        });
+        grid.innerHTML = '';
+        if (!items.length) {
+          grid.innerHTML = '<div class="tool-panel__empty">没有匹配的插件</div>'; return;
+        }
+        items.forEach(function (p) { grid.appendChild(marketCard(p, grid)); });
+      }
+      si.addEventListener('input', paint);
+      paint();
+    }).catch(function (e) {
+      root.innerHTML = '<div class="alert alert--err">市场加载失败：'
+        + escHtml(pluginErrMsg(e)) + '<br><br>可能是手机连不上 Gitee/GitHub，'
+        + '或市场源暂时不可用。本地导入不受影响。</div>';
+    });
+  }
+
+  function marketCard(p, grid) {
+    var el = document.createElement('div');
+    el.className = 'tool-card';
+    var ic = document.createElement('span'); ic.className = 'tool-card__icon';
+    ic.textContent = '📦';
+    var bd = document.createElement('div'); bd.className = 'tool-card__body';
+    var nm = document.createElement('div'); nm.className = 'tool-card__name';
+    nm.textContent = p.name || p.id;
+    if (p.version) {
+      var vb = document.createElement('span'); vb.className = 'tool-card__badge';
+      vb.textContent = 'v' + p.version; nm.appendChild(vb);
+    }
+    if (p.status === 'update_available') {
+      var ub = document.createElement('span'); ub.className = 'tool-card__badge';
+      ub.textContent = '可更新（本地 v' + (p.localVersion || '?') + '）'; ub.style.color = '#c8860d';
+      nm.appendChild(ub);
+    } else if (p.status === 'installed') {
+      var ib = document.createElement('span'); ib.className = 'tool-card__badge';
+      ib.textContent = '已安装'; ib.style.color = '#2e9e5b'; nm.appendChild(ib);
+    }
+    bd.appendChild(nm);
+    var ds = document.createElement('div'); ds.className = 'tool-card__desc';
+    ds.style.whiteSpace = 'normal';
+    ds.textContent = p.description || '';
+    bd.appendChild(ds);
+    var meta = document.createElement('div'); meta.className = 'tool-card__desc';
+    meta.textContent = (p.author ? '作者 ' + p.author + '  ·  ' : '')
+      + '下载 ' + (p.downloads || 0) + (p.zipUrl ? '' : '  ·  仅源码安装');
+    bd.appendChild(meta);
+
+    var acts = document.createElement('div');
+    acts.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;margin-top:8px';
+    var prog = document.createElement('div');
+    var installLabel = p.status === 'update_available' ? '更新' : '安装';
+    if (p.zipUrl) {
+      acts.appendChild(btn(installLabel, function (ev) {
+        runMarketInstall('/plugins/market/' + encodeURIComponent(p.id) + '/install',
+          { enable: false }, ev.currentTarget, prog, function () { loadMarket(grid.parentNode, false); });
+      }, 'btn--primary btn--sm'));
+    }
+    /* 无 zip 的（四个官方示例）只能源码安装；有 zip 的也给一个源码入口兜底 */
+    acts.appendChild(btn(p.zipUrl ? '源码安装' : '源码安装', function (ev) {
+      if (!confirm('「' + (p.name || p.id) + '」将逐个拉取源码文件安装，无 sha256 校验。继续？')) return;
+      runMarketInstall('/plugins/market/' + encodeURIComponent(p.id) + '/install-from-source',
+        { enable: false }, ev.currentTarget, prog, function () { loadMarket(grid.parentNode, false); });
+    }, 'btn--ghost btn--sm'));
+    bd.appendChild(acts);
+    bd.appendChild(prog);
+
+    el.appendChild(ic); el.appendChild(bd);
+    return el;
+  }
+
+  function runMarketInstall(url, body, btnEl, prog, after) {
+    var old = btnEl.textContent;
+    btnEl.disabled = true; btnEl.textContent = '提交中…';
+    prog.innerHTML = '';
+    var bar = makeProgress(prog);
+    bar.set(0, '排队…');
+    apiPost(url, body).then(function (r) {
+      watchJob(r.job, bar, function () { btnEl.disabled = false; btnEl.textContent = old; after(); });
+    }).catch(function (e) {
+      btnEl.disabled = false; btnEl.textContent = old;
+      bar.fail(pluginErrMsg(e));
+    });
+  }
+
+  draw();
 };
 
 PANELS.tts = function (host, S) {

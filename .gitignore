@@ -6,6 +6,11 @@ cyrene_mobile/data/
 cyrene_mobile/**/__pycache__/
 *.pyc
 
+# 插件：已安装插件、导入收件箱、解包临时目录（均为运行时生成）
+cyrene_mobile/plugins/
+cyrene_mobile/plugins_inbox/
+cyrene_mobile/_plugin_tmp/
+
 # 本地快照 / 备份
 *.bak
 *.pre_*

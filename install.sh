@@ -39,7 +39,7 @@ printf "${C_B}  昔涟 · 手机版 Web Agent  部署${C_N}\n"
 printf "${C_B}============================================${C_N}\n\n"
 
 # ---- 1. Python ----
-info "[1/5] 检查 Python..."
+info "[1/6] 检查 Python..."
 if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
   warn "  未找到 python，正在安装（需要联网）..."
   pkg update -y
@@ -49,7 +49,7 @@ PY="$(command -v python3 || command -v python)"
 ok "  Python: $("$PY" --version 2>&1)  ($PY)"
 
 # ---- 2. termux-api（硬件工具桥，可选）----
-info "[2/5] 检查 termux-api（电量/手电筒/通知等硬件工具需要）..."
+info "[2/6] 检查 termux-api（电量/手电筒/通知等硬件工具需要）..."
 if command -v termux-battery-status >/dev/null 2>&1; then
   ok "  termux-api 命令行已就位。"
 else
@@ -63,13 +63,27 @@ else
   warn "  并在系统设置里授予相应权限。详见 README。"
 fi
 
-# ---- 3. 目录准备 ----
-info "[3/5] 准备运行目录..."
+# ---- 3. Node.js（插件系统，可选）----
+info "[3/6] 检查 Node.js（插件市场/插件导入需要）..."
+if command -v node >/dev/null 2>&1; then
+  ok "  Node: $(node --version 2>&1)"
+else
+  warn "  未找到 node，尝试安装 nodejs-lts（约 30 MB，需要联网与足够存储）..."
+  if pkg install -y nodejs-lts 2>/dev/null; then
+    ok "  Node 已安装: $(node --version 2>&1)"
+  else
+    warn "  安装失败。不影响 Web 对话、工具与技能，仅「插件」功能不可用。"
+    warn "  之后可手动执行: pkg install nodejs-lts"
+  fi
+fi
+
+# ---- 4. 目录准备 ----
+info "[4/6] 准备运行目录..."
 mkdir -p "$APP_DIR/data"
 ok "  数据目录: $APP_DIR/data"
 
-# ---- 4. 配置文件 ----
-info "[4/5] 检查配置..."
+# ---- 5. 配置文件 ----
+info "[5/6] 检查配置..."
 CFG="$APP_DIR/.config.json"
 if [ ! -f "$CFG" ]; then
   if [ -f "$SCRIPT_DIR/config.example.json" ]; then
@@ -84,8 +98,8 @@ else
   ok "  .config.json 已存在，保留现有配置。"
 fi
 
-# ---- 5. 启动命令软链 ----
-info "[5/5] 注册启动命令 cyrene-web..."
+# ---- 6. 启动命令软链 ----
+info "[6/6] 注册启动命令 cyrene-web..."
 if [ -n "${PREFIX:-}" ] && [ -d "$PREFIX/bin" ]; then
   cat > "$PREFIX/bin/cyrene-web" << EOF
 #!/data/data/com.termux/files/usr/bin/bash
