@@ -59,6 +59,13 @@ CONFIG_FILE   = BASE_DIR / ".config.json"
 USAGE_FILE    = DATA_DIR / "usage.json"
 STATIC_DIR    = RUNTIME_DIR / "static"
 
+# ========== 一键更新（仓库根那个 update.sh） ==========
+# 仓库根：install.sh / update.sh 所在的那一层，比 cyrene_mobile 高一级。
+# 只拷了 cyrene_mobile/ 的部署可能没有这两个文件，调用处会检查并明说。
+REPO_DIR      = BASE_DIR.parent
+UPDATE_SH     = REPO_DIR / "update.sh"
+UPDATE_LOG    = DATA_DIR / "update.log"
+
 # ========== 静态资源白名单 ==========
 # 用 dict 精确匹配文件名做白名单：`../` 之类的穿越串永远命中不了 key，
 # 因此不存在「先拼路径再判断是否越界」的窗口。
@@ -7327,6 +7334,10 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path == "/settings":
             self._json(self._public_settings())
+        elif path == "/update/check":
+            self._json(_update_check())
+        elif path == "/update/status":
+            self._json(_update_status())
         elif path == "/tools":
             self._json({"tools": self._tool_list()})
         elif path == "/skills":
@@ -7943,6 +7954,18 @@ class Handler(BaseHTTPRequestHandler):
             _delayed_service_action(mode)
             return
 
+        # 一键更新：只本机可调，和 /service/* 共用同一条权限门 —— 更新会重启
+        # 服务，不能让同一 WiFi 下的别人代劳。加上 confirm 防误触。
+        if path == "/update/apply":
+            if not self._is_local_client():
+                self._json({"error": "仅本机可执行更新（防止局域网其他设备触发）"}, 403)
+                return
+            if not body.get("confirm"):
+                self._json({"error": "没有确认，不执行更新"}, 400)
+                return
+            self._json(_start_update())
+            return
+
         if path == "/sessions/clear":
             with STORE_LOCK:
                 SESSIONS.clear()
@@ -8255,6 +8278,249 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "current": cur})
         else:
             self._json({"error": "not found"}, 404)
+
+
+# ========== 一键更新：检测 / 执行 ==========
+# 检测和执行都走仓库根的 update.sh，规则只有一套 —— 不会出现
+# 「网页说有新版、脚本跑起来说没有」这种两边各说各话。
+# 检测用 --check：只下载比对 + 语法自检，一个文件都不动。
+# 执行时开独立会话（start_new_session）：update.sh 换完代码会重启本服务，
+# 服务被杀时不能顺手把更新进程一起带走，否则更新做到一半就断了。
+UPDATE_LOCK  = threading.Lock()
+UPDATE_STATE = {"running": False, "startedAt": 0.0, "exitCode": None, "pid": 0}
+
+
+def _bash_exe():
+    """找一个真能跑的 bash；Termux 上它未必在 PATH 里。"""
+    for cand in ("/data/data/com.termux/files/usr/bin/bash", "/bin/bash", "bash"):
+        if os.sep in cand:
+            if os.path.isfile(cand):
+                return cand
+        else:
+            p = shutil.which(cand)
+            if p:
+                return p
+    return ""
+
+
+def _update_ready():
+    """能不能更新、拿什么跑。返回 (bash 路径, 不行的原因)。"""
+    if not UPDATE_SH.is_file():
+        return "", ("没找到 %s。这份部署可能只拷了 cyrene_mobile/ —— "
+                    "把仓库根的 update.sh 一起放过来才能一键更新。" % UPDATE_SH)
+    bash = _bash_exe()
+    if not bash:
+        return "", "没找到 bash，跑不了 update.sh。"
+    return bash, ""
+
+
+def _update_parse(text):
+    """从 update.sh 的输出里抠出前后指纹和结论。"""
+    cur = re.search(r"当前：(\d+) 个代码文件，指纹\s*([0-9a-f]+)", text)
+    new = re.search(r"新版：(\d+) 个代码文件，指纹\s*([0-9a-f]+)", text)
+    return {
+        "currentCount": int(cur.group(1)) if cur else 0,
+        "currentFingerprint": cur.group(2) if cur else "",
+        "remoteCount": int(new.group(1)) if new else 0,
+        "remoteFingerprint": new.group(2) if new else "",
+        "hasUpdate": "有新版本可以更新" in text,
+        "tail": "\n".join([l for l in text.splitlines() if l.strip()][-14:]),
+    }
+
+
+UPDATE_REPO   = "morisukesu/cyrene-web-mobile"      # 打包下载兜底用
+UPDATE_BRANCH = "main"
+# 检测用两个源，按速度排序：Gitee 是 GitHub 的镜像、内容一致，
+# 实测一次 tree API 只要 0.2 秒；GitHub 要 1.5 秒，国内还可能被掐。
+UPDATE_SOURCES = (
+    ("Gitee", "morisuke/cyrene-web-mobile",
+     "https://gitee.com/api/v5/repos/%s/git/trees/%s?recursive=1"),
+    ("GitHub", "morisukesu/cyrene-web-mobile",
+     "https://api.github.com/repos/%s/git/trees/%s?recursive=1"),
+)
+# 参与比对的目录，与 update.sh 里的 fp_of 保持一致
+CODE_DIRS = ("prompts", "runtime", "skills")
+
+
+def _git_blob_sha(data):
+    """git 存 blob 用的 sha1，和 GitHub API 回传的 sha 是同一套算法。"""
+    h = hashlib.sha1()
+    h.update(b"blob %d\0" % len(data))
+    h.update(data)
+    return h.hexdigest()
+
+
+def _local_code_shas():
+    """本地 prompts/ runtime/ skills/ setup.sh 每个文件的 blob sha。"""
+    out = {}
+    for t in CODE_DIRS:
+        base = BASE_DIR / t
+        if not base.is_dir():
+            continue
+        for dp, dns, fns in os.walk(str(base)):
+            dns[:] = [d for d in dns if d != "__pycache__"]
+            for fn in fns:
+                p = Path(dp) / fn
+                try:
+                    rel = "cyrene_mobile/" + p.relative_to(BASE_DIR).as_posix()
+                    out[rel] = _git_blob_sha(p.read_bytes())
+                except OSError:
+                    pass
+    sp = BASE_DIR / "setup.sh"
+    if sp.is_file():
+        out["cyrene_mobile/setup.sh"] = _git_blob_sha(sp.read_bytes())
+    return out
+
+
+def _remote_code_shas(timeout=25):
+    """远端同一批文件的 blob sha。两个源按顺序试，谁先答上来用谁。
+
+    返回 (路径 -> sha, 源名字)。
+    """
+    last = None
+    for name, slug, tpl in UPDATE_SOURCES:
+        try:
+            req = urllib.request.Request(tpl % (slug, UPDATE_BRANCH), headers={
+                "User-Agent": "cyrene-web-mobile",
+                "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                d = json.loads(r.read().decode("utf-8", "replace"))
+            out = {}
+            for e in d.get("tree") or []:
+                p = e.get("path") or ""
+                if e.get("type") != "blob" or not p.startswith("cyrene_mobile/"):
+                    continue
+                parts = p.split("/")
+                if not (len(parts) >= 3 and parts[1] in CODE_DIRS) \
+                        and p != "cyrene_mobile/setup.sh":
+                    continue
+                out[p] = e.get("sha") or ""
+            if not out:
+                raise ValueError("这个源没回文件列表")
+            return out, name
+        except Exception as e:
+            last = "%s: %s" % (name, e)
+    raise RuntimeError(last or "两个源都没答上来")
+
+
+def _fp_of(mapping):
+    """把一张 {路径: sha} 表压成一个短指纹，只用来在界面上显示。"""
+    h = hashlib.sha256()
+    for k in sorted(mapping):
+        h.update(k.encode("utf-8"))
+        h.update(b"\0")
+        h.update(mapping[k].encode("utf-8"))
+    return h.hexdigest()[:12]
+
+
+def _update_check_via_api():
+    local = _local_code_shas()
+    remote, src = _remote_code_shas()
+    # 只算「远端有、本地没有」和「两边都有但内容不同」的。
+    # 本地自己多出来的那些（.bak-* / .pre_* 这类更新残留）不算：更新脚本本来
+    # 也不会去删它们，拿它们当「有新版本」只会每次都误报。
+    changed = sorted([p for p in set(remote)
+                      if local.get(p) != remote.get(p)])
+    return {
+        "ok": True, "supported": True, "via": "api", "source": src,
+        "hasUpdate": bool(changed),
+        "currentCount": len(local), "remoteCount": len(remote),
+        "currentFingerprint": _fp_of(local),
+        "remoteFingerprint": _fp_of(remote),
+        "changedCount": len(changed),
+        "changed": changed[:12],
+        "canApply": UPDATE_SH.is_file(),
+    }
+
+
+def _update_check_via_script(note=""):
+    """备用通道：update.sh --check。要下整包，慢，但有网就一定能出结果。"""
+    bash, why = _update_ready()
+    if not bash:
+        return {"ok": False, "supported": False, "error": why}
+    try:
+        p = subprocess.run([bash, str(UPDATE_SH), "--check"], cwd=str(REPO_DIR),
+                           capture_output=True, timeout=900)
+        text = ((p.stdout or b"") + (p.stderr or b"")).decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "supported": True,
+                "error": "备用方式也超时了（它要下整包，网慢时十几分钟都可能）。"}
+    except Exception as e:
+        return {"ok": False, "supported": True, "error": "检测失败：%s" % e}
+    info = _update_parse(text)
+    info["supported"] = True
+    info["via"] = "script"
+    info["note"] = note
+    info["canApply"] = True
+    info["changedCount"] = 0
+    info["changed"] = []
+    info["exitCode"] = p.returncode
+    if not info["currentFingerprint"]:
+        info["ok"] = False
+        info["error"] = "update.sh 没跑通（退出码 %d）。" % p.returncode
+    else:
+        info["ok"] = True
+    return info
+
+
+def _update_check():
+    """先走 GitHub API 比 blob sha：几十 KB、秒级。
+
+    之前这里是直接跑 update.sh --check，它要下整个仓库包（约 20 MB）。
+    实测国内到 codeload 只有 31 KB/s，整包要十分钟，检测根本等不出来。
+    API 不通时才回退到脚本那条路，并如实告诉前端「这次走的是慢通道」。
+    """
+    try:
+        return _update_check_via_api()
+    except Exception as e:
+        why = "%s: %s" % (type(e).__name__, e)
+    return _update_check_via_script(
+        note="GitHub API 没通（%s），这次改用脚本比对整包，会慢很多。" % why)
+
+
+def _update_status():
+    """更新进行到哪一步了（前端轮询用），顺带回日志尾部。"""
+    with UPDATE_LOCK:
+        st = dict(UPDATE_STATE)
+    tail = ""
+    try:
+        if UPDATE_LOG.is_file():
+            tail = UPDATE_LOG.read_bytes()[-6000:].decode("utf-8", "replace")
+    except Exception:
+        pass
+    st["tail"] = tail
+    return st
+
+
+def _start_update():
+    """起一个独立会话跑 update.sh —— 这才是真的更新。"""
+    bash, why = _update_ready()
+    if not bash:
+        return {"ok": False, "error": why}
+    with UPDATE_LOCK:
+        if UPDATE_STATE["running"]:
+            return {"ok": False, "error": "已经在更新了，等这一轮跑完。"}
+        UPDATE_STATE.update(running=True, startedAt=time.time(), exitCode=None, pid=0)
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        fh = open(str(UPDATE_LOG), "wb")
+        kw = {"start_new_session": True} if os.name == "posix" else {}
+        proc = subprocess.Popen([bash, str(UPDATE_SH)], cwd=str(REPO_DIR),
+                                stdout=fh, stderr=subprocess.STDOUT, **kw)
+    except Exception as e:
+        with UPDATE_LOCK:
+            UPDATE_STATE.update(running=False, exitCode=-1)
+        return {"ok": False, "error": "起不来更新进程：%s" % e}
+    with UPDATE_LOCK:
+        UPDATE_STATE["pid"] = proc.pid
+
+    def _wait():
+        code = proc.wait()
+        with UPDATE_LOCK:
+            UPDATE_STATE.update(running=False, exitCode=code)
+
+    threading.Thread(target=_wait, name="update-wait", daemon=True).start()
+    return {"ok": True, "pid": proc.pid}
 
 
 # ========== 主入口 ==========

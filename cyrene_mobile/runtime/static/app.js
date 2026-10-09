@@ -2381,6 +2381,174 @@ PANELS.usage = function (host, S) {
   host.appendChild(acts);
 };
 
+/* ================= 版本与更新 ================= */
+/* 检测和执行都调仓库根的 update.sh，网页和脚本共用一套判断，不会各说各话。
+   执行时脚本会重启服务，所以页面短暂断连属正常。 */
+var UPDATE_UI = { phase: 'idle', info: null, error: '', status: null, timer: 0 };
+
+function updateCheck() {
+  if (UPDATE_UI.phase === 'checking' || UPDATE_UI.phase === 'updating') return;
+  UPDATE_UI.phase = 'checking'; UPDATE_UI.error = ''; UPDATE_UI.info = null;
+  renderSettingsPanel();
+  api('/update/check').then(function (d) {
+    if (d && d.ok) { UPDATE_UI.info = d; UPDATE_UI.phase = 'ready'; }
+    else { UPDATE_UI.error = (d && d.error) || '检测失败'; UPDATE_UI.phase = 'idle'; }
+    renderSettingsPanel();
+  }).catch(function (e) {
+    UPDATE_UI.error = '检测失败：' + (e.message || e); UPDATE_UI.phase = 'idle';
+    renderSettingsPanel();
+  });
+}
+
+function updateApply() {
+  if (UPDATE_UI.phase === 'updating') return;
+  if (!confirm('现在更新到仓库最新版？\n\n会先下载新代码做语法自检，'
+    + '更新前自动备份旧代码，完成后服务自动重启（网页断开一下再恢复）。')) return;
+  UPDATE_UI.phase = 'updating'; UPDATE_UI.error = ''; UPDATE_UI.status = null;
+  renderSettingsPanel();
+  apiPost('/update/apply', { confirm: true }).then(function (d) {
+    if (d && d.ok) { updatePoll(0); return; }
+    UPDATE_UI.phase = 'idle';
+    UPDATE_UI.error = (d && d.error) || '没能开始更新';
+    renderSettingsPanel();
+  }).catch(function (e) {
+    UPDATE_UI.phase = 'idle';
+    UPDATE_UI.error = '更新请求失败：' + (e.message || e);
+    renderSettingsPanel();
+  });
+}
+
+function updatePoll(n) {
+  clearTimeout(UPDATE_UI.timer);
+  var ticks = n || 0;
+  api('/update/status').then(function (d) {
+    UPDATE_UI.status = d;
+    renderSettingsPanel();
+    if (d && d.running) {
+      UPDATE_UI.timer = setTimeout(function () { updatePoll(ticks + 1); }, 1500);
+      return;
+    }
+    if (d && d.exitCode === 0) {
+      UPDATE_UI.phase = 'done';           /* 换完代码了，服务正在被重启 */
+    } else {
+      UPDATE_UI.phase = 'idle';
+      UPDATE_UI.error = '更新进程退出了（退出码 ' + (d && d.exitCode) + '），'
+        + '看下面的输出，或者去 Termux 看 cyrene-web 的日志。';
+    }
+    renderSettingsPanel();
+  }).catch(function () {
+    /* 服务被重启时请求断掉是预期内的：继续等它回来 */
+    ticks += 1;
+    renderSettingsPanel();
+    if (ticks < 200) {
+      UPDATE_UI.timer = setTimeout(function () { updatePoll(ticks); }, 1500);
+    } else {
+      UPDATE_UI.phase = 'idle';
+      UPDATE_UI.error = '等不到服务回来，去 Termux 看一眼 cyrene-web 还在不在。';
+      renderSettingsPanel();
+    }
+  });
+}
+
+function updateLogText(t) {
+  var ls = String(t || '').split('\n').filter(function (s) { return s.trim(); });
+  return ls.slice(-10).join('\n');
+}
+
+function renderUpdateSection(host) {
+  var c = card();
+  var checking = UPDATE_UI.phase === 'checking';
+  var updating = UPDATE_UI.phase === 'updating';
+  var i = UPDATE_UI.info;
+
+  c.appendChild(row('当前版本', checking
+      ? '正在下载仓库快照并比对，第一次要十几 MB，稍等一下'
+      : '和 GitHub 上 main 分支比代码指纹；只比对，不动文件',
+    btn(checking ? '检测中…' : (i ? '重新检测' : '检测更新'),
+      function () { updateCheck(); }, 'btn--ghost btn--sm'),
+    { notice: (i && i.currentFingerprint)
+        ? ('当前指纹 ' + i.currentFingerprint + ' · ' + i.currentCount + ' 个代码文件') : '' }));
+
+  if (UPDATE_UI.error) {
+    var e1 = document.createElement('div');
+    e1.className = 'alert alert--err';
+    e1.textContent = UPDATE_UI.error;
+    c.appendChild(e1);
+  }
+
+  if (i && i.ok && !updating) {
+    var box = document.createElement('div');
+    box.className = 'alert alert--' + (i.hasUpdate ? 'warn' : 'ok');
+    box.textContent = (i.hasUpdate
+      ? ('仓库里有新版本：' + i.remoteCount + ' 个代码文件，指纹 ' + i.remoteFingerprint)
+      : ('已经是最新版了（' + i.currentCount + ' 个代码文件，指纹 ' + i.currentFingerprint + '）'))
+      + (i.source ? '　·　比对源 ' + i.source : '');
+    c.appendChild(box);
+  }
+
+  if (i && i.ok && i.hasUpdate && !updating && UPDATE_UI.phase !== 'done') {
+    var acts = document.createElement('div');
+    acts.style.cssText = 'display:flex;gap:8px;padding:12px 14px 0';
+    acts.appendChild(btn('立即更新', function () { updateApply(); }, 'btn--primary btn--sm'));
+    c.appendChild(acts);
+  }
+
+  if (updating || UPDATE_UI.phase === 'done') {
+    var tip = document.createElement('div');
+    tip.className = 'alert alert--info';
+    tip.textContent = UPDATE_UI.phase === 'done'
+      ? '更新完成，服务正在重启 —— 页面稍后自己会好，一直转圈就手动刷一下。'
+      : '正在更新：下载 → 语法自检 → 备份 → 换代码 → 重启服务。中途网页会断一下，属正常。';
+    c.appendChild(tip);
+    var pre = document.createElement('pre');
+    pre.style.cssText = 'margin:10px 14px 0;padding:10px;overflow:auto;max-height:180px;'
+      + 'font-size:12px;line-height:1.5;white-space:pre-wrap;'
+      + 'background:rgba(127,127,127,.12);border-radius:8px';
+    pre.textContent = updateLogText(UPDATE_UI.status && UPDATE_UI.status.tail) || '（等输出…）';
+    c.appendChild(pre);
+  }
+
+  if (i && i.ok && i.tail && !updating && UPDATE_UI.phase !== 'done') {
+    var det = document.createElement('details');
+    det.style.cssText = 'margin:10px 14px 0';
+    var sm = document.createElement('summary');
+    sm.textContent = 'update.sh 的原始输出';
+    det.appendChild(sm);
+    var pre2 = document.createElement('pre');
+    pre2.style.cssText = 'margin:8px 0 0;padding:10px;overflow:auto;max-height:200px;'
+      + 'font-size:12px;line-height:1.5;white-space:pre-wrap;'
+      + 'background:rgba(127,127,127,.12);border-radius:8px';
+    pre2.textContent = i.tail;
+    det.appendChild(pre2);
+    c.appendChild(det);
+  }
+
+  if (i && i.ok && i.note) {
+    var nb = document.createElement('div');
+    nb.className = 'cy-settings-general__notice';
+    nb.style.cssText = 'padding:6px 14px 0';
+    nb.textContent = i.note;
+    c.appendChild(nb);
+  }
+
+  if (i && i.ok && i.changedCount) {
+    var det2 = document.createElement('details');
+    det2.style.cssText = 'margin:10px 14px 0';
+    var sm2 = document.createElement('summary');
+    sm2.textContent = '有变化的文件（' + i.changedCount + ' 个）';
+    det2.appendChild(sm2);
+    var pre3 = document.createElement('pre');
+    pre3.style.cssText = 'margin:8px 0 0;padding:10px;overflow:auto;max-height:200px;'
+      + 'font-size:12px;line-height:1.5;white-space:pre-wrap;'
+      + 'background:rgba(127,127,127,.12);border-radius:8px';
+    pre3.textContent = (i.changed || []).join('\n');
+    det2.appendChild(pre3);
+    c.appendChild(det2);
+  }
+
+  host.appendChild(section('版本与更新', '检测仓库有没有新版，有就一键更新', c));
+}
+
 PANELS.server = function (host, S) {
   var sv = S.server || {};
   var c = card();
@@ -2467,6 +2635,8 @@ PANELS.server = function (host, S) {
   }, 'btn--danger btn--sm'));
   host.appendChild(section('服务控制', null, svcSec));
   host.appendChild(svcActs);
+
+  renderUpdateSection(host);
 };
 
 /* ---------- 模式：默认模式 + 各模式提示词规模 ---------- */

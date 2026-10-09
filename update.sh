@@ -1,7 +1,8 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
 #   昔涟 · 手机版 Web Agent —— 原地更新脚本
-#   仓库：https://github.com/morisukesu/cyrene-web-mobile
+#   仓库：https://gitee.com/morisuke/cyrene-web-mobile
+#         GitHub 同名仓库 morisukesu/cyrene-web-mobile 内容一致，作备用
 #
 #   把已经部署好的这一份更新到仓库最新，你自己的东西一样不动：
 #     保留  cyrene_mobile/.config.json、data/、plugins/、plugins_inbox/、_plugin_tmp/
@@ -14,8 +15,12 @@
 # ============================================================
 set -euo pipefail
 
+# 打包下载用的源。只有连 git 也用不了时，才会走到那条路。
 REPO="morisukesu/cyrene-web-mobile"
 BRANCH="main"
+# 取新版的 git 源，按顺序试。Gitee 是 GitHub 的镜像、内容一致，
+# 国内实测 37MB 两秒；GitHub 原站慢得多，放第二位兜底。
+GIT_URLS="https://gitee.com/morisuke/cyrene-web-mobile.git https://github.com/morisukesu/cyrene-web-mobile.git"
 MODE="auto"
 DO_BACKUP=1
 FROM_DIR=""
@@ -169,22 +174,46 @@ if [ -n "$FROM_DIR" ]; then
   [ "$NEW_ROOT" = "$SCRIPT_DIR" ] && die "--from 指的就是当前这份目录，没有可更新的内容。"
   ok "从本地目录取新版：$NEW_ROOT"
 else
-  info "从 GitHub 拉取 $BRANCH 分支..."
-  URL="https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz"
-  TGZ="$WORK/branch.tar.gz"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fL --retry 2 --connect-timeout 15 -o "$TGZ" "$URL" \
-      || die "下载失败：$URL（没网的话，把仓库包解压好，再用 --from 指过来）"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$TGZ" "$URL" || die "下载失败：$URL（没网的话，把仓库包解压好，再用 --from 指过来）"
+  # 取新版按「国内能不能秒下」排序：
+  #   1. git 浅克隆 Gitee 镜像  —— 实测 37MB 两秒
+  #   2. git 浅克隆 GitHub      —— 慢得多，源站兜底
+  #   3. GitHub 打包下载        —— 老路，连 git 都没有时才走
+  # Gitee 的打包下载要登录，所以它这边只走 git。
+  NEW_ROOT=""
+  if command -v git >/dev/null 2>&1; then
+    info "获取 $BRANCH 分支的新版..."
+    for u in $GIT_URLS; do
+      rm -rf "$WORK/clone"
+      if git clone --depth 1 --branch "$BRANCH" -q "$u" "$WORK/clone" >/dev/null 2>&1 \
+         && [ -d "$WORK/clone/cyrene_mobile" ]; then
+        NEW_ROOT="$WORK/clone"
+        ok "已取到：$u"
+        break
+      fi
+      warn "这个源没拉下来：$u"
+    done
   else
-    die "既没有 curl 也没有 wget。先 pkg install curl，或用 --from 指本地目录"
+    warn "没装 git，只能走打包下载（会慢很多）"
   fi
-  ok "下载完成（$(du -h "$TGZ" 2>/dev/null | cut -f1)）"
-  tar -xzf "$TGZ" -C "$WORK" || die "解压失败，多半是没下全，重跑一次"
-  NEW_ROOT="$(find "$WORK" -maxdepth 2 -type d -name cyrene_mobile | head -n 1)"
-  [ -n "$NEW_ROOT" ] || die "解压后没看到 cyrene_mobile 目录"
-  NEW_ROOT="$(cd "$NEW_ROOT/.." && pwd)"
+
+  if [ -z "$NEW_ROOT" ]; then
+    info "退回打包下载 $BRANCH 分支..."
+    URL="https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz"
+    TGZ="$WORK/branch.tar.gz"
+    if command -v curl >/dev/null 2>&1; then
+      curl -fL --retry 2 --connect-timeout 15 -o "$TGZ" "$URL" \
+        || die "下载失败：$URL（没网的话，把仓库包解压好，再用 --from 指过来）"
+    elif command -v wget >/dev/null 2>&1; then
+      wget -q -O "$TGZ" "$URL" || die "下载失败：$URL（没网的话，把仓库包解压好，再用 --from 指过来）"
+    else
+      die "既没有 git、也没有 curl/wget。先 pkg install git，或用 --from 指本地目录"
+    fi
+    ok "下载完成（$(du -h "$TGZ" 2>/dev/null | cut -f1)）"
+    tar -xzf "$TGZ" -C "$WORK" || die "解压失败，多半是没下全，重跑一次"
+    NEW_ROOT="$(find "$WORK" -maxdepth 2 -type d -name cyrene_mobile | head -n 1)"
+    [ -n "$NEW_ROOT" ] || die "解压后没看到 cyrene_mobile 目录"
+    NEW_ROOT="$(cd "$NEW_ROOT/.." && pwd)"
+  fi
 fi
 NEW_APP="$NEW_ROOT/cyrene_mobile"
 
