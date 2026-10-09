@@ -2530,6 +2530,8 @@ TYPO_RANGES = {
 DEFAULT_SETTINGS = {
     "appearance": {
         "theme": "charcoal-pink",
+        # 插件皮肤的 id（plugin:<插件名>）。空 = 不用插件皮肤，走上面那套内置主题。
+        "uiSkin": "",
         "messageTypography": {"fontSize": 15, "lineHeight": 1.85,
                               "letterSpacing": 0.8, "fontWeight": 400},
         "mobileMessageSegmentation": "off",
@@ -2550,7 +2552,15 @@ DEFAULT_SETTINGS = {
     },
     "tools": {},      # {tool_id: bool}，缺省视为 True
     "skills": {},     # {skill_id: bool}，缺省视为 manifest.defaultEnabled
-    "tts": {"autoSpeak": False, "rate": 1.0, "pitch": 1.0, "language": ""},
+    # engine = "system"  用手机自带的 termux-tts-speak（离线、免费）
+    #          "minimax" 调 MiniMax 的云端音色，和桌面端同一个嗓子
+    "tts": {"autoSpeak": False, "rate": 1.0, "pitch": 1.0, "language": "",
+            "engine": "system", "minimaxKey": "", "minimaxVoiceId": "",
+            "minimaxModel": "speech-2.8-hd", "minimaxSpeed": 1.0, "minimaxVolume": 1.0,
+            "minimaxPitch": 0, "minimaxVocalEnhance": True,
+            "customEndpointUrl": "", "customApiKey": "", "customVoiceId": "",
+            "customFormat": "mp3", "customSpeed": 1.0, "customVolume": 1.0,
+            "customTimeoutMs": 30000},
     "server": {"web_port": 28443, "bind_host": "0.0.0.0", "tool_timeout": 30},
     # 新会话的默认模式；每个会话可单独切换并记忆在 session.mode
     "chat": {"defaultMode": DEFAULT_MODE},
@@ -2625,6 +2635,7 @@ def normalize_settings(raw):
             if ap.get("mobileMessageSegmentation") in ("off", "on") else "off"),
         "markdown": _as_bool(ap.get("markdown"), True),
         "highlight": _as_bool(ap.get("highlight"), True),
+        "uiSkin": _as_str(ap.get("uiSkin"), "")[:80],
     }
 
     mo = src.get("model") if isinstance(src.get("model"), dict) else {}
@@ -2649,11 +2660,27 @@ def normalize_settings(raw):
                      if isinstance(k, str)} if isinstance(src.get("skills"), dict) else {}
 
     tt = src.get("tts") if isinstance(src.get("tts"), dict) else {}
+    eng = _as_str(tt.get("engine"), "system").strip().lower()
     out["tts"] = {
         "autoSpeak": _as_bool(tt.get("autoSpeak"), False),
         "rate": round(_clamp(tt.get("rate"), 0.5, 2.0, 1.0), 2),
         "pitch": round(_clamp(tt.get("pitch"), 0.5, 2.0, 1.0), 2),
         "language": _as_str(tt.get("language"), "")[:20],
+        "engine": eng if eng in ("minimax", "custom") else "system",
+        "minimaxKey": _as_str(tt.get("minimaxKey"), "")[:256],
+        "minimaxVoiceId": _as_str(tt.get("minimaxVoiceId"), "")[:128],
+        "minimaxModel": (_as_str(tt.get("minimaxModel"), "") or "speech-2.8-hd")[:64],
+        "minimaxSpeed": round(_clamp(tt.get("minimaxSpeed"), 0.5, 2.0, 1.0), 2),
+        "minimaxVolume": round(_clamp(tt.get("minimaxVolume"), 0.1, 10.0, 1.0), 2),
+        "minimaxPitch": round(_clamp(tt.get("minimaxPitch"), -12, 12, 0), 1),
+        "minimaxVocalEnhance": _as_bool(tt.get("minimaxVocalEnhance"), True),
+        "customEndpointUrl": _as_str(tt.get("customEndpointUrl"), "")[:500],
+        "customApiKey": _as_str(tt.get("customApiKey"), "")[:256],
+        "customVoiceId": _as_str(tt.get("customVoiceId"), "")[:128],
+        "customFormat": "wav" if _as_str(tt.get("customFormat"), "").lower() == "wav" else "mp3",
+        "customSpeed": round(_clamp(tt.get("customSpeed"), 0.5, 2.0, 1.0), 2),
+        "customVolume": round(_clamp(tt.get("customVolume"), 0.1, 3.0, 1.0), 2),
+        "customTimeoutMs": int(_clamp(tt.get("customTimeoutMs"), 5000, 300000, 30000)),
     }
 
     sv = src.get("server") if isinstance(src.get("server"), dict) else {}
@@ -4459,6 +4486,9 @@ class PluginManager:
                     "description": str(mf.get("description") or ""),
                     "icon": mf.get("icon") or None,
                     "settingsPanel": mf.get("settingsPanel") or None,
+                    # 声明了 uiSkin = 这个插件会改界面。面板据此打标，
+                    # 让用户在挑皮肤之前看得见。
+                    "uiSkin": isinstance(mf.get("uiSkin"), dict),
                     "deps": mf.get("deps") or [],
                     "state": self._states.get(pid, "installed"),
                     "enabled": bool(reg_e.get("enabled", False)),
@@ -4486,7 +4516,7 @@ class PluginManager:
                     out.append({
                         "id": pid, "name": pid, "version": entry.get("version", ""),
                         "author": "", "description": "(插件目录已不存在)",
-                        "icon": None, "settingsPanel": None, "deps": [],
+                        "icon": None, "settingsPanel": None, "uiSkin": False, "deps": [],
                         "state": "not_installed",
                         "enabled": bool(entry.get("enabled", False)),
                         "supported": False,
@@ -6395,17 +6425,367 @@ def dispatch_exclusive(calls, max_parallel=None, ctx=None):
 
 
 # ========== TTS ==========
-# termux-tts-speak 是阻塞式播放。保存句柄以便 /tts/stop 能真的打断它。
+# 两条嗓子：
+#   system  —— termux-tts-speak，手机自带的，离线、免费、阻塞式播完才返回
+#   minimax —— 云端合成，音色跟桌面端一致（要填自己的 API Key）
+# 桌面端那条走的是 WebSocket；这里用它的 HTTP 版 v1/t2a_v2，
+# 纯 urllib 就能调，省得为了 TTS 再引一个 websocket 依赖。
+# 合成好的 mp3 按 (引擎+文本) 缓存一份，同一句话不重复花钱。
 TTS_PROC = None
 TTS_LOCK = threading.Lock()
 
+MINIMAX_T2A_URL = "https://api.minimaxi.com/v1/t2a_v2"
+
+# ---- 气口增强：规则照桌面端 minimax-vocal-enhancer.js 搬的 ----
+# 往文本里补 (laughs)/(emm)/(sighs)/(breath) 这类标记，让语气有停顿。
+MAX_VOCAL_TAGS = 2
+MINIMAX_VOCAL_TAGS = (
+    "(laughs)", "(chuckle)", "(coughs)", "(clear-throat)", "(groans)",
+    "(breath)", "(pant)", "(inhale)", "(exhale)", "(gasps)", "(sniffs)",
+    "(sighs)", "(snorts)", "(burps)", "(lip-smacking)", "(humming)",
+    "(hissing)", "(emm)", "(sneezes)",
+)
+# (正则, 气口, 插在词前还是词后, 这段最多几个, 是否只在句末触发)
+MINIMAX_VOCAL_RULES = (
+    (re.compile(r"(?<![（(])哈{2,}(?![）)])"), "(laughs)", "after", 1, False),
+    (re.compile(r"(?<![（(])嘿{2,}(?![）)])"), "(chuckle)", "after", 1, False),
+    (re.compile(r"(?<![（(])嗯[~….]{0,3}(?![）)])"), "(emm)", "before", 1, False),
+    (re.compile(r"(?<![a-zA-Z（(])emm+m*[.…]*", re.I), "(emm)", "before", 1, False),
+    (re.compile(r"(?<![（(])啊(?![）)])"), "(gasps)", "before", 1, False),
+    (re.compile(r"(?<![（(])唉(?![）)])"), "(sighs)", "before", 1, False),
+    (re.compile(r"(?<![（(])哎(?![）)])"), "(sighs)", "before", 1, False),
+    (re.compile(r"(?:请看下面的代码块|代码如下|见下表|如下所示|如下表所示)[:：]?\s*$"),
+     "(breath)", "after", 1, True),
+    (re.compile(r"[.…]{2,}\s*$"), "(sighs)", "after", 1, True),
+)
+
+
+def _has_vocal_tag_near(text, index, direction):
+    """前后 20 个字里已经有气口标记，就别再叠一个。"""
+    seg = text[max(0, index - 20):index] if direction == "before" else text[index:index + 20]
+    return any(tag in seg for tag in MINIMAX_VOCAL_TAGS)
+
+
+def enhance_minimax_text(text, enabled=True):
+    """给文本补气口标记。整段最多补 MAX_VOCAL_TAGS 个。"""
+    if not enabled or not text:
+        return text
+    out = text
+    total = 0
+    for rx, tag, pos, per, tail_only in MINIMAX_VOCAL_RULES:
+        if total >= MAX_VOCAL_TAGS:
+            break
+        if tail_only and not rx.search(out):
+            continue
+        applied, start = 0, 0
+        while applied < per and total < MAX_VOCAL_TAGS:
+            m = rx.search(out, start)
+            if not m:
+                break
+            idx = m.start() if pos == "before" else m.end()
+            if _has_vocal_tag_near(out, idx, pos):
+                start = m.start() + max(1, m.end() - m.start())
+                continue
+            out = out[:idx] + tag + out[idx:]
+            applied += 1
+            total += 1
+            start = idx + len(tag)
+    return out
+
+
+def tts_engine():
+    """现在用哪条嗓子。"""
+    eng = str((SETTINGS.get("tts") or {}).get("engine") or "system").strip().lower()
+    if eng in ("minimax", "custom"):
+        return eng
+    return "system"
+
+
+def _tts_cache_path(tag, text, ext="mp3"):
+    h = hashlib.sha1((tag + "\0" + text).encode("utf-8")).hexdigest()[:20]
+    d = DATA_DIR / "tts"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d / (h + "." + ext)
+
+
+def _minimax_synth(text, cfg):
+    """调 MiniMax 合成一段 mp3。返回 (bytes, 错误原因)，成功时错误为空串。"""
+    key = str(cfg.get("minimaxKey") or "").strip()
+    if not key:
+        return None, "还没填 MiniMax 的 API Key（设置 → 语音）"
+    voice = str(cfg.get("minimaxVoiceId") or "").strip()
+    if not voice:
+        return None, "还没填音色 ID（设置 → 语音）"
+    payload = {
+        "model": str(cfg.get("minimaxModel") or "").strip() or "speech-2.8-hd",
+        "text": enhance_minimax_text(
+            text, bool(cfg.get("minimaxVocalEnhance", True))),
+        "stream": False,
+        "voice_setting": {
+            "voice_id": voice,
+            "speed": float(cfg.get("minimaxSpeed") or 1.0),
+            "vol": float(cfg.get("minimaxVolume") or 1.0),
+            # pitch 必须是整数，传 0.0 这种浮点会被 API 顶回来（2013）
+            "pitch": int(round(float(cfg.get("minimaxPitch") or 0))),
+            "english_normalization": False,
+        },
+        "audio_setting": {"sample_rate": 32000, "bitrate": 128000,
+                          "format": "mp3", "channel": 1},
+    }
+    req = urllib.request.Request(
+        MINIMAX_T2A_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": "Bearer " + key,
+                 "Content-Type": "application/json"},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        return None, "MiniMax 返回 %s：%s" % (e.code, body)
+    except Exception as e:
+        return None, "连不上 MiniMax：%s" % e
+    base = data.get("base_resp") or {}
+    code = base.get("status_code")
+    if code not in (0, None):
+        return None, "MiniMax 报错 %s：%s" % (code, base.get("status_msg") or "")
+    hex_audio = (data.get("data") or {}).get("audio") or ""
+    if not hex_audio:
+        return None, "MiniMax 没返回音频（这段话可能被内容策略挡了）"
+    try:
+        return bytes.fromhex(hex_audio), ""
+    except ValueError:
+        return None, "返回的音频不是合法 hex"
+
+
+def _play_audio_file(path):
+    """用 termux-media-player 放一个音频文件。它是后台播的，不等播完。"""
+    try:
+        subprocess.run(["termux-media-player", "stop"],
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass
+    try:
+        p = subprocess.run(["termux-media-player", "play", str(path)],
+                           capture_output=True, timeout=20)
+    except FileNotFoundError:
+        return False, "termux-media-player 不存在（要装 Termux:API）"
+    except Exception as e:
+        return False, str(e)
+    if p.returncode != 0:
+        detail = (p.stderr or b"").decode("utf-8", "replace").strip()[:200]
+        return False, detail or ("exit %d" % p.returncode)
+    return True, "ok"
+
+
+def _tts_speak_minimax(text, cfg):
+    # 语速、音量也进 key —— 不然调了语速而句子没变，命中的还是旧那版音频
+    tag = "minimax:%s:%s:%s:%s:%s:%s" % (
+        cfg.get("minimaxVoiceId") or "", cfg.get("minimaxModel") or "",
+        cfg.get("minimaxSpeed") or 1.0, cfg.get("minimaxVolume") or 1.0,
+        cfg.get("minimaxPitch") or 0, bool(cfg.get("minimaxVocalEnhance", True)))
+    cache = _tts_cache_path(tag, text)
+    try:
+        if cache.is_file() and cache.stat().st_size > 0:
+            return _play_audio_file(cache)
+    except OSError:
+        pass
+    audio, err = _minimax_synth(text, cfg)
+    if audio is None:
+        return False, err
+    try:
+        cache.write_bytes(audio)
+    except OSError:
+        pass
+    return _play_audio_file(cache)
+
+
+def _custom_synth(text, cfg):
+    """调自定义云端接口。返回 (音频字节, 扩展名, 错误原因)。
+
+    约定跟桌面端 custom-cloud-engine 一致：
+      POST <接口地址>   Content-Type: application/json
+      Key 非空时带 Authorization: Bearer <key>
+      body: {text, voiceId?, speed, volume, format}
+      响应：直接给音频字节，或者 application/json 里给 audioBase64。
+    """
+    url = str(cfg.get("customEndpointUrl") or "").strip()
+    if not url:
+        return None, "", "还没填自定义云端的接口地址（设置 → 语音）"
+    fmt = "wav" if str(cfg.get("customFormat") or "").strip().lower() == "wav" else "mp3"
+    timeout = _clamp(cfg.get("customTimeoutMs"), 5, 300, 30)
+    body = {
+        "text": text,
+        "speed": float(cfg.get("customSpeed") or 1.0),
+        "volume": float(cfg.get("customVolume") or 1.0),
+        "format": fmt,
+    }
+    voice = str(cfg.get("customVoiceId") or "").strip()
+    if voice:
+        body["voiceId"] = voice
+    headers = {"Content-Type": "application/json"}
+    key = str(cfg.get("customApiKey") or "").strip()
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                 headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        return None, "", "接口返回 %s：%s" % (e.code, detail)
+    except Exception as e:
+        return None, "", "请求失败：%s" % e
+    if "json" in ctype:
+        try:
+            d = json.loads(raw.decode("utf-8", "replace"))
+        except Exception:
+            return None, "", "接口说是 JSON，但解析不了"
+        b64 = d.get("audioBase64")
+        if not b64:
+            return None, "", "JSON 里没有 audioBase64"
+        try:
+            audio = base64.b64decode(b64)
+        except Exception:
+            return None, "", "audioBase64 解不开"
+        got = str(d.get("format") or "").strip().lower()
+        if got in ("wav", "mp3"):
+            fmt = got
+    else:
+        audio = raw
+        if "wav" in ctype or "wave" in ctype:
+            fmt = "wav"
+        elif "mpeg" in ctype or "mp3" in ctype:
+            fmt = "mp3"
+    if not audio:
+        return None, "", "接口返回了空音频"
+    return audio, fmt, ""
+
+
+def _tts_speak_custom(text, cfg):
+    tag = "custom:%s:%s:%s:%s:%s" % (
+        cfg.get("customEndpointUrl") or "", cfg.get("customVoiceId") or "",
+        cfg.get("customSpeed") or 1.0, cfg.get("customVolume") or 1.0,
+        cfg.get("customFormat") or "mp3")
+    fmt = "wav" if str(cfg.get("customFormat") or "").strip().lower() == "wav" else "mp3"
+    cache = _tts_cache_path(tag, text, fmt)
+    try:
+        if cache.is_file() and cache.stat().st_size > 0:
+            return _play_audio_file(cache)
+    except OSError:
+        pass
+    audio, got, err = _custom_synth(text, cfg)
+    if audio is None:
+        return False, err
+    if got != fmt:
+        cache = _tts_cache_path(tag, text, got)
+    try:
+        cache.write_bytes(audio)
+    except OSError:
+        pass
+    return _play_audio_file(cache)
+
+
+def _tts_speak_system(text, cfg):
+    """手机自带的那条嗓子，阻塞播完才返回。"""
+    global TTS_PROC
+    cmd = ["termux-tts-speak"]
+    try:
+        rate = float(cfg.get("rate", 1.0))
+        cmd += ["-r", str(round(rate, 2))]
+    except (TypeError, ValueError):
+        pass
+    try:
+        pitch = float(cfg.get("pitch", 1.0))
+        cmd += ["-p", str(round(pitch, 2))]
+    except (TypeError, ValueError):
+        pass
+    lang = str(cfg.get("language") or "").strip()
+    if lang:
+        cmd += ["-l", lang[:20]]
+    cmd.append(text[:800])
+    try:
+        with TTS_LOCK:
+            TTS_PROC = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE)
+            proc = TTS_PROC
+        _, err = proc.communicate(timeout=60)
+        with TTS_LOCK:
+            TTS_PROC = None
+        if proc.returncode != 0:
+            detail = (err or b"").decode(errors="replace").strip()[:200]
+            return False, detail or f"exit {proc.returncode}"
+        return True, "ok"
+    except FileNotFoundError:
+        with TTS_LOCK:
+            TTS_PROC = None
+        return False, "termux-tts-speak 不存在（需在 Termux 内运行并安装 Termux:API）"
+    except subprocess.TimeoutExpired:
+        tts_stop()
+        return False, "播放超时"
+    except Exception as e:
+        with TTS_LOCK:
+            TTS_PROC = None
+        return False, str(e)
+
 
 def tts_speak(text):
-    """在当前线程阻塞播放，播完返回。返回 (ok, message)。"""
-    global TTS_PROC
+    """念一段话。按设置里的引擎分派，返回 (ok, message)。"""
     t = str(text or "").strip()
     if not t:
         return False, "empty"
+    cfg = SETTINGS.get("tts") or {}
+    eng = tts_engine()
+    if eng == "minimax":
+        return _tts_speak_minimax(t[:1500], cfg)
+    if eng == "custom":
+        return _tts_speak_custom(t[:1500], cfg)
+    return _tts_speak_system(t, cfg)
+
+
+def tts_stop():
+    """停掉正在念的。两条嗓子的停法不一样。"""
+    global TTS_PROC
+    if tts_engine() in ("minimax", "custom"):
+        try:
+            subprocess.run(["termux-media-player", "stop"],
+                           capture_output=True, timeout=5)
+            return True
+        except Exception:
+            return False
+    with TTS_LOCK:
+        proc, TTS_PROC = TTS_PROC, None
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        # termux-tts-speak 只是客户端，引擎侧要单独叫停
+        try:
+            subprocess.run(["termux-tts-speak", "-s"], timeout=5,
+                           capture_output=True)
+        except Exception:
+            pass
+        return True
+    return False, "empty"
     cfg = SETTINGS.get("tts", {})
     cmd = ["termux-tts-speak"]
     try:
@@ -6570,6 +6950,41 @@ INFLIGHT = {}
 STREAM_SUBS = {}            # sid -> set(queue.Queue)
 STREAM_LOCK = threading.Lock()
 STREAM_MAX_SECONDS = 900    # 单条 SSE 连接的兜底时长，防止线程挂死
+
+# ---- UI 事件流（皮肤热改这类「界面要立刻变」的事）----
+# 跟上面那套同一形状，只是订阅的是整页而不是单个会话。开着页面的每一个
+# 标签各订一条；没人订的时候，publish 的代价只是一次空列表遍历。
+UI_SUBS = set()             # set(queue.Queue)
+UI_LOCK = threading.Lock()
+UI_REV = 0                  # 每次界面配置变化 +1，前端拿它判断要不要重画
+UI_MAX_SECONDS = 1800
+
+
+def ui_subscribe():
+    q = queue.Queue(maxsize=200)
+    with UI_LOCK:
+        globals()["UI_SUBS"].add(q)
+    return q
+
+
+def ui_unsubscribe(q):
+    with UI_LOCK:
+        globals()["UI_SUBS"].discard(q)
+
+
+def ui_bump_rev():
+    """界面配置变了：版本号 +1，并叫醒所有开着的页面。"""
+    global UI_REV
+    with UI_LOCK:
+        UI_REV += 1
+        rev = UI_REV
+        subs = list(UI_SUBS)
+    for q in subs:
+        try:
+            q.put_nowait({"kind": "skin", "rev": rev})
+        except Exception:
+            pass
+    return rev
 
 
 def stream_subscribe(sid):
@@ -7224,6 +7639,44 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             stream_unsubscribe(sid, q)
 
+    def _stream_ui(self):
+        """界面事件流：皮肤之类的东西一变，开着的页面立刻收到。
+
+        与 _stream_chat 同一形状，区别是这里不绑会话，整页都订同一条。
+        """
+        q = ui_subscribe()
+        started = time.time()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.wfile.write(b": open\n\n")
+            self.wfile.flush()
+            idle = 0.0
+            while True:
+                if time.time() - started > UI_MAX_SECONDS:
+                    break
+                try:
+                    ev = q.get(timeout=1.0)
+                    idle = 0.0
+                except queue.Empty:
+                    idle += 1.0
+                    if idle >= 20.0:
+                        idle = 0.0
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                    continue
+                payload = json.dumps(ev, ensure_ascii=False)
+                self.wfile.write(b"data: " + payload.encode() + b"\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            pass
+        finally:
+            ui_unsubscribe(q)
+
     def _body(self):
         try:
             n = int(self.headers.get("Content-Length", 0) or 0)
@@ -7334,6 +7787,10 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path == "/settings":
             self._json(self._public_settings())
+        elif path == "/ui/skins":
+            self._json(_ui_skins_payload())
+        elif path == "/ui/stream":
+            self._stream_ui()
         elif path == "/update/check":
             self._json(_update_check())
         elif path == "/update/status":
@@ -7954,6 +8411,30 @@ class Handler(BaseHTTPRequestHandler):
             _delayed_service_action(mode)
             return
 
+        # 运行时改界面：插件面板点一下就走这儿。挂本机门 —— 它改的是所有人的界面。
+        if path == "/ui/skin":
+            # 面板跑在 sandbox 的 iframe 里（origin 是 opaque），读响应要 ACAO；
+            # 它发的又是 text/plain 的「简单请求」，所以不会有预检 OPTIONS。
+            hdr = {"Access-Control-Allow-Origin": "*"}
+
+            def _skin_reply(obj, code=200):
+                self._send_extra(json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+                                 "application/json; charset=utf-8", hdr)
+
+            if not self._is_local_client():
+                _skin_reply({"ok": False, "error": "仅本机可改界面"}, 403)
+                return
+            pid = _as_str(body.get("plugin"), "")[:64]
+            if not PLUGIN_ID_RE.match(pid or ""):
+                _skin_reply({"ok": False, "error": f"非法插件 id: {pid}"}, 400)
+                return
+            rev, err = ui_skin_set(pid, body)
+            if err:
+                _skin_reply({"ok": False, "error": err}, 400)
+                return
+            _skin_reply({"ok": True, "rev": rev})
+            return
+
         # 一键更新：只本机可调，和 /service/* 共用同一条权限门 —— 更新会重启
         # 服务，不能让同一 WiFi 下的别人代劳。加上 confirm 防误触。
         if path == "/update/apply":
@@ -8521,6 +9002,130 @@ def _start_update():
 
     threading.Thread(target=_wait, name="update-wait", daemon=True).start()
     return {"ok": True, "pid": proc.pid}
+
+
+# ========== 插件皮肤（uiSkin） ==========
+# 插件在 manifest 里声明一套皮肤，用户在设置 → 外观 里挑一套用。
+# 这里故意不做过筛：插件本来就是任意 Node 代码，能读文件、联网、跑 shell，
+# 从 CSS 这条路拦它拦不住什么。真正该做的两件事是「看得见」和「收得回来」——
+#   · 装/启用前，插件面板会标出这个包会改界面；
+#   · 皮肤只在用户挑中的时候才注入，随时能点回「不用皮肤」。
+UI_SKIN_MAX_BYTES = 256 * 1024
+
+
+def _clean_skin_tokens(raw):
+    """把插件给的 token 表夹成 {名字: 值}。只收 -- 开头、长度有限的键。"""
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in list(raw.items())[:400]:
+        if (isinstance(k, str) and k.startswith("--") and len(k) <= 64
+                and isinstance(v, (str, int, float)) and not isinstance(v, bool)):
+            out[k] = str(v)[:200]
+    return out
+
+
+def _read_skin_css(pid, rel):
+    """读插件目录里的皮肤文件。返回 (css, 错误)。路径按 settingsPanel 同一套规则校验。"""
+    if not isinstance(rel, str) or "/" in rel or "\\" in rel or ".." in rel:
+        return "", "css 必须是插件目录内的裸文件名: %r" % (rel,)
+    d = PLUGIN_MANAGER.plugin_dir(pid)
+    p = d / rel
+    try:
+        root = d.resolve()
+        resolved = p.resolve()
+        inside = (resolved.is_relative_to(root)
+                  if hasattr(resolved, "is_relative_to")
+                  else root.parts == resolved.parts[:len(root.parts)])
+    except OSError:
+        inside = False
+    if not inside or not p.is_file():
+        return "", "皮肤文件不存在: %s" % rel
+    try:
+        data = p.read_bytes()
+    except OSError as ex:
+        return "", "皮肤文件读取失败: %s" % ex
+    if len(data) > UI_SKIN_MAX_BYTES:
+        return "", ("皮肤文件 %d KB，超过 %d KB 上限，没有载入"
+                    % (len(data) // 1024, UI_SKIN_MAX_BYTES // 1024))
+    return data.decode("utf-8", "replace"), ""
+
+
+# 运行时覆盖：插件在跑的过程中改界面（比如按时间换配色）。
+# 叠在「用户挑的那套皮肤」之上，按插件名排序，后面的盖前面的。
+UI_SKIN_OVERRIDE = {}       # pid -> {"name":.., "base":.., "css":.., "tokens":{..}}
+
+
+def ui_skin_set(pid, spec):
+    """写一个插件的运行时皮肤。spec: {name?, base?, css? 或 cssFile?, tokens?, clear?}"""
+    if spec.get("clear"):
+        UI_SKIN_OVERRIDE.pop(pid, None)
+        return ui_bump_rev(), ""
+    tokens = _clean_skin_tokens(spec.get("tokens"))
+    css = _as_str(spec.get("css"), "")[:UI_SKIN_MAX_BYTES]
+    if not css and spec.get("cssFile"):
+        css, err = _read_skin_css(pid, spec.get("cssFile"))
+        if err:
+            return None, err
+    base = spec.get("base") if spec.get("base") in ("charcoal-pink", "pearl-white") else ""
+    if not css and not tokens:
+        return None, "css 和 tokens 至少要给一个"
+    UI_SKIN_OVERRIDE[pid] = {
+        "plugin": pid,
+        "name": _as_str(spec.get("name"), "")[:60] or pid,
+        "base": base, "css": css, "tokens": tokens,
+    }
+    return ui_bump_rev(), ""
+
+
+def _plugin_ui_skin(pid, mf):
+    """读一个插件声明的 uiSkin。没声明返回 None。"""
+    raw = mf.get("uiSkin") if isinstance(mf, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    name = str(raw.get("name") or "").strip()[:60] or ("%s 的皮肤" % (mf.get("name") or pid))
+    base = raw.get("base") if raw.get("base") in ("charcoal-pink", "pearl-white") else ""
+    tokens = _clean_skin_tokens(raw.get("tokens"))
+
+    css, err = "", ""
+    rel = raw.get("css")
+    if rel:
+        css, err = _read_skin_css(pid, rel)
+    if not css and not tokens and not err:
+        err = "uiSkin 里既没有 css 也没有 tokens"
+    return {"id": "plugin:" + pid, "plugin": pid, "name": name, "base": base,
+            "css": css, "tokens": tokens, "bytes": len(css.encode("utf-8")),
+            "enabled": False, "error": err}
+
+
+def _ui_skins_payload():
+    """GET /ui/skins —— 已装插件声明的皮肤清单。
+
+    只有「已启用」的插件才真的把 CSS 交出去；停用的照样列出来，但 css/tokens
+    留空并写明原因，免得用户以为皮肤坏了。
+    """
+    reg = plugin_registry()
+    try:
+        installed = PLUGIN_MANAGER.scan_installed()
+    except Exception:
+        installed = {}
+    skins = []
+    for pid, mf in sorted(installed.items()):
+        s = _plugin_ui_skin(pid, mf)
+        if not s:
+            continue
+        entry = reg.get(pid) if isinstance(reg.get(pid), dict) else {}
+        s["enabled"] = bool(entry.get("enabled", False))
+        if not s["enabled"]:
+            s["css"], s["tokens"] = "", {}
+            s["error"] = s["error"] or "插件当前停用，皮肤未生效"
+        skins.append(s)
+    return {"ok": True,
+            "rev": UI_REV,
+            "active": (SETTINGS.get("appearance") or {}).get("uiSkin") or "",
+            "skins": skins,
+            # 运行时覆盖：插件在跑的过程中改的界面，叠在挑中的那套之上
+            "override": [UI_SKIN_OVERRIDE[k] for k in sorted(UI_SKIN_OVERRIDE)]}
 
 
 # ========== 主入口 ==========

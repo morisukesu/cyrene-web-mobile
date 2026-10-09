@@ -1112,6 +1112,8 @@ function loadSettings() {
   return api('/settings').then(function (d) {
     SETTINGS = d;
     applyAppearance(d.appearance || {});
+    loadUiSkins();
+    openUiStream();
     dirty = false; setSaveStatus('');
     renderSettingsPanel();
   }).catch(function (e) {
@@ -1132,6 +1134,87 @@ function applyAppearance(ap) {
   root.setProperty('--cy-msg-line-height', String(ty.lineHeight != null ? ty.lineHeight : 1.85));
   root.setProperty('--cy-msg-spacing', (ty.letterSpacing != null ? ty.letterSpacing : 0.8) + 'px');
   root.setProperty('--cy-msg-weight', String(ty.fontWeight != null ? ty.fontWeight : 400));
+  applyUiSkin();
+}
+
+/* ---------- 插件皮肤 ---------- */
+/* 皮肤由插件在 manifest 里声明 uiSkin，用户在设置里挑一套。
+   这里是故意不做内容过筛的：插件本来就是任意 Node 代码，CSS 这条路拦不住它。
+   能收得住的地方在别处 —— 只有用户挑中的那套才注入，随时能点回「不用皮肤」。 */
+var UI_SKINS = null;
+var uiSkinsLoading = false;
+
+/* 编辑器以外的地方也会调，放在前面声明 */
+
+function loadUiSkins(force) {
+  if (uiSkinsLoading) return Promise.resolve();
+  if (UI_SKINS && !force) return Promise.resolve();
+  uiSkinsLoading = true;
+  return api('/ui/skins').then(function (d) {
+    UI_SKINS = d && d.skins ? d : { skins: [], active: '' };
+    applyUiSkin();
+    if (activeTab === 'appearance') renderSettingsPanel();
+  }).catch(function () {
+    UI_SKINS = { skins: [], active: '' };
+  }).then(function () { uiSkinsLoading = false; });
+}
+
+function applyUiSkin() {
+  var el = document.getElementById('cy-ui-skin');
+  var want = (SETTINGS && SETTINGS.appearance && SETTINGS.appearance.uiSkin) || '';
+  var s = null;
+  if (want && UI_SKINS) {
+    s = (UI_SKINS.skins || []).filter(function (x) { return x.id === want; })[0] || null;
+  }
+  /* 图层顺序：用户挑的那套皮肤打底，插件的运行时覆盖按插件名叠在上面。
+     后一层能盖前一层，这样插件想「在原皮肤上再压一层」也做得到。 */
+  var layers = [];
+  if (s) layers.push(s);
+  if (UI_SKINS && UI_SKINS.override) {
+    (UI_SKINS.override || []).forEach(function (o) { layers.push(o); });
+  }
+  if (!layers.length) { if (el) el.remove(); return; }
+  for (var i = layers.length - 1; i >= 0; i--) {
+    if (layers[i].base) {
+      document.documentElement.setAttribute('data-ui-theme', layers[i].base);
+      break;
+    }
+  }
+  var css = '';
+  layers.forEach(function (L) {
+    var tk = L.tokens || {};
+    var decl = Object.keys(tk).map(function (k) { return k + ':' + tk[k] + ';'; }).join('');
+    if (decl) css += ':root{' + decl + '}\n';
+    if (L.css) css += L.css + '\n';
+  });
+  if (!css) { if (el) el.remove(); return; }
+  if (!el) {
+    el = document.createElement('style');
+    el.id = 'cy-ui-skin';
+    document.head.appendChild(el);
+  }
+  el.textContent = css;
+}
+
+/* 界面事件流：插件改了皮肤，这里立刻收到，不用用户去重开设置面板。
+   连不上就静默重试 —— 它只是个加速器，拿不到也不影响别的功能。 */
+var uiES = null;
+function openUiStream() {
+  if (typeof EventSource !== 'function' || uiES) return;
+  try {
+    uiES = new EventSource('/ui/stream');
+  } catch (e) { uiES = null; return; }
+  uiES.onmessage = function (ev) {
+    var d = null;
+    try { d = JSON.parse(ev.data); } catch (e) { return; }
+    if (!d || d.kind !== 'skin') return;
+    if (UI_SKINS && d.rev === UI_SKINS.rev) return;
+    UI_SKINS = null;
+    loadUiSkins(true);
+  };
+  uiES.onerror = function () {
+    /* 断了自己重连（EventSource 本来就会），这里只保证不反复 new */
+  };
 }
 
 /* ---------- 控件工厂 ---------- */
@@ -1365,6 +1448,57 @@ PANELS.appearance = function (host, S) {
     grid.appendChild(b);
   });
   host.appendChild(section('界面主题', '色值取自桌面端同名主题文件', grid));
+
+  /* ---------- 插件皮肤 ---------- */
+  var skins = (UI_SKINS && UI_SKINS.skins) || [];
+  var curSkin = ap.uiSkin || '';
+  var sg = document.createElement('div'); sg.className = 'theme-grid';
+  [{ id: '', name: '不用皮肤', plugin: '' }].concat(skins).forEach(function (s) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'theme-card' + (curSkin === s.id ? ' is-active' : '');
+    b.setAttribute('aria-pressed', String(curSkin === s.id));
+    var lb = document.createElement('span');
+    lb.className = 'theme-card__label';
+    lb.textContent = s.name + (s.plugin ? '（' + s.plugin + '）' : '');
+    b.appendChild(lb);
+    b.addEventListener('click', function () {
+      Array.prototype.forEach.call(sg.children, function (c) {
+        c.classList.remove('is-active');
+        c.setAttribute('aria-pressed', 'false');
+      });
+      b.classList.add('is-active');
+      b.setAttribute('aria-pressed', 'true');
+      if (UI_SKINS) UI_SKINS.active = s.id;
+      applyUiSkin();
+      saveSettings({ appearance: { uiSkin: s.id } }, true);
+    });
+    sg.appendChild(b);
+  });
+  var skinSec = section('插件皮肤', '插件在 manifest 里声明 uiSkin，这里挑一套；只列已装的',
+    sg);
+  host.appendChild(skinSec);
+  var skinNote = document.createElement('div');
+  skinNote.className = 'cy-settings-general__notice';
+  skinNote.style.cssText = 'padding:4px 14px 10px';
+  skinNote.textContent = skins.length
+    ? '皮肤可以直接注入 CSS，它会盖住内置样式。挑之前先确认那个插件是你信得过的。'
+    : '还没有插件声明 uiSkin —— 装了带皮肤的插件，这里就会冒出来。';
+  skinSec.appendChild(skinNote);
+  var skinBad = skins.filter(function (s) { return s.error; });
+  if (skinBad.length) {
+    var bw = document.createElement('div');
+    bw.className = 'alert alert--warn';
+    bw.textContent = skinBad.map(function (s) { return s.name + '：' + s.error; }).join('；');
+    skinSec.appendChild(bw);
+  }
+  var skinActs = document.createElement('div');
+  skinActs.style.cssText = 'display:flex;gap:8px;padding:10px 14px 0';
+  skinActs.appendChild(btn('重新扫描皮肤', function () {
+    UI_SKINS = null;
+    loadUiSkins(true);
+  }, 'btn--ghost btn--sm'));
+  skinSec.appendChild(skinActs);
 
   /* 排版滑块，实时预览 */
   var ranges = {
@@ -1917,6 +2051,12 @@ PANELS.plugins = function (host, S) {
       rb.title = '静态扫描发现：' + p.risky.join(', ');
       nm.appendChild(rb);
     }
+    if (p.uiSkin) {
+      var kb = document.createElement('span'); kb.className = 'tool-card__badge';
+      kb.textContent = '会改界面';
+      kb.title = '这个插件声明了 uiSkin，皮肤在 设置 → 外观 里挑';
+      nm.appendChild(kb);
+    }
     if (p.verified === false && p.source) {
       var ub = document.createElement('span'); ub.className = 'tool-card__badge';
       ub.textContent = '未经 sha256'; ub.style.color = '#c8860d'; nm.appendChild(ub);
@@ -2275,24 +2415,114 @@ PANELS.plugins = function (host, S) {
 
 PANELS.tts = function (host, S) {
   var t = S.tts || {};
+  var eng = t.engine === 'minimax' ? 'minimax' : (t.engine === 'custom' ? 'custom' : 'system');
+
+  /* 引擎选择：手机自带 / MiniMax / 自定义云端 */
+  var ce = card();
+  ce.appendChild(row('朗读引擎',
+    eng === 'minimax' ? 'MiniMax 云端合成，音色和桌面端同一个'
+      : eng === 'custom' ? '你自己的云端接口，按下面的约定返回音频'
+        : '手机自带的 termux-tts-speak，离线、免费',
+    segmented(eng, [
+      { value: 'system', label: '手机自带' },
+      { value: 'minimax', label: 'MiniMax' },
+      { value: 'custom', label: '自定义云端' }
+    ], function (v) {
+      /* 切引擎必须重画：三条嗓子的字段不一样，只存不画会看着像没反应 */
+      saveSettings({ tts: { engine: v } }, true).then(function () { renderSettingsPanel(); });
+    }),
+    { stack: true }));
+
+  if (eng === 'minimax') {
+    ce.appendChild(row('API Key', '你自己的 MiniMax Key，只存在这台手机里',
+      textInput(t.minimaxKey || '', function (v) { saveSettings({ tts: { minimaxKey: v } }); },
+        { password: true, placeholder: 'sk-api-…', label: 'MiniMax API Key' }), null));
+    ce.appendChild(row('音色 ID', '桌面端用的那个，照抄过来就行',
+      textInput(t.minimaxVoiceId || '', function (v) { saveSettings({ tts: { minimaxVoiceId: v } }); },
+        { mono: true, placeholder: 'cyrene-voice-…', label: '音色 ID' }), null));
+    ce.appendChild(row('模型', '默认 speech-2.8-hd',
+      textInput(t.minimaxModel || 'speech-2.8-hd',
+        function (v) { saveSettings({ tts: { minimaxModel: v } }); },
+        { mono: true, label: '模型' }), null));
+    ce.appendChild(row('语速', 'MiniMax 的 speed，1.0 为正常',
+      slider(0.5, 2.0, 0.1, t.minimaxSpeed != null ? t.minimaxSpeed : 1.0,
+        function (v) { saveSettings({ tts: { minimaxSpeed: v } }); },
+        function (v) { return v.toFixed(1) + '×'; }), { stack: true }));
+    ce.appendChild(row('音量', 'MiniMax 的 vol，1.0 为正常',
+      slider(0.1, 3.0, 0.1, t.minimaxVolume != null ? t.minimaxVolume : 1.0,
+        function (v) { saveSettings({ tts: { minimaxVolume: v } }); },
+        function (v) { return v.toFixed(1); }), { stack: true }));
+    ce.appendChild(row('音调', '基频用的是模型自带的；慢速时嫌闷就往右拉一点',
+      slider(-6, 6, 1, t.minimaxPitch != null ? t.minimaxPitch : 0,
+        function (v) { saveSettings({ tts: { minimaxPitch: v } }); },
+        function (v) { return (v > 0 ? '+' : '') + v; }), { stack: true }));
+    ce.appendChild(row('气口增强', '话里带上哈/嗯/啊这些字时，补一个停顿标记；最多两处',
+      toggle(t.minimaxVocalEnhance !== false,
+        function (v) { saveSettings({ tts: { minimaxVocalEnhance: v } }, true); },
+        '气口增强'), null));
+  }
+
+  if (eng === 'custom') {
+    ce.appendChild(row('接口地址', '往这里 POST 一个 JSON，把音频拿回来',
+      textInput(t.customEndpointUrl || '', function (v) { saveSettings({ tts: { customEndpointUrl: v } }); },
+        { mono: true, placeholder: 'http://…/tts', label: '接口地址' }), null));
+    ce.appendChild(row('API Key', '可以留空；填了就放进 Authorization: Bearer',
+      textInput(t.customApiKey || '', function (v) { saveSettings({ tts: { customApiKey: v } }); },
+        { password: true, label: '接口 Key' }), null));
+    ce.appendChild(row('音色 ID', '可以留空，会作为 voiceId 发过去',
+      textInput(t.customVoiceId || '', function (v) { saveSettings({ tts: { customVoiceId: v } }); },
+        { mono: true, label: '音色 ID' }), null));
+    ce.appendChild(row('返回格式', '问接口要 mp3 还是 wav',
+      segmented(t.customFormat === 'wav' ? 'wav' : 'mp3',
+        [{ value: 'mp3', label: 'mp3' }, { value: 'wav', label: 'wav' }],
+        function (v) { saveSettings({ tts: { customFormat: v } }, true); }), { stack: true }));
+    ce.appendChild(row('语速', '作为 speed 发过去，1.0 为正常',
+      slider(0.5, 2.0, 0.1, t.customSpeed != null ? t.customSpeed : 1.0,
+        function (v) { saveSettings({ tts: { customSpeed: v } }); },
+        function (v) { return v.toFixed(1) + '×'; }), { stack: true }));
+    ce.appendChild(row('音量', '作为 volume 发过去，1.0 为正常',
+      slider(0.1, 3.0, 0.1, t.customVolume != null ? t.customVolume : 1.0,
+        function (v) { saveSettings({ tts: { customVolume: v } }); },
+        function (v) { return v.toFixed(1); }), { stack: true }));
+    ce.appendChild(row('超时', '多少秒还没回就当失败',
+      slider(5, 120, 5, t.customTimeoutMs != null ? Math.round(t.customTimeoutMs / 1000) : 30,
+        function (v) { saveSettings({ tts: { customTimeoutMs: v * 1000 } }); },
+        function (v) { return v + 's'; }), { stack: true }));
+    var hint = document.createElement('div');
+    hint.className = 'cy-settings-general__notice';
+    hint.style.cssText = 'padding:4px 14px 12px';
+    hint.textContent = '接口收到 {text, voiceId, speed, volume, format}；'
+      + '直接吐音频字节，或者回 JSON 带一个 audioBase64 都行。';
+    ce.appendChild(hint);
+  }
+
+  if (eng !== 'system') {
+    ce.appendChild(row('说话的地方', '音频拿到后交给 termux-media-player 播',
+      null, { notice: '要装 Termux:API' }));
+  }
+  host.appendChild(section('朗读引擎', null, ce));
+
+  /* 自动朗读对所有引擎都生效；下面三条只有手机自带那条嗓子用得上 */
   var c = card();
-  c.appendChild(row('自动朗读回复', '昔涟回完话就用系统 TTS 念出来',
+  c.appendChild(row('自动朗读回复', '昔涟回完话就念出来',
     toggle(t.autoSpeak, function (v) { saveSettings({ tts: { autoSpeak: v } }, true); },
       '自动朗读回复'), null));
-  c.appendChild(row('语速', 'termux-tts-speak -r，1.0 为正常',
-    slider(0.5, 2.0, 0.1, t.rate != null ? t.rate : 1.0,
-      function (v) { saveSettings({ tts: { rate: v } }); },
-      function (v) { return v.toFixed(1) + '×'; }), { stack: true }));
-  c.appendChild(row('音调', 'termux-tts-speak -p，1.0 为正常',
-    slider(0.5, 2.0, 0.1, t.pitch != null ? t.pitch : 1.0,
-      function (v) { saveSettings({ tts: { pitch: v } }); },
-      function (v) { return v.toFixed(1); }), { stack: true }));
-  c.appendChild(row('语言', '留空则用系统默认',
-    textInput(t.language || '', function (v) { saveSettings({ tts: { language: v } }); },
-      { placeholder: 'zh-CN', label: '语言' }), null));
-
-  host.appendChild(section('语音朗读', '依赖 Termux:API 的 termux-tts-speak；'
-    + '电脑上没有这个命令，播放会静默失败', c));
+  if (eng === 'system') {
+    c.appendChild(row('语速', 'termux-tts-speak -r，1.0 为正常',
+      slider(0.5, 2.0, 0.1, t.rate != null ? t.rate : 1.0,
+        function (v) { saveSettings({ tts: { rate: v } }); },
+        function (v) { return v.toFixed(1) + '×'; }), { stack: true }));
+    c.appendChild(row('音调', 'termux-tts-speak -p，1.0 为正常',
+      slider(0.5, 2.0, 0.1, t.pitch != null ? t.pitch : 1.0,
+        function (v) { saveSettings({ tts: { pitch: v } }); },
+        function (v) { return v.toFixed(1); }), { stack: true }));
+    c.appendChild(row('语言', '留空则用系统默认',
+      textInput(t.language || '', function (v) { saveSettings({ tts: { language: v } }); },
+        { placeholder: 'zh-CN', label: '语言' }), null));
+  }
+  host.appendChild(section('语音朗读', eng === 'system'
+    ? '依赖 Termux:API 的 termux-tts-speak；电脑上没有这个命令，播放会静默失败'
+    : '语速/音调/语言是「手机自带」那条嗓子的参数，上面切到云端时已经收起来了', c));
 
   var c2 = card();
   var testRow = row('试听', null, null);
