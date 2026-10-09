@@ -15,7 +15,9 @@ var chat = $('chat'), input = $('input'), sendBtn = $('send-btn'),
     modeBtnLabel = $('mode-btn-label'), modeMenu = $('mode-menu'),
     settingsEl = $('settings'), settingsScrim = $('settings-scrim'),
     settingsBody = $('settings-body'), settingsNav = $('settings-nav'),
-    saveStatus = $('save-status');
+    saveStatus = $('save-status'),
+    attachBtn = $('attach-btn'), attachFile = $('attach-file'),
+    attachBar = $('attach-bar');
 
 var currentSid = null, busy = false, aborter = null, timer = null, secs = 0, t0 = 0;
 /* settleTimer/settleTries：中止或刷新后，轮询后端「这一轮落库了没」的定时器与计数。
@@ -223,6 +225,127 @@ input.addEventListener('input', function () {
 input.addEventListener('keydown', function (e) {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); onSend(); }
 });
+
+/* ================= 附件（上传文件）=================
+   流程：点「＋」选文件 → 逐个读成 base64 → POST /upload 落盘 →
+   服务端回 id/路径 → 挂进 chip 列表 → 发送时只回传 id。
+
+   为什么客户端只管 id、不管路径：磁盘名由服务端生成，路径也在服务端解析。
+   前端就算被改，也构造不出「uploads 目录之外」的路径。
+   上限与后端 UPLOAD_MAX_MB 保持一致，这里是早拦截，后端还会再查一遍。 */
+var ATTACH_MAX_MB = 16;
+var ATTACH_MAX_COUNT = 8;
+var CHIP_ICON = { image: '🖼', doc: '📄', zip: '🗜', other: '📎' };
+var pendingAtts = [];            /* [{id, name, size, isImage}]，发送后清空 */
+
+function chipKind(f) {
+  if (f.isImage) return 'image';
+  if (/\.(zip|7z|rar|tar|gz)$/i.test(f.name)) return 'zip';
+  if (/\.(txt|md|json|js|py|csv|log|html|css)$/i.test(f.name)) return 'doc';
+  return 'other';
+}
+
+function humanSize(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + 'B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + 'K';
+  return (n / 1024 / 1024).toFixed(1) + 'M';
+}
+
+function renderAttachBar() {
+  attachBar.innerHTML = '';
+  attachBar.hidden = !pendingAtts.length;
+  pendingAtts.forEach(function (f, idx) {
+    var chip = document.createElement('span');
+    chip.className = 'attach-chip' + (f.isImage ? ' attach-chip--img' : '');
+    var ic = document.createElement('span');
+    ic.className = 'attach-chip__ic';
+    ic.textContent = CHIP_ICON[chipKind(f)];
+    var nm = document.createElement('span');
+    nm.className = 'attach-chip__name';
+    nm.textContent = f.name;
+    var sz = document.createElement('span');
+    sz.className = 'attach-chip__size';
+    sz.textContent = humanSize(f.size);
+    var del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'attach-chip__del';
+    del.setAttribute('aria-label', '移除 ' + f.name);
+    del.textContent = '×';
+    del.addEventListener('click', function () {
+      pendingAtts.splice(idx, 1);
+      renderAttachBar();
+    });
+    chip.appendChild(ic); chip.appendChild(nm); chip.appendChild(sz); chip.appendChild(del);
+    attachBar.appendChild(chip);
+  });
+}
+
+/* File → base64（去掉 data:...;base64, 前缀，后端只吃裸串） */
+function readFileBase64(file) {
+  return new Promise(function (resolve, reject) {
+    var fr = new FileReader();
+    fr.onload = function () {
+      var s = String(fr.result || '');
+      var i = s.indexOf(',');
+      resolve(i >= 0 ? s.slice(i + 1) : s);
+    };
+    fr.onerror = function () { reject(new Error('读取失败')); };
+    fr.readAsDataURL(file);
+  });
+}
+
+/* 逐个上传，谁失败只影响谁 —— 不用 Promise.all，避免一个坏文件吞掉整批 */
+function uploadFiles(files) {
+  var list = Array.prototype.slice.call(files || []);
+  if (!list.length) return;
+  var room = ATTACH_MAX_COUNT - pendingAtts.length;
+  if (room <= 0) { alert('一条消息最多带 ' + ATTACH_MAX_COUNT + ' 个附件'); return; }
+  if (list.length > room) {
+    alert('还能再加 ' + room + ' 个，多余的先不传了');
+    list = list.slice(0, room);
+  }
+  var errors = [];
+  var chain = Promise.resolve();
+  list.forEach(function (f) {
+    chain = chain.then(function () {
+      if (f.size > ATTACH_MAX_MB * 1024 * 1024) {
+        errors.push(f.name + '：' + (f.size / 1024 / 1024).toFixed(1) + 'MB 超过上限 ' + ATTACH_MAX_MB + 'MB');
+        return null;
+      }
+      if (!f.size) { errors.push(f.name + '：是空文件'); return null; }
+      return readFileBase64(f).then(function (b64) {
+        return apiPost('/upload', { filename: f.name, dataBase64: b64 });
+      }).then(function (r) {
+        if (r && r.file) { pendingAtts.push(r.file); renderAttachBar(); }
+      }).catch(function (e) {
+        errors.push(f.name + '：' + ((e && e.message) || e));
+      });
+    });
+  });
+  return chain.then(function () {
+    if (errors.length) alert('有文件没传上去：\n' + errors.join('\n'));
+  });
+}
+
+attachBtn.addEventListener('click', function () { attachFile.click(); });
+attachFile.addEventListener('change', function () {
+  var files = attachFile.files;
+  /* 先清空 input：同一个文件连选两次也要能触发 change */
+  uploadFiles(files).then(function () { attachFile.value = ''; },
+                           function () { attachFile.value = ''; });
+});
+
+function clearAtts() {
+  pendingAtts = [];
+  renderAttachBar();
+}
+
+function attsForSend() {
+  return pendingAtts.map(function (f) {
+    return { id: f.id, name: f.name };
+  });
+}
 
 /* ================= 渲染 ================= */
 function makeBubble(cls, cont) {
@@ -462,7 +585,7 @@ function makeAskCard(ask, interactive) {
     var stick = atBottom();
     addBubble(lines.join('\n'), 'user');
     scrollBottom(stick);
-    sendTurn(lines.join('\n'), false);
+    sendTurn(lines.join('\n'), false, []);
   });
 
   p.bub.appendChild(box);
@@ -508,13 +631,17 @@ function retryLast() {
     var row = errBubs[errBubs.length - 1].parentNode;
     if (row && row.parentNode === chat) row.remove();
   }
-  sendTurn(text, true);
+  sendTurn(text, true, []);
 }
 
-function addBubble(text, cls, toolInfo) {
+function addBubble(text, cls, toolInfo, atts) {
   var stick = atBottom();
   var p = makeBubble(cls);
-  if (cls === 'bot') mountMd(p.bub, text); else p.bub.textContent = text;
+  if (cls === 'bot') mountMd(p.bub, text);
+  else {
+    p.bub.textContent = text;
+    if (atts && atts.length) p.bub.appendChild(makeAttachBox(atts));
+  }
   if (toolInfo) {
     var t = document.createElement('div'); t.className = 'tool-info'; t.textContent = toolInfo;
     p.bub.appendChild(t);
@@ -522,6 +649,30 @@ function addBubble(text, cls, toolInfo) {
   chat.appendChild(p.row);
   scrollBottom(stick);
   return p;
+}
+
+/* 用户气泡里的附件：图片给缩略图，其它给一行文件名。
+   缩略图走 GET /uploads/<id> —— 服务端只放行图片扩展名，非图片不给预览。 */
+function makeAttachBox(atts) {
+  var box = document.createElement('div');
+  box.className = 'attach-box';
+  atts.forEach(function (a) {
+    if (a.isImage && a.url) {
+      var img = document.createElement('img');
+      img.className = 'attach-thumb';
+      img.src = a.url;
+      img.alt = a.name || '图片';
+      img.loading = 'lazy';
+      box.appendChild(img);
+    } else {
+      var row = document.createElement('div');
+      row.className = 'attach-line';
+      row.textContent = '📎 ' + (a.name || a.id || '文件')
+        + (a.size ? '（' + humanSize(a.size) + '）' : '');
+      box.appendChild(row);
+    }
+  });
+  return box;
 }
 
 /* 分段回复：第一段带头像，后续段用 cont 隐藏头像，视觉上仍是一个人的连续发言 */
@@ -732,6 +883,11 @@ function renderChat(msgs, title) {
     if (m.role === 'user') {
       var pu = makeBubble('user');
       pu.bub.textContent = m.content;
+      /* 历史里的附件同样回放：图片给缩略图。附件 id 认不出时后端不会给这
+         条消息带 attachments，所以这里 m.attachments 有值就等于文件还在。 */
+      if (m.attachments && m.attachments.length) {
+        pu.bub.appendChild(makeAttachBox(m.attachments));
+      }
       frag.appendChild(pu.row);
       return;
     }
@@ -941,16 +1097,18 @@ function onSend() {
     return;
   }
   var text = input.value.trim();
-  if (!text) return;
+  var atts = attsForSend();
+  if (!text && !atts.length) return;      /* 空消息 + 没附件 = 没什么可发的 */
   input.value = ''; input.style.height = 'auto';
 
-  addBubble(text, 'user');
-  sendTurn(text, false);
+  addBubble(text, 'user', null, atts);
+  clearAtts();
+  sendTurn(text, false, atts);
 }
 
 /* 真正发一轮请求。isRetry=true 时后端不重复追加 user 消息（它还在库里），
    前端也不再画一个用户气泡。 */
-function sendTurn(text, isRetry) {
+function sendTurn(text, isRetry, atts) {
   setBusy(true);
   showThinking();
   startThinkStream(currentSid);
@@ -963,7 +1121,9 @@ function sendTurn(text, isRetry) {
 
   api('/chat/' + encodeURIComponent(currentSid) + '/send', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message: text, retry: !!isRetry }), signal: aborter.signal
+    body: JSON.stringify({ message: text, retry: !!isRetry,
+                           attachments: atts || [] }),
+    signal: aborter.signal
   }).then(function (r) {
     hideThinking();
     /* 失败轮次：错误串走 error 通道，渲染成错误气泡 + 重试按钮，

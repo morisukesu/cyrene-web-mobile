@@ -383,6 +383,14 @@ button,input,select,textarea{font-family:inherit;letter-spacing:inherit}
   padding:10px 12px calc(10px + var(--safe-b));background:var(--rb-surface-workspace);
   border-top:1px solid var(--rb-border-default);display:flex;gap:9px;align-items:flex-end;flex-shrink:0;
 }
+#attach-btn{
+  width:44px;height:44px;flex-shrink:0;cursor:pointer;
+  border:1px solid var(--rb-border-default);border-radius:var(--rb-radius-lg);
+  background:var(--rb-surface-elevated);color:var(--rb-text-secondary);
+  font-size:19px;line-height:1;display:flex;align-items:center;justify-content:center;
+}
+#attach-btn:hover{background:var(--rb-surface-hover);color:var(--rb-accent);
+  border-color:var(--rb-accent)}
 #input{
   flex:1;padding:11px 14px;border-radius:var(--rb-radius-lg);
   border:1px solid var(--rb-input-border);background:var(--rb-input-bg);color:var(--rb-input-text);
@@ -402,6 +410,43 @@ button,input,select,textarea{font-family:inherit;letter-spacing:inherit}
 #send-btn.cancel{
   background:var(--rb-bg-3);color:var(--rb-danger);box-shadow:none;
   border:1px solid var(--rb-border-default);
+}
+
+/* ===== 附件（待发送 chip 栏 + 气泡内附件）===== */
+#attach-bar{
+  display:flex;flex-wrap:wrap;gap:6px;
+  padding:8px 12px 0;background:var(--rb-surface-workspace);
+  border-top:1px solid var(--rb-border-subtle);
+}
+#attach-bar[hidden]{display:none}
+.attach-chip{
+  display:inline-flex;align-items:center;gap:5px;max-width:min(100%,230px);
+  padding:4px 6px 4px 9px;border-radius:999px;
+  background:var(--rb-surface-elevated);border:1px solid var(--rb-border-default);
+  font-size:12px;color:var(--rb-text-secondary);
+}
+.attach-chip--img{border-color:var(--rb-accent)}
+.attach-chip__ic{flex-shrink:0;font-size:13px;line-height:1}
+.attach-chip__name{
+  min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  color:var(--rb-text-primary);
+}
+.attach-chip__size{flex-shrink:0;color:var(--rb-text-disabled);font-size:11px}
+.attach-chip__del{
+  flex-shrink:0;width:18px;height:18px;padding:0;border:none;background:none;cursor:pointer;
+  color:var(--rb-text-disabled);font-size:14px;line-height:1;
+  display:flex;align-items:center;justify-content:center;border-radius:50%;
+}
+.attach-chip__del:hover{color:var(--rb-danger);background:var(--rb-surface-hover)}
+
+/* 气泡里的附件。图片缩略图与 .md img 保持一致的尺寸口径 */
+.attach-box{display:flex;flex-direction:column;gap:6px;margin-top:6px}
+.attach-thumb{
+  display:block;max-width:min(100%,130px);height:auto;border-radius:12px;
+}
+.attach-line{
+  font-size:12px;line-height:1.5;word-break:break-all;
+  color:var(--rb-text-secondary);
 }
 
 /* ===== 移动端 ===== */

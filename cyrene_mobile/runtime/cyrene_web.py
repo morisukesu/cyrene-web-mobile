@@ -982,6 +982,260 @@ def _download_dir():
     return d
 
 
+# ========== 聊天附件上传 ==========
+# 浏览器选的文件走 POST /upload 落盘到 FS_ROOT/cyrene/uploads/，路径随消息交给
+# 模型；图片额外以 base64 塞进当轮上下文（多模态），让她真能看见。
+#
+# 为什么同样是 base64 JSON：手机端 _body() 只解析 JSON，multipart 要自写
+# boundary 解析器。插件导入当初也是因此从 multipart 改成 base64 JSON。
+#
+# 安全口径与插件导入一致：
+#   · 落盘目标由 guard_path 限制在 FS_ROOT 内，且只允许 uploads 这一层
+#   · 文件名净化 + 服务端自生成 id（前端只回传 id，不回传路径）
+#   · id 过严格白名单（拒 /、\、..、控制字符），再经 guard_path 定位
+UPLOAD_DIRNAME = "cyrene/uploads"        # 相对 FS_ROOT 的上传目录
+UPLOAD_MAX_MB = 16                       # 单文件上限（前端同值拦截）
+UPLOAD_MAX_ATTACH = 8                    # 一条消息最多带几个附件
+VISION_MAX_BYTES = FS_MAX_FILE_BYTES     # 能塞进上下文的图片上限（4 MiB）
+# 图片扩展名 → MIME。按扩展名判定而不是嗅探文件头：手机端没有 PIL，
+# 而「是不是图片」只用于决定要不要塞进上下文，判错最多退化成只落盘。
+IMAGE_EXT_MIME = {
+    "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+    "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
+}
+# id 是服务端生成的「时间戳-随机串.扩展名」，所以要放行 `.`；同时显式拒绝
+# `..`（`a..b` 这种不含分隔符的串看着人畜无害，但没必要放进来）。
+UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+# None = 还没试过；True = 端点收图；False = 已确认不收（本进程不再尝试注入）
+VISION_SUPPORTED = None
+
+
+def _sanitize_upload_name(raw):
+    """上传文件名净化：只取最后一段、剥危险字符、限长。
+
+    传进来的名字完全不可信（可能带 ../、绝对路径、控制字符）。这里只负责
+    产出一个**显示用**的安全名字；磁盘名另有服务端生成的 id，不用它。
+    """
+    name = str(raw or "").replace("\x00", "")
+    # 反斜杠也当分隔符，Windows 风格路径 "C:\\a\\b.txt" 同样只留 b.txt
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(ch for ch in name if ord(ch) >= 32 and ch != "\x7f")
+    name = name.strip().strip(".")          # 防 ".." / "..." 这类纯点名字
+    return (name or "file")[:120]
+
+
+def _upload_dir():
+    """上传目录（FS_ROOT/cyrene/uploads），不存在则创建。"""
+    d = guard_path(UPLOAD_DIRNAME, want="any")     # 相对 FS_ROOT 解析
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise PathGuardError(f"(上传目录创建失败: {e})")
+    return d
+
+
+def _image_mime(name):
+    """按扩展名判图片 MIME；不是图片返回空串。"""
+    if "." not in name:
+        return ""
+    return IMAGE_EXT_MIME.get(name.rsplit(".", 1)[-1].lower(), "")
+
+
+def save_upload(data, filename):
+    """把上传内容落盘，返回元数据 dict。
+
+    id 形如 `20261009-2150-ab12cd34.png`：时间戳可读、随机段防撞、扩展名
+    保留（预览路由要靠它判 MIME）。原始文件名单独放在 name 里给前端显示，
+    不参与磁盘路径 —— 中文名、空格、奇怪符号都不会变成路径问题。
+    """
+    if not data:
+        raise PathGuardError("(文件是空的，0 字节)")
+    if len(data) > UPLOAD_MAX_MB * 1024 * 1024:
+        raise PathGuardError(
+            f"(文件 {_human_size(len(data))} 超过上限 {UPLOAD_MAX_MB} MB)")
+
+    safe = _sanitize_upload_name(filename)
+    ext = ""
+    if "." in safe:
+        cand = safe.rsplit(".", 1)[-1].lower()
+        # 扩展名只收纯 ASCII 字母数字，最长 8 位（.jpeg / .webp 之类够用）
+        if cand.isascii() and cand.isalnum() and len(cand) <= 8:
+            ext = "." + cand
+    uid = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8] + ext
+
+    d = _upload_dir()
+    try:
+        p = guard_path(f"{UPLOAD_DIRNAME}/{uid}", want="any")
+    except PathGuardError:
+        raise
+    try:
+        # 原子落盘：先写同目录临时文件再 rename，中途断电不会留半截文件
+        fd, tmp = tempfile.mkstemp(prefix=".up_", dir=str(d))
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, str(p))
+    except OSError as e:
+        raise PathGuardError(f"(写盘失败: {e})")
+
+    mime = _image_mime(safe)
+    return {
+        "id": uid,
+        "name": safe,
+        "path": str(p),
+        "rel": f"{UPLOAD_DIRNAME}/{uid}",
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "mime": mime or "application/octet-stream",
+        "isImage": bool(mime),
+    }
+
+
+def resolve_upload(uid):
+    """按 id 定位已上传文件。id 不合规或文件不存在返回 None。
+
+    id 先过白名单（只允许 ASCII 字母数字与 _-，`..`、`/` 天然命中不了），
+    再由 guard_path 做第二道确认，两层都过才返回路径。
+    """
+    if not isinstance(uid, str) or not UPLOAD_ID_RE.match(uid):
+        return None
+    try:
+        p = guard_path(f"{UPLOAD_DIRNAME}/{uid}", want="file")
+    except PathGuardError:
+        return None
+    return p
+
+
+def attachment_text(atts):
+    """把附件列表拼成附在用户消息末尾的文本块（给模型看的路径）。"""
+    lines = ["📎 附件："]
+    for a in atts:
+        lines.append(f"- {a['name']}（{_human_size(a['size'])}）→ {a['path']}")
+    return "\n".join(lines)
+
+
+def resolve_attachments(raw):
+    """把前端回传的附件列表解析成元数据。返回 (atts, dropped)。
+
+    前端只回传 /upload 给的 id（可选带显示名），路径一律由服务端现算。
+    认不出的 id 直接丢弃并计数 —— 附件是附带品，不该因为一个过期 id
+    让整条消息发不出去。超过 UPLOAD_MAX_ATTACH 的同样丢。
+
+    name 只用于显示与拼给模型的文本，永远不参与磁盘路径计算。
+    """
+    if not isinstance(raw, list):
+        return [], 0
+    atts, dropped = [], 0
+    for item in raw:
+        if len(atts) >= UPLOAD_MAX_ATTACH:
+            dropped += 1
+            continue
+        if isinstance(item, str):
+            uid, shown = item, ""
+        elif isinstance(item, dict):
+            uid = item.get("id"); shown = item.get("name")
+        else:
+            uid, shown = None, None
+        p = resolve_upload(uid) if isinstance(uid, str) else None
+        if p is None:
+            dropped += 1
+            continue
+        try:
+            size = p.stat().st_size
+        except OSError:
+            dropped += 1
+            continue
+        mime = _image_mime(uid)
+        name = _sanitize_upload_name(shown) if shown else uid
+        atts.append({"id": uid, "name": name, "path": str(p), "size": size,
+                     "mime": mime or "application/octet-stream",
+                     "isImage": bool(mime)})
+    return atts, dropped
+
+
+# ---------- 多模态（图片进上下文） ----------
+# 只在**首轮**把带附件的那条 user 消息换成 content 数组：work 上下文每次
+# LLM 调用都整份重发，若一直留着图片，maxTurns=4 就是 4 次带图，白烧 token。
+def content_has_image(content):
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(p, dict) and p.get("type") == "image_url"
+               for p in content)
+
+
+def messages_have_images(messages):
+    return any(isinstance(m, dict) and content_has_image(m.get("content"))
+               for m in messages)
+
+
+def media_to_text(content):
+    """把多模态 content 数组压回纯文本（丢图片，只留 text 部分）。"""
+    if not isinstance(content, list):
+        return content if isinstance(content, str) else str(content or "")
+    parts = []
+    for p in content:
+        if isinstance(p, dict) and p.get("type") == "text":
+            parts.append(str(p.get("text") or ""))
+    return "\n".join(x for x in parts if x)
+
+
+def strip_images(messages):
+    """把消息里的多模态图片剥掉，只留文本。端点不收图时的退路。"""
+    out = []
+    for m in messages:
+        if isinstance(m, dict) and content_has_image(m.get("content")):
+            nm = dict(m)
+            nm["content"] = media_to_text(m.get("content"))
+            out.append(nm)
+        else:
+            out.append(m)
+    return out
+
+
+def image_item(a, raw):
+    """一张图片 → OpenAI 兼容的 image_url 片段（data URI 内联）。"""
+    b64 = base64.b64encode(raw).decode("ascii")
+    mime = a.get("mime") or "image/png"
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+
+
+def read_injectable(p):
+    """读一张准备注入上下文的图。返回 (bytes, 是否因过大/读不到被跳过)。
+
+    上限用 FS_MAX_FILE_BYTES（4 MiB）：base64 后是 5.3 MiB，再乘历史轮次会
+    把请求体推得很大。手机端没有图像库可以缩图，超限就只落盘不进上下文。
+    """
+    try:
+        if p.stat().st_size > VISION_MAX_BYTES:
+            return None, True
+        raw = p.read_bytes()
+    except OSError:
+        return None, True
+    if not raw:
+        return None, True
+    return raw, False
+
+
+def build_vision_content(text, atts):
+    """文本 + 可注入图片 → OpenAI 兼容的多模态 content 数组。
+
+    返回 (content, skipped)：skipped 是不进上下文的图片名（过大或读不到）。
+    调用方要在文本里说明这些图的情况，免得用户以为她「看见了」。
+    """
+    content = [{"type": "text", "text": text}]
+    skipped = []
+    for a in atts:
+        if not a.get("isImage"):
+            continue
+        p = resolve_upload(a["id"])
+        if p is None:
+            skipped.append(a["name"]); continue
+        raw, too_big = read_injectable(p)
+        if too_big or raw is None:
+            skipped.append(a["name"]); continue
+        content.append(image_item(a, raw))
+    return content, skipped
+
+
 # ---------- 三个 handler ----------
 
 def _h_web_search(a):
@@ -3349,6 +3603,7 @@ class LLMClient:
           1. 带 reasoning 参数被拒(400/422) → 剥掉 reasoning 重试
           2. 带 tools 被拒(400/422)         → 剥掉 tools 重试并置 fc_rejected
           3. 撞 554（中转站 40 rpm 限流）    → 指数退避 1s/3s/9s，最多重试 2 次
+          4. 带图片失败                     → 剥掉图片重试；成功即判定「端点不收图」
         """
         payload = self._base_payload(messages, max_tokens)
         used_reasoning = False
@@ -3359,6 +3614,13 @@ class LLMClient:
             payload["enable_thinking"] = True
             used_reasoning = True
 
+        # 图片注入：只在这条消息真带图、且没被判定过「端点不收」时才带。
+        # VISION_SUPPORTED 是进程级记忆 —— 一旦确认端点不收图，后续请求不再
+        # 白试一次（每次都要多一个来回，代价不小）。
+        global VISION_SUPPORTED
+        used_images = (VISION_SUPPORTED is not False) and messages_have_images(messages)
+        plain_messages = strip_images(messages) if used_images else messages
+
         used_tools = bool(tools)
         if used_tools:
             payload["tools"] = tools
@@ -3366,6 +3628,11 @@ class LLMClient:
 
         status, data = None, {}
         posts = 0
+        # 每个「剥离动作」只允许发生一次。没有这个守卫的话，下面 554 的退避
+        # 重试会把剥图当成常规动作反复做，最后把图片悄悄丢干净还看不出来。
+        stripped_reasoning = False
+        stripped_tools = False
+        tried_plain_after_image = False
         while True:
             posts += 1
             status, data = self._post(payload)
@@ -3376,21 +3643,50 @@ class LLMClient:
                 continue
 
             # 自愈 1：思考参数不被接受
-            if used_reasoning and status in (400, 422):
+            if used_reasoning and status in (400, 422) and not stripped_reasoning:
                 for k in ("reasoning_effort", "reasoning", "enable_thinking"):
                     payload.pop(k, None)
                 used_reasoning = False
+                stripped_reasoning = True
                 if posts <= 5:
                     continue
 
             # 自愈 2：tools 字段不被接受 → 降级到文本协议
-            if used_tools and status in (400, 422):
+            if used_tools and status in (400, 422) and not stripped_tools:
                 payload.pop("tools", None)
                 payload.pop("tool_choice", None)
                 used_tools = False
+                stripped_tools = True
                 if posts <= 5:
                     continue
+
+            # 自愈 3：带图失败 → 剥掉图片重发一次。
+            #
+            # ⚠ 这里刻意不只认 400/422。实测（手机端真机）中转站在遇到图片时
+            #   返回的是 **502**（网关错误，带 request_id），后来压测到限流时是
+            #   **554**。两者都不是「参数不对」的语义，只认 400/422 会让降级
+            #   永远不触发 —— 用户看到的就是「一发图就失败」。
+            #   判据改成「只要不是 200，就值得试一次剥图」：剥图后再失败，
+            #   说明问题不在图片（本轮 554 就是这种情况），代价也只是一次请求。
+            #
+            # 剥图成功后**不立刻**记 VISION_SUPPORTED=False：得等确认「纯文字
+            # 这条路能走通」再记。否则遇到限流这种暂时性故障，会把端点误判成
+            # 「永远不支持图片」，之后图片再也进不了上下文。
+            if used_images and status != 200 and not tried_plain_after_image:
+                payload["messages"] = plain_messages
+                used_images = False
+                tried_plain_after_image = True
+                if posts <= 6:
+                    continue
             break
+
+        # 端点真收下了图：记一笔，省掉后续请求的试探
+        if used_images and status == 200:
+            VISION_SUPPORTED = True
+        # 剥掉图片之后这一趟跑通了 —— 说明端点确实不接受图片，记一笔，
+        # 之后不再拿图片去试（省一个来回，也免得再触发一次 502）。
+        elif tried_plain_after_image and status == 200:
+            VISION_SUPPORTED = False
 
         fc_rejected = bool(tools) and not used_tools
 
@@ -3441,6 +3737,11 @@ class LLMClient:
             payload["reasoning_effort"] = self.reasoning_effort
             payload["reasoning"] = {"effort": self.reasoning_effort}
             payload["enable_thinking"] = True
+        used_images = (VISION_SUPPORTED is not False) and messages_have_images(messages)
+        if used_images:
+            # 带图时不能走流式：SSE 分片里没有图片回显的价值，反而让降级路径
+            # 变复杂。直接退到整段 chat_ex，它已经带图片自愈（自愈 3）。
+            return self.chat_ex(messages, max_tokens=max_tokens, tools=tools)
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -7108,6 +7409,10 @@ def _loop_ctx(sid, history, mode=None):
             c = m.get("content")
             if isinstance(c, str):
                 user_query = c
+            elif isinstance(c, list):
+                # 带图片时 content 是多模态数组：取 text 部分当用户问题。
+                # 不取的话插件收到的 userQuery 会是空串。
+                user_query = media_to_text(c)
             break
     if mode is None:
         s = _session_get(sid)
@@ -7246,6 +7551,11 @@ def run_agent_loop(sid, client, prompt, history, allow_tools, cfg=None):
                                   on_delta=lambda _k, _t: stream_publish(sid, _k, _t),
                                   cancel=lambda: is_aborted(sid))
         turns += 1
+        # 图片只在**本次请求**里有意义，发完就收 —— work 是每轮整份重发的，
+        # 留着图片等于每次调用都再传一遍几 MB 的 base64。
+        # 位置很关键：必须在这轮请求**发出之后**才剥，否则首轮就没图可看。
+        if messages_have_images(work):
+            work = strip_images(work)
         llm_calls += 1
 
         if r.get("error"):
@@ -7506,7 +7816,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
   <div id="mode-menu" role="menu" aria-label="对话模式"></div>
   <div id="chat"></div>
+  <div id="attach-bar"></div>
   <div id="input-bar">
+    <button id="attach-btn" type="button" aria-label="添加附件" title="添加附件">＋</button>
+    <input id="attach-file" type="file" multiple hidden>
     <textarea id="input" placeholder="和昔涟说点什么..." rows="1" enterkeyhint="send"></textarea>
     <button id="send-btn" type="button" aria-label="发送">➤</button>
   </div>
@@ -7598,6 +7911,26 @@ class Handler(BaseHTTPRequestHandler):
         cache = ("public, max-age=86400"
                  if name in STATIC_FILES and name not in STATIC_NOCACHE else "no-store")
         self._send(data, ctype, 200, cache)
+
+    def _upload_asset(self, uid):
+        """GET /uploads/<id> —— 聊天里的附件（主要是图片缩略图）。
+
+        只放行图片扩展名：这是个无鉴权的读口，把任意上传文件暴露成可下载
+        等于给「上传什么就能被下载什么」开后门。图片够用了。
+        no-store：附件是用户私人物料，不该落浏览器缓存。
+        """
+        p = resolve_upload(uid)
+        if p is None:
+            self._json({"error": "not found"}, 404); return
+        ctype = IMAGE_EXT_MIME.get(
+            uid.rsplit(".", 1)[-1].lower() if "." in uid else "", "")
+        if not ctype:
+            self._json({"error": "只有图片能预览"}, 415); return
+        try:
+            data = p.read_bytes()
+        except OSError:
+            self._json({"error": "asset missing on disk"}, 404); return
+        self._send(data, ctype, 200, "no-store")
 
     def _stream_chat(self, sid):
         # 实时增量推送：SSE 长连接。
@@ -7778,6 +8111,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"messages": msgs, "title": title, "mode": mode,
                         "todos": todos, "ask": ask, "inflight": inflight,
                         "settleBudget": budget})
+        elif len(seg) == 2 and seg[0] == "uploads":
+            # 聊天里的附件缩略图：GET /uploads/<id>
+            self._upload_asset(seg[1])
         elif path == "/modes":
             self._json({
                 "modes": [{"id": k, "label": v["label"], "icon": v["icon"],
@@ -8145,6 +8481,34 @@ class Handler(BaseHTTPRequestHandler):
         t.start()
         self._json({"ok": True, "job": job, "kind": kind, "label": label})
 
+    def _handle_upload(self, body):
+        """POST /upload —— 聊天附件上传（base64 JSON）。
+
+        ⚠ 同样偏离 multipart：`_body()` 只解析 JSON，写 boundary 解析器不划算。
+        上限按「base64 字符串长度」先粗筛，再按解码后的真实字节数复查 ——
+        粗筛是为了省掉一次无谓的 22 MB decode。
+        不挂本机门：落盘目标被 guard_path 锁在 FS_ROOT 里，而挂门会让
+        「平板 / 另一台设备连手机」时用不了附件（write_file / download_file
+        这两个写工具同样没挂门）。
+        """
+        b64 = body.get("dataBase64")
+        if not isinstance(b64, str) or not b64:
+            self._json({"error": "缺少 dataBase64 字段"}, 400); return
+        max_b64 = int(UPLOAD_MAX_MB * 1024 * 1024 * 4 / 3) + 4096
+        if len(b64) > max_b64:
+            self._json({"error": f"文件超过上限 {UPLOAD_MAX_MB} MB"}, 413); return
+        try:
+            data = base64.b64decode(b64, validate=False)
+        except (ValueError, TypeError) as e:
+            self._json({"error": f"base64 解码失败: {e}"}, 400); return
+        try:
+            info = save_upload(data, body.get("filename"))
+        except PathGuardError as e:
+            self._json({"error": str(e)}, 400); return
+        self._json({"ok": True, "file": info,
+                    "maxMb": UPLOAD_MAX_MB, "maxAttach": UPLOAD_MAX_ATTACH,
+                    "visionMaxBytes": VISION_MAX_BYTES})
+
     def _handle_plugin_import(self, body):
         """POST /plugins/import —— 浏览器选文件，base64 JSON 上传。
 
@@ -8317,6 +8681,11 @@ class Handler(BaseHTTPRequestHandler):
                 CURRENT_SID = sid
                 save_sessions(SESSIONS)
             self._json({"sid": sid, "mode": want_mode})
+            return
+
+        # 聊天附件上传：POST /upload（base64 JSON）
+        if path == "/upload":
+            self._handle_upload(body)
             return
 
         if len(seg) == 3 and seg[0] == "chat" and seg[2] == "send":
@@ -8593,8 +8962,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_send(self, sid, body):
         msg = str(body.get("message", "")).strip()
-        if not msg:
+        # 附件只认 id，路径由服务端现算；认不出的丢掉并计数，不阻断发送。
+        atts, atts_dropped = resolve_attachments(body.get("attachments"))
+        if not msg and not atts:
             self._json({"error": "empty"}, 400); return
+        if not msg:
+            # 只发了文件、一个字没写：补一句可读的话，别让模型收到空正文
+            msg = "（发来一个文件，看看它）"
         is_retry = bool(body.get("retry"))
 
         max_history = SETTINGS.get("model", {}).get("max_history", 30)
@@ -8627,7 +9001,18 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 if len(msgs) == 0:
                     s["title"] = msg[:20]
-                msgs.append({"role": "user", "content": msg})
+                # 附件文本并进 content 一起落库：模型跨请求只看 role/content，
+                # 路径写在这里它下一轮还看得见（附件元数据只给前端渲染用）。
+                entry_u = {"role": "user", "content": msg}
+                if atts:
+                    entry_u["content"] = msg + "\n\n" + attachment_text(atts)
+                    entry_u["attachments"] = [
+                        {"id": a["id"], "name": a["name"], "size": a["size"],
+                         "mime": a["mime"], "isImage": a["isImage"],
+                         # 浏览器能直接显示的类型才给 URL（非图片预览路由回 415）
+                         "url": f"/uploads/{a['id']}" if a["isImage"] else ""}
+                        for a in atts]
+                msgs.append(entry_u)
                 # 用户开口了 = 上一轮的提问已被回答，撤掉待答标记。
                 # 不撤的话前端会一直挂着提问卡，用户答完还能再点一次。
                 s.pop("pendingAsk", None)
@@ -8642,6 +9027,19 @@ class Handler(BaseHTTPRequestHandler):
             history = [{"role": m.get("role", "user"), "content": m.get("content", "")}
                        for m in msgs
                        if not m.get("error")]
+
+        # 图片进上下文：只改**最后一条** user 消息（这一轮刚发的那条）。
+        # 历史里更早的附件不再重传 —— 它们的路径已经写在各自 content 里，
+        # 每次都把 base64 拖上会把请求体撑成几十 MB。
+        # 只在首轮注入，靠 run_agent_loop 的 first_turn 还原，见那里的说明。
+        vision_skipped = []
+        if atts and VISION_SUPPORTED is not False and history:
+            img_atts = [a for a in atts if a.get("isImage")]
+            if img_atts:
+                content, vision_skipped = build_vision_content(
+                    history[-1].get("content", ""), img_atts)
+                if len(content) > 1:              # 真有图进来了才替换
+                    history[-1] = {"role": "user", "content": content}
 
         mode_allows_tools = MODES[mode].get("tools", False)
         show_steps = agent_cfg("showSteps")
