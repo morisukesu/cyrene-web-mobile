@@ -2355,7 +2355,7 @@ TOOL_PROTOCOLS = ("auto", "fc")
 AGENT_RANGES = {
     "maxTurns":       (1, 12, 4),        # 单次请求最多工具轮数
     "maxParallel":    (1, 4, 4),         # 一轮内并发执行的工具上限
-    "throttleMs":     (0, 10000, 1500),  # 相邻 LLM 调用最小间隔（治 40 rpm 限流）
+    "throttleMs":     (0, 10000, 3500),  # 相邻 LLM 调用最小间隔（治 40 rpm 限流）
     "stepTimeout":    (5, 120, 30),      # 单个工具执行超时（秒）
     "totalTimeout":   (30, 600, 180),    # 整条 loop 总预算（秒），超时=第四种终止状态
     "maxOutputChars": (500, 32000, 8000),  # 单工具输出上限（旧代码硬编码 800，太小）
@@ -2555,7 +2555,7 @@ DEFAULT_SETTINGS = {
     "agent": {
         "maxTurns": 4,
         "maxParallel": 4,
-        "throttleMs": 1500,
+        "throttleMs": 3500,
         "stepTimeout": 30,
         "totalTimeout": 180,
         "maxOutputChars": 8000,
@@ -5444,6 +5444,23 @@ class PluginManager:
             text = "" if text is None else str(text)
         return OUTCOME_SUCCESS, text
 
+    def invoke_ipc(self, pid, channel, args=None, timeout=20.0):
+        """面板 UI 调插件注册的 IPC handler，返回原始结果。
+
+        与 execute_tool 分工不同：那条是「模型调插件工具」，要把结果翻译成
+        四态 outcome；这条是「插件自己的面板拉数据」，结果直接回给前端，不
+        经过模型。Node 侧 doIpcInvoke 早就写好了，这里只把它接到 HTTP 面上。
+        """
+        with self._lock:
+            client = self._clients.get(pid)
+        if client is None:
+            raise PluginHostError("E_PLUGIN_STOPPING", f"插件 {pid} 未运行")
+        res = client.call("ipc.invoke", {
+            "channel": channel,
+            "args": args if isinstance(args, list) else [],
+        }, timeout=timeout)
+        return res.get("result") if isinstance(res, dict) else None
+
     def shutdown_all(self):
         """宿主退出时收干净全部子进程。atexit 与 SIGTERM 都要挂。
 
@@ -7539,6 +7556,45 @@ class Handler(BaseHTTPRequestHandler):
             "X-Content-Type-Options": "nosniff",
         })
 
+    def _handle_plugin_ipc(self, pid, body):
+        """POST /plugins/<id>/ipc —— 插件面板的 IPC 通道（给 iframe 用）。
+
+        为什么需要它：桌面端面板靠 Electron 的 ipcRenderer 拿数据，手机端
+        没有 Electron，面板一句 require 就抛错、整页白屏。转换脚本会把面板
+        里的 ipcRenderer 换成打本端点的 shim，面板代码一行都不用改。
+
+        CORS：面板跑在 sandbox="allow-scripts" 的 iframe 里，origin 是 opaque，
+        fetch 本端点会带 Origin: null；不放 ACAO 响应就读不到，面板照样空着。
+        放通跨源后风险与本机任意页面相当，所以同样挂本机门。
+        """
+        if not PLUGIN_ID_RE.match(pid or ""):
+            self._json({"error": f"非法插件 id: {pid}"}, 400); return
+        if not self._is_local_client():
+            self._json({"error": "仅本机可调插件面板通道"}, 403); return
+        channel = _as_str(body.get("channel"), "")[:120]
+        if not channel:
+            self._json({"error": "缺少 channel"}, 400); return
+        args = body.get("args")
+        args = args if isinstance(args, list) else []
+        hdr = {"Access-Control-Allow-Origin": "*"}
+        try:
+            result = PLUGIN_MANAGER.invoke_ipc(pid, channel, args)
+        except PluginHostError as e:
+            self._send_extra(json.dumps(
+                {"ok": False, "error": str(e), "code": e.code},
+                ensure_ascii=False).encode("utf-8"),
+                "application/json; charset=utf-8", hdr)
+            return
+        except Exception as e:
+            self._send_extra(json.dumps(
+                {"ok": False, "error": f"{type(e).__name__}: {e}"},
+                ensure_ascii=False).encode("utf-8"),
+                "application/json; charset=utf-8", hdr)
+            return
+        self._send_extra(json.dumps(
+            {"ok": True, "result": result}, ensure_ascii=False).encode("utf-8"),
+            "application/json; charset=utf-8", hdr)
+
     # ---------- 插件市场（P5） ----------
 
     def _handle_plugin_market(self, force_refresh=False):
@@ -7826,6 +7882,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if len(seg) == 2 and seg[0] == "skills":
             self._handle_skill_toggle(seg[1], body)
+            return
+
+        # 插件面板 IPC：POST /plugins/<id>/ipc
+        # ⚠ 必须排在下面那条通用 <id>/<action> 之前 —— 两者段数相同，谁先匹配谁赢。
+        # 通用那条对未知 action 会直接回 404「unknown action」，轮不到这里。
+        if len(seg) == 3 and seg[0] == "plugins" and seg[2] == "ipc":
+            self._handle_plugin_ipc(seg[1], body)
             return
 
         # 插件启停/卸载：POST /plugins/<id>/<action>

@@ -635,9 +635,25 @@ async function doRegister(params) {
     );
   }
 
-  // open() 是可选的早期钩子
+  // open() 是可选的早期钩子。它失败不该让整颗插件判死：
+  //   · 桌面端大量插件的 open() 只负责「弹一个独立窗口」，手机上没有 Electron，
+  //     这类失败与插件主体能力无关；
+  //   · 还有些插件的 open() 依赖 register() 阶段才建立的上下文
+  //     （cyrene-browser 的 open() 就用 pluginContext，而宿主是先 open 后 register，
+  //      它必然拿到 null → 抛「插件尚未注册」，整颗判 failed）；
+  //   · 契约里 open() 本来就是可选钩子，可选钩子不该有否决权。
+  // 所以这里吞掉异常，只留一行 stderr；真正的失败交给 register() 去报。
   if (typeof PLUGIN.open === "function") {
-    await PLUGIN.open();
+    try {
+      await PLUGIN.open();
+    } catch (e) {
+      process.stderr.write(
+        `[plugin_host] open() 失败已忽略（可选钩子，不影响注册）: ${
+          (e && e.message) || e
+        }
+`
+      );
+    }
   }
 
   await PLUGIN.register(CTX);
