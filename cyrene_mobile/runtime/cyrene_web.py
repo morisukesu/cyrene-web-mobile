@@ -83,6 +83,11 @@ STATIC_FILES = {
 STATIC_PREFIX_DIRS = {
     "stickers/": {"jpg": "image/jpeg", "jpeg": "image/jpeg",
                   "png": "image/png", "gif": "image/gif", "webp": "image/webp"},
+    # 图标与角色形象素材（对标桌面端 src/renderer/public/icons/）。
+    # svg 供 favicon / <img> 直接引用；功能图标另有内联 sprite，不走这条路由。
+    "icons/": {"svg": "image/svg+xml", "png": "image/png",
+               "jpg": "image/jpeg", "jpeg": "image/jpeg",
+               "gif": "image/gif", "webp": "image/webp"},
 }
 STATIC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -128,6 +133,29 @@ def load_static(name):
     with STATIC_CACHE_LOCK:
         STATIC_CACHE[name] = data
     return data
+
+
+# 页面里的图标位标记。sprite 由 _gen_icon_sprite.py 生成到 static/icons/icons.svg，
+# 这里在响应时注入 —— 保持 sprite 单一来源，也避免把 20KB 字符串写进本文件。
+ICON_SPRITE_MARK = "<!--ICON_SPRITE-->"
+
+
+def render_index_html():
+    """把图标 sprite 注入首页骨架。
+
+    sprite 缺失时降级为「不注入」：页面照常可用，只是图标位显示为空。
+    不抛异常，避免一个图标资源问题把整个页面打死。
+    """
+    data = load_static("icons/icons.svg")
+    sprite = ""
+    if data:
+        try:
+            sprite = data.decode("utf-8")
+        except UnicodeDecodeError:
+            sprite = ""
+    if ICON_SPRITE_MARK in HTML_PAGE:
+        return HTML_PAGE.replace(ICON_SPRITE_MARK, sprite)
+    return HTML_PAGE
 
 
 # ========== 工具定义 ==========
@@ -336,6 +364,61 @@ def _human_size(n):
 
 
 # ---------- 六个 handler ----------
+
+def _h_read_image(a):
+    """read_image：把本地图片交给独立视觉模型，返回文字描述。
+
+    与 read_file 的分工（对齐桌面端那套）：
+      read_file  → 文本文件
+      read_image → 本地图片，让「她」看见内容
+      read_image_url → 公网图片，本机不下载
+
+    这里只做参数校验 + 路径守卫 + 调用协议层；图片怎么编码、请求怎么拼，
+    全在 caption_image 里，本函数不碰 image_url 格式。
+    """
+    ok, conf = resolve_caption_vision_config()
+    if not ok:
+        # 配置不齐是「可预期」的失败，不是异常：返回可读原因，
+        # 她会照着如实告诉用户（对应工具描述里那句「未配置时会返回错误」）。
+        return OUTCOME_FAILURE, str(conf)
+
+    try:
+        p = guard_path(a.get("path"), want="file")
+    except PathGuardError as e:
+        return OUTCOME_FAILURE, str(e)
+
+    question = (a.get("question") or "").strip()[:500]
+    text = caption_image({"path": p}, question, cfg=(ok, conf))
+    if isinstance(text, str) and text.startswith("[错误"):
+        return OUTCOME_FAILURE, text
+
+    head = f"图片: {_rel(p, _fs_root())}"
+    return OUTCOME_SUCCESS, head + "\n" + text
+
+
+def _h_read_image_url(a):
+    """read_image_url：把公网图片 URL 交给独立视觉模型，返回文字描述。
+
+    URL 原样直传给厂商，本机不下载、不转 base64 —— 省流量省内存，
+    也让「看一眼网上的图」不必先落一份副本（要副本另有 download_file）。
+    """
+    url = (a.get("url") or "").strip()
+    if not url:
+        return OUTCOME_FAILURE, "(缺少 url)"
+    if not re.match(r"^https?://", url, re.I):
+        return OUTCOME_FAILURE, ("(url 必须以 http:// 或 https:// 开头。"
+                                 "本机路径请用 read_image)")
+
+    ok, conf = resolve_caption_vision_config()
+    if not ok:
+        return OUTCOME_FAILURE, str(conf)
+
+    question = (a.get("question") or "").strip()[:500]
+    text = caption_image({"url": url}, question, cfg=(ok, conf))
+    if isinstance(text, str) and text.startswith("[错误"):
+        return OUTCOME_FAILURE, text
+    return OUTCOME_SUCCESS, text
+
 
 def _h_read_file(a):
     """read_file：按行分段读文本文件，带行号。"""
@@ -1236,6 +1319,568 @@ def build_vision_content(text, atts):
     return content, skipped
 
 
+# ========== 图片路由（对齐桌面端 Cyrene-Agent 的 image-router） ==========
+# 桌面端那份的设计声明，这里照抄口径：
+#   「所有图片入口（附件 / 工具 / 频道 / 动态）先问这里，不允许各自判断。」
+#   「三种结果，不允许模糊状态。」
+#
+# 为什么手机端也需要这一层：本机主通道是那台中转站，实测收不了图。若各处自己
+# 判断（附件那边看 VISION_SUPPORTED、工具那边看配置），就会出现「同一个配置下
+# 附件说看不见、工具说看得见」这种自相矛盾的状态。收口到一处，结论只有三种。
+IMAGE_ROUTE_DIRECT = "direct"     # 主模型自己看图（base64 直传）
+IMAGE_ROUTE_CAPTION = "caption"   # 交给独立视觉模型转述成文字
+IMAGE_ROUTE_REJECT = "reject"     # 当前配置看不了图，带面向用户的说明
+
+# reject 的文案。对齐桌面端措辞，但把入口名换成本机的「设置 → 视觉」。
+IMAGE_REJECT_REASON = (
+    "当前主模型不是多模态，且未配置独立视觉模型。"
+    "请在「设置 → 视觉」中配置视觉端点，或把主模型换成多模态的。"
+)
+
+
+def multimodal_enabled():
+    """主模型是否按多模态走。三态语义见 DEFAULT_SETTINGS["model"]["multimodal"]。
+
+    auto 的判据是 VISION_SUPPORTED：本文件原有的探测结论。
+      None = 还没试过（默认按能收图处理，让第一次请求去证伪）
+      True = 端点收下了图
+      False = 已确认不收（实测 502 那条路径）
+    之所以 auto 认 False 为「非多模态」，是因为那份探测是**实测**结论，
+    比起用户的猜测或配置声明，实测更该被信任。
+    """
+    try:
+        mm = SETTINGS.get("model", {}).get("multimodal", "auto")
+    except (NameError, AttributeError):
+        mm = "auto"
+    if mm == "on":
+        return True
+    if mm == "off":
+        return False
+    # auto 的两段判据：
+    #   ① 已有实测结论（True/False）→ 一律以实测为准，这是最可信的来源；
+    #   ② 还没探测过（None）时，若用户已把独立视觉端点配齐，就把图交给它。
+    # 为什么要加 ②：不加的话 None 会被当成「主模型能收图」，直接判 direct，
+    # 主模型收不了图时用户看到的是一次 502/554，而他明明配好了视觉通道却
+    # 一次都没被用上（实测 2026-10-10：配置齐、/vision/status 显示
+    # route=direct、面板测试返回的 model 是主模型而非视觉端点）。
+    # 用户专门配了视觉端点，本来就是想让它看图，这里让它优先是符合意图的。
+    if VISION_SUPPORTED is None and vision_ready():
+        return False
+    return VISION_SUPPORTED is not False
+
+
+def resolve_image_route(source="attachment", multimodal=None):
+    """统一的图片路由判定。返回 dict：{"mode", "config"?, "reason"?}。
+
+    判定顺序严格对齐桌面端 resolveImageRoute：
+      ① 主模型多模态          → direct
+      ② 独立视觉三项齐 + 开关 → caption
+      ③ 都不满足              → reject + 面向用户的 reason
+
+    source 目前只用于未来扩展与日志（桌面端有 attachment/tool/channel/moments
+    四种来源），手机端当前都是同一条判据；保留参数是为了调用点读起来有意义，
+    也免得以后细分来源时要改所有调用签名。
+
+    multimodal 参数供测试注入（None = 用真实判定），生产调用不传。
+    """
+    if multimodal is None:
+        mm_on = multimodal_enabled()
+    else:
+        mm_on = bool(multimodal)
+    if mm_on:
+        return {"mode": IMAGE_ROUTE_DIRECT}
+
+    if vision_ready():
+        return {
+            "mode": IMAGE_ROUTE_CAPTION,
+            "config": {
+                "api_base": str(vision_cfg("api_base", "") or "").strip(),
+                "api_key": str(vision_cfg("api_key", "") or ""),
+                "model": str(vision_cfg("model", "") or "").strip(),
+            },
+        }
+
+    return {"mode": IMAGE_ROUTE_REJECT, "reason": IMAGE_REJECT_REASON}
+
+
+def resolve_caption_vision_config():
+    """转述用的视觉配置：成功给 (True, config)，失败给 (False, 面向用户的错误)。
+
+    对齐桌面端 resolveCaptionVisionConfig。它比 resolve_image_route 少一种结果：
+    direct 在那边会「回落到主模型自己看图」，但**工具**场景下这条路走不通 ——
+    read_image 的职责就是把图变成文字给她看，主模型能自己看图时这个工具本就
+    不该被调用（工具描述里写了「不要用于」）。所以这里 direct 也返回
+    ok=True + 主模型配置，让调用方照常发一次请求；真被误调也就是多花一次调用，
+    不会出错。
+
+    返回 config 一律是三个字段齐的 dict（api_base / api_key / model）。
+    """
+    route = resolve_image_route("tool")
+    mode = route.get("mode")
+    if mode == IMAGE_ROUTE_CAPTION:
+        return True, route["config"]
+    if mode == IMAGE_ROUTE_REJECT:
+        return False, route.get("reason") or IMAGE_REJECT_REASON
+    # direct：主模型自己能看图，用主模型配置发（现状行为保留）
+    try:
+        m = SETTINGS.get("model", {})
+    except (NameError, AttributeError):
+        m = {}
+    return True, {"api_base": str(m.get("api_base", "") or "").strip(),
+                  "api_key": str(m.get("api_key", "") or ""),
+                  "model": str(m.get("model", "") or "").strip()}
+
+
+# ========== 视觉描述缓存（对齐桌面端 TtlResultCache） ==========
+# 桌面端那份的注释把要害写清楚了，这里照搬口径：
+#   「每次调用都是真金白银的视觉模型请求。模型对同一张图反复看（"再看下那个图…"）
+#     时直接复用 30 分钟内的描述。key 必须带 userQuery：同一个图不同问题的描述不同。」
+#
+# 与桌面端唯一的差别：手机端**只用内存**，不落盘。
+# 桌面端也是纯内存 TTL 缓存，但手机还有一条额外理由 —— 磁盘已用 916G/943G（98%），
+# 任何「顺手写一份到磁盘」的设计都是给自己挖坑。内存方案同时解决体积与磁盘两件事。
+VISION_CAPTION_CACHE_MAX = 64        # 条数上限：手机内存有限，别无限攒
+
+_vision_cache = {}                   # key -> (ts, text)；dict 保序，天然可做 FIFO 淘汰
+_vision_cache_lock = threading.Lock()
+
+# 上一次调用的结果，供 /vision/status 与面板自检显示（不含 key、不含图片内容）
+VISION_LAST = {}
+
+
+def _vision_cache_ttl():
+    """当前生效的缓存 TTL（秒）。0 = 不缓存（用户把 cacheTtlMin 拉到 0）。"""
+    try:
+        return max(0, int(vision_cfg("cacheTtlMin", 30) or 0)) * 60
+    except (TypeError, ValueError):
+        return 30 * 60
+
+
+def vision_cache_get(key):
+    """读缓存。命中返回 (ts, text)，否则 None。
+
+    TTL 是**读取时**按当前配置判的，不是写入时定死的 —— 这样用户在面板上
+    把 30 分钟改成 5 分钟能立刻生效，不需要重启服务或重建缓存。
+    """
+    if not key:
+        return None
+    ttl = _vision_cache_ttl()
+    if ttl <= 0:
+        return None
+    now = time.time()
+    with _vision_cache_lock:
+        item = _vision_cache.get(key)
+        if item is None:
+            return None
+        ts, text = item
+        if now - ts > ttl:
+            # 顺手清掉过期项。不清也不影响正确性，但会让淘汰顺序变脏。
+            _vision_cache.pop(key, None)
+            return None
+        return ts, text
+
+
+def vision_cache_put(key, text):
+    """写缓存。
+
+    ⚠ 调用方必须先确认这是**成功**的描述。桌面端那条判据在这里同样成立：
+    错误描述不缓存，下次重试（否则一次网络抖动会被固化 30 分钟）。
+    这个判断收在调用方而不是这里，是为了让「要不要缓存」这个决定看得见。
+    """
+    if not key or not text:
+        return
+    with _vision_cache_lock:
+        # 满了先淘汰最旧的。popitem(last=False) 取的是最早插入的键，
+        # 因为 dict 保序且我们从不原地更新已有键的顺序 —— 被命中的键不重排，
+        # 所以这是 FIFO 而不是严格 LRU。对「同一张图看几次」的用法足够，
+        # 而且比维护 LRU 链表少一半代码和一半出错机会。
+        while len(_vision_cache) >= VISION_CAPTION_CACHE_MAX:
+            try:
+                _vision_cache.popitem(last=False)
+            except KeyError:
+                break
+        _vision_cache[key] = (time.time(), text)
+
+
+def vision_cache_clear():
+    """清空缓存。返回清掉的条数。"""
+    with _vision_cache_lock:
+        n = len(_vision_cache)
+        _vision_cache.clear()
+        return n
+
+
+def vision_cache_count():
+    with _vision_cache_lock:
+        return len(_vision_cache)
+
+
+# ========== 独立视觉协议层（对齐桌面端 vision-captioner） ==========
+# 桌面端工具文件里写明的分工，这里照搬：
+#   「协议构造全部委托 vision-captioner（唯一多模态协议层），
+#     工具文件只做参数校验 + 视觉配置检查 + 调用，不碰 image_url 格式细节。」
+# 手机端同样把协议收在这几个函数里，工具 handler 不自己拼 payload。
+#
+# 错误前缀是约定的一部分：调用方靠 "[错误" 前缀判断成功与否（缓存层就吃这条），
+# 前缀本身也直接面向模型 —— 她会照着「[错误·配置] …」如实告诉用户看不了。
+VISION_ERR_CONFIG = "[错误·配置]"
+VISION_ERR_NETWORK = "[错误·网络]"
+VISION_ERR_TOO_BIG = "[错误·超限]"
+VISION_ERR_FORMAT = "[错误·格式]"
+
+# 没给 question 时的默认指令。写成「如实描述」而不是「分析」：她的用途是
+# 「看见这张图然后说话」，不是出一份图像分析报告。
+VISION_DEFAULT_PROMPT = (
+    "请描述这张图片的内容：主要对象、场景、可见的文字，以及整体氛围。"
+    "如实描述你看到的，看不清的地方就说看不清，不要猜测。"
+)
+
+
+def vision_endpoint_url(base):
+    """把用户填的 api_base 规范化成真正要打的 /chat/completions 地址。
+
+    为什么需要这一层：设置面板那一栏叫「接口地址」，用户很自然会直接粘一条
+    完整端点（`https://host/v1/chat/completions`）。天真拼接会得到
+    `…/v1/chat/completions/chat/completions`，网关回的往往是 404 / 554 这类
+    看起来像「限流」或「未找到」的码，排查时会一路往网络和密钥上找。
+
+    实测（2026-10-10，本机中转站 + 一个能收图的视觉模型）：
+      · 原样打完整端点   → 200（带图也答对）
+      · 拼接后（旧行为） → 404 Not Found
+      · 从 /v1 补端点    → 200
+
+    三种输入都收：
+      https://host/v1                    → 补 /chat/completions
+      https://host/v1/chat/completions   → 原样
+      https://host/v1/chat/completions/  → 去尾斜杠后原样
+    """
+    b = str(base or "").strip().rstrip("/")
+    if not b:
+        return ""
+    if b.endswith("/chat/completions"):
+        return b
+    return b + "/chat/completions"
+
+# 魔数 → (mime, 规范扩展名)。判真实类型用，见下面 sniff_image_type 的说明。
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png", "png"),
+    (b"\xff\xd8\xff", "image/jpeg", "jpg"),
+    (b"GIF87a", "image/gif", "gif"),
+    (b"GIF89a", "image/gif", "gif"),
+    (b"BM", "image/bmp", "bmp"),
+)
+
+
+def sniff_image_type(data):
+    """读文件头判真实图片类型。返回 (mime, ext)，认不出返回 None。
+
+    为什么按魔数而不是按扩展名：借 dsh read_image 的那条设计 ——
+    「扩展名是声明，魔数与像素校验才是权威」。手机端这份更该这么做，因为
+    交接文档里记着实测坑：`builtin-20.gif` / `34.png` / `38.gif` 三张图
+    文件头其实是 RIFF/WEBP，扩展名骗人。当时靠手工改名修好了，但那属于
+    「人肉兜底」；此处的校验就是为了让同类问题在运行时自己暴露出来，
+    而不是等到浏览器渲染不出来。
+    """
+    if not data or len(data) < 12:
+        return None
+    for magic, mime, ext in _IMAGE_MAGIC:
+        if data.startswith(magic):
+            return mime, ext
+    # WebP：RIFF....WEBP（前 4 字节 RIFF，8-12 字节 WEBP）
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    return None
+
+
+def image_dimensions(data, mime):
+    """尽力解析图片像素尺寸。认不出返回 None。
+
+    为什么值得写这几行：返回元数据里的宽高能让她判断「这是不是一张缩略图 /
+    是不是长截图」，也让「图太大看不清」这种结论有依据。手机端没有 PIL，
+    所以只解析各格式的头部字段 —— 不做完整解码，解析失败一律回 None，
+    绝不因为一个尺寸字段让整次转述失败。
+    """
+    try:
+        if mime == "image/png":
+            # IHDR 紧跟在 8 字节签名 + 4 字节长度 + 4 字节类型之后
+            if len(data) >= 24 and data[12:16] == b"IHDR":
+                return (int.from_bytes(data[16:20], "big"),
+                        int.from_bytes(data[20:24], "big"))
+        elif mime == "image/gif":
+            if len(data) >= 10:
+                return (int.from_bytes(data[6:8], "little"),
+                        int.from_bytes(data[8:10], "little"))
+        elif mime == "image/bmp":
+            if len(data) >= 26:
+                return (int.from_bytes(data[18:22], "little"),
+                        int.from_bytes(data[22:26], "little"))
+        elif mime == "image/webp":
+            # VP8X：24 位宽高减一，各占 3 字节
+            if len(data) >= 30 and data[12:16] == b"VP8X":
+                w = int.from_bytes(data[24:27], "little") + 1
+                h = int.from_bytes(data[27:30], "little") + 1
+                return (w, h)
+            # VP8L：14 位宽高打包在一个小端 32 位里
+            if len(data) >= 25 and data[12:16] == b"VP8L":
+                bits = int.from_bytes(data[21:25], "little")
+                return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+            # VP8（有损）：宽高在帧头里，偏移较深，这里不做（回 None 更诚实）
+        elif mime == "image/jpeg":
+            return _jpeg_dimensions(data)
+    except Exception:
+        # 尺寸是锦上添花，任何一种解析意外都退回 None，不打断主流程
+        return None
+    return None
+
+
+def _jpeg_dimensions(data):
+    """扫 JPEG 的 SOF 段取宽高。SOF0/1/2/3/5/6/7/9/10/11/13/14/15 都带尺寸。"""
+    i = 2                                   # 跳过 SOI (FFD8)
+    n = len(data)
+    while i + 9 < n:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        # 填充字节 FF 允许重复，跳过
+        if marker == 0xFF:
+            i += 1
+            continue
+        # 无参数的段：SOI/EOI/RSTn/TEM
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7 or marker == 0x01:
+            i += 2
+            continue
+        seg_len = int.from_bytes(data[i + 2:i + 4], "big")
+        if seg_len < 2:
+            return None
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            h = int.from_bytes(data[i + 5:i + 7], "big")
+            w = int.from_bytes(data[i + 7:i + 9], "big")
+            return (w, h)
+        i += 2 + seg_len
+    return None
+
+
+def read_image_bounded(path, max_bytes):
+    """有界读一张图片。返回 (bytes, None) 或 (None, 错误文本)。
+
+    借 dsh read_image 的两条实现细节：
+      ① stat 先短路 —— 明显超限的文件根本不去打开它，省一次 I/O，
+         也避免在 400MB 的文件上白读一遍。
+      ② 读了 limit+1 个字节来判超限 —— 防「stat 之后文件又长大了」这个
+         竞态。只看 stat 就放行的话，两行代码之外文件可能已经被写大。
+    """
+    try:
+        st = path.stat()
+    except OSError as e:
+        return None, f"{VISION_ERR_FORMAT} 读不到这个文件（{e.strerror or e}）"
+    if st.st_size > max_bytes:
+        return None, (f"{VISION_ERR_TOO_BIG} 图片 {_human_size(st.st_size)}，"
+                      f"超过上限 {_human_size(max_bytes)}")
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(max_bytes + 1)     # 多读一个字节，见 ②
+    except OSError as e:
+        return None, f"{VISION_ERR_FORMAT} 读取失败（{e.strerror or e}）"
+    if len(data) > max_bytes:
+        return None, (f"{VISION_ERR_TOO_BIG} 图片超过上限 "
+                      f"{_human_size(max_bytes)}")
+    if not data:
+        return None, f"{VISION_ERR_FORMAT} 文件是空的（0 字节）"
+    return data, None
+
+
+class VisionClient:
+    """独立视觉端点客户端。**刻意不复用 LLMClient**。
+
+    不复用的三个理由：
+      · 配置来源不同（vision 段 vs model 段），复用就得把两套配置搅在一起；
+      · 请求形态不同：视觉转述只发一条 user 消息、不带工具、不流式，
+        而 LLMClient 背着 reasoning / tools / 流式 / 工具调用累积这一整套；
+      · 失败语义不同：转述失败不该影响主对话，需要独立的短超时与错误前缀。
+    重合的只有「往 /chat/completions 发个 JSON」这十几行，不值得为此耦合。
+    """
+
+    def __init__(self, cfg):
+        # 走 vision_endpoint_url 而不是裸拼：用户把完整端点粘进「接口地址」是
+        # 常态，裸拼会让路径重复成 …/chat/completions/chat/completions。
+        self.url = vision_endpoint_url(cfg.get("api_base", ""))
+        self.key = cfg.get("api_key", "") or ""
+        self.model = str(cfg.get("model", "") or "")
+        # 超时用 vision 段的短值（默认 60），不跟随主模型的 120：
+        # 转述是附带动作，不该把整轮对话拖住。
+        try:
+            self.timeout = max(10, int(vision_cfg("request_timeout", 60) or 60))
+        except (TypeError, ValueError):
+            self.timeout = 60
+
+    def describe(self, image_part, question="", max_tokens=800):
+        """发一次转述请求。返回 (ok, text)——失败时 text 已带错误前缀。"""
+        if not self.url or not self.model:
+            return False, f"{VISION_ERR_CONFIG} 视觉端点没配全（需要 api_base + model）"
+        prompt = (question or "").strip() or VISION_DEFAULT_PROMPT
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                image_part,
+            ]}],
+            "max_tokens": int(max_tokens),
+            "temperature": 0.3,      # 转述要稳，不要发挥
+            # 刻意不带 tools / stream：视觉端点只需要回一段文字
+        }
+        url = self.url                 # 已在 __init__ 规范化，见 vision_endpoint_url
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {self.key}"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                status = r.getcode()
+                body = r.read()
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read().decode(errors="replace")[:400]
+            except Exception:
+                detail = ""
+            return False, (f"{VISION_ERR_NETWORK} 视觉端点返回 HTTP {e.code}"
+                           + (f"：{detail}" if detail else ""))
+        except Exception as e:
+            return False, f"{VISION_ERR_NETWORK} 请求视觉端点失败（{e}）"
+        if status != 200:
+            return False, f"{VISION_ERR_NETWORK} 视觉端点返回 HTTP {status}"
+        try:
+            obj = json.loads(body.decode("utf-8", errors="replace"))
+        except Exception:
+            return False, f"{VISION_ERR_FORMAT} 视觉端点返回的不是 JSON"
+        choices = obj.get("choices") or []
+        if not choices:
+            return False, f"{VISION_ERR_FORMAT} 视觉端点没返回 choices"
+        msg = choices[0].get("message") or {}
+        text = msg.get("content")
+        if isinstance(text, list):
+            # 少数端点回 content 数组，拼成纯文本
+            text = "".join(str(p.get("text") or "")
+                           for p in text if isinstance(p, dict))
+        text = (text or "").strip()
+        if not text:
+            # 空回复是视觉端点的常见失败形态（图太大 / 被内容策略挡掉），
+            # 明说出来比返回空串好：空串会被当成「她什么都没看见」，
+            # 而这句话能让她知道该换个说法或换张图。
+            return False, f"{VISION_ERR_FORMAT} 视觉端点返回了空描述（图可能太大或不支持这种格式）"
+        return True, text
+
+
+def vision_max_bytes():
+    """本次允许进视觉通道的图片字节上限。
+
+    取 vision.maxMb 与 VISION_MAX_BYTES 的**较小值**：前者是用户偏好，
+    后者是这台设备上已经验证过的硬边界（4 MiB，与 base64 请求体大小挂钩），
+    用户把 maxMb 调到 16 也不该突破后者。
+    """
+    try:
+        mb = float(vision_cfg("maxMb", 4) or 4)
+    except (TypeError, ValueError):
+        mb = 4.0
+    return int(min(mb * 1024 * 1024, VISION_MAX_BYTES))
+
+
+def caption_image(source, question="", cfg=None):
+    """把一张图交给独立视觉模型转述成文字。**唯一的多模态协议层**。
+
+    source 两种形态（对齐桌面端 read_image / read_image_url 的分工）：
+      {"path": Path}  → 本地文件：有界读 → 魔数校验 → base64 data URI
+      {"url": str}    → 公网地址：原样直传，厂商服务器自己拉图，
+                        本机不下载、不转 base64（省流量省内存）
+
+    返回**永远是字符串**：成功是描述正文，失败是带 "[错误·xxx]" 前缀的说明。
+    这个「不抛异常、只回文本」的契约，是为了让工具 handler 与上传链路都能
+    直接把返回值塞进上下文 —— 出错时她也能如实告诉用户看不了，而不是
+    整轮对话因为一次转述失败而炸掉。
+
+    cfg 传入 (ok, config_or_error) 形态的解析结果；不传则自己解析。
+    """
+    global VISION_LAST
+    if cfg is None:
+        cfg = resolve_caption_vision_config()
+    ok, conf = cfg
+    if not ok:
+        VISION_LAST = {"ok": False, "at": time.time(), "error": str(conf)[:300]}
+        return str(conf)
+
+    max_bytes = vision_max_bytes()
+    local_hash = ""
+    meta = []
+
+    if isinstance(source, dict) and source.get("path") is not None:
+        path = Path(source["path"])
+        data, err = read_image_bounded(path, max_bytes)
+        if err:
+            VISION_LAST = {"ok": False, "at": time.time(), "error": err[:300]}
+            return err
+        sniffed = sniff_image_type(data)
+        if sniffed is None:
+            msg = (f"{VISION_ERR_FORMAT} 这不是能识别的图片格式"
+                   f"（只认 PNG / JPEG / WebP / GIF / BMP）")
+            VISION_LAST = {"ok": False, "at": time.time(), "error": msg[:300]}
+            return msg
+        mime, ext = sniffed
+        # 扩展名与真实类型不符时报出来 —— 对齐 dsh「不匹配时按改名修复提示
+        # 失败关闭，而不是被静默接受」的取舍。这里不阻断（图照样能转述），
+        # 但在返回文本里点一句，让「扩展名骗人」这类问题不再靠人肉发现。
+        claimed = path.suffix.lower().lstrip(".")
+        if claimed and claimed not in (ext, "jpeg" if ext == "jpg" else ext):
+            meta.append(f"（注意：扩展名是 .{claimed}，实际内容是 {ext}）")
+        dims = image_dimensions(data, mime)
+        if dims:
+            meta.append(f"{dims[0]}×{dims[1]}")
+        meta.append(_human_size(len(data)))
+        local_hash = hashlib.sha256(data).hexdigest()
+        b64 = base64.b64encode(data).decode("ascii")
+        image_part = {"type": "image_url",
+                      "image_url": {"url": f"data:{mime};base64,{b64}"}}
+
+    elif isinstance(source, dict) and source.get("url"):
+        url = str(source["url"]).strip()
+        if not re.match(r"^https?://", url, re.I):
+            msg = f"{VISION_ERR_FORMAT} url 必须以 http:// 或 https:// 开头"
+            VISION_LAST = {"ok": False, "at": time.time(), "error": msg[:300]}
+            return msg
+        # URL 直传：本机不下载。这也是桌面端 read_image_url 的做法。
+        image_part = {"type": "image_url", "image_url": {"url": url}}
+
+    else:
+        msg = f"{VISION_ERR_FORMAT} 缺少图片来源（path 或 url）"
+        VISION_LAST = {"ok": False, "at": time.time(), "error": msg[:300]}
+        return msg
+
+    # 缓存查：key 必须带 question —— 同一张图不同问题的描述不同。
+    # 本地图用内容哈希（比路径准：同一张图换个文件名仍是同一张），
+    # url 用地址本身，与桌面端一致。
+    cache_key = (local_hash or image_part["image_url"]["url"]) + "||" + (question or "")
+    hit = vision_cache_get(cache_key)
+    if hit:
+        ts, text = hit
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        mins = max(1, _vision_cache_ttl() // 60)
+        VISION_LAST = {"ok": True, "at": ts, "cached": True, "chars": len(text)}
+        return f"[缓存] 此描述生成于 {stamp}，{mins} 分钟内复用\n\n{text}"
+
+    client = VisionClient(conf)
+    ok2, text = client.describe(image_part, question)
+    if not ok2:
+        VISION_LAST = {"ok": False, "at": time.time(), "error": text[:300]}
+        return text
+    # 只有成功描述才写缓存（错误不缓存，下次重试）
+    vision_cache_put(cache_key, text)
+    VISION_LAST = {"ok": True, "at": time.time(), "cached": False, "chars": len(text)}
+    if meta:
+        # 元数据放在描述前面：她先知道「这是什么图、多大」，再读内容，
+        # 判断「图看不清」这类结论时才有依据。
+        return "· ".join(meta) + "\n\n" + text
+    return text
+
+
 # ---------- 三个 handler ----------
 
 def _h_web_search(a):
@@ -2132,57 +2777,57 @@ def _h_shell_job(a):
 #             （旧 [TOOL] 文本协议的位置参数映射已在阶段3 删除，随之删掉了
 #              只服务于它的 whole 标记。）
 TOOLS = {
-    "battery":       {"desc": "查手机电量、充电状态与电池温度", "icon": "🔋",
+    "battery":       {"desc": "查手机电量、充电状态与电池温度", "icon": "battery",
                       "readonly": True, "risk": "safe",
                       "cmd": ["termux-battery-status"],
                       "params": {}},
-    "camera":        {"desc": "拍照并保存到相册 DCIM", "icon": "📷",
+    "camera":        {"desc": "拍照并保存到相册 DCIM", "icon": "camera",
                       "readonly": False, "risk": "device",
                       "cmd": ["termux-camera-photo", "-c", "0", "/sdcard/DCIM/cyrene_{ts}.jpg"],
                       "params": {}},
-    "tts":           {"desc": "让手机朗读一段文字", "icon": "🔊",
+    "tts":           {"desc": "让手机朗读一段文字", "icon": "tts",
                       "readonly": False, "risk": "device",
                       "cmd": ["termux-tts-speak", "{text}"],
                       "params": {"text": {"type": "string", "required": True,
                                           "desc": "要朗读的文字"}}},
-    "notify":        {"desc": "发一条系统通知", "icon": "🔔",
+    "notify":        {"desc": "发一条系统通知", "icon": "notify",
                       "readonly": False, "risk": "device",
                       "cmd": ["termux-notification", "-t", "{title}", "-c", "{text}"],
                       "params": {"text": {"type": "string", "required": True,
                                           "desc": "通知正文"},
                                  "title": {"type": "string", "default": "昔涟",
                                            "desc": "通知标题，缺省「昔涟」"}}},
-    "vibrate":       {"desc": "让手机震动一下", "icon": "📳",
+    "vibrate":       {"desc": "让手机震动一下", "icon": "vibrate",
                       "readonly": False, "risk": "device",
                       "cmd": ["termux-vibrate"],
                       "params": {}},
-    "torch":         {"desc": "开关手电筒", "icon": "🔦",
+    "torch":         {"desc": "开关手电筒", "icon": "torch",
                       "readonly": False, "risk": "device",
                       "cmd": ["termux-torch", "{on_off}"],
                       "params": {"on_off": {"type": "string", "required": True,
                                             "enum": ["on", "off"],
                                             "desc": "on=打开，off=关闭"}}},
-    "location":      {"desc": "查 GPS 定位（需系统定位总开关已打开）", "icon": "📍",
+    "location":      {"desc": "查 GPS 定位（需系统定位总开关已打开）", "icon": "location",
                       "readonly": True, "risk": "safe",
                       "cmd": ["termux-location", "-p", "{provider}"],
                       "params": {"provider": {"type": "string", "default": "network",
                                               "enum": ["network", "gps", "passive"],
                                               "desc": "定位来源。室内用 network，"
                                                       "室外精确用 gps"}}},
-    "clipboard_set": {"desc": "把文字写进剪贴板", "icon": "📋",
+    "clipboard_set": {"desc": "把文字写进剪贴板", "icon": "clipboard_set",
                       "readonly": False, "risk": "device",
                       "cmd": ["termux-clipboard-set", "{text}"],
                       "params": {"text": {"type": "string", "required": True,
                                           "desc": "要写入剪贴板的内容"}}},
-    "clipboard_get": {"desc": "读取剪贴板当前内容", "icon": "📄",
+    "clipboard_get": {"desc": "读取剪贴板当前内容", "icon": "clipboard_get",
                       "readonly": True, "risk": "safe",
                       "cmd": ["termux-clipboard-get"],
                       "params": {}},
-    "wifi_info":     {"desc": "查当前 WiFi 连接信息（SSID、IP、信号强度）", "icon": "📶",
+    "wifi_info":     {"desc": "查当前 WiFi 连接信息（SSID、IP、信号强度）", "icon": "wifi_info",
                       "readonly": True, "risk": "safe",
                       "cmd": ["termux-wifi-connectioninfo"],
                       "params": {}},
-    "brightness":    {"desc": "调节屏幕亮度", "icon": "🔆",
+    "brightness":    {"desc": "调节屏幕亮度", "icon": "brightness",
                       "readonly": False, "risk": "device",
                       "cmd": ["termux-brightness", "{value}"],
                       "params": {"value": {"type": "integer", "required": True,
@@ -2196,7 +2841,7 @@ TOOLS = {
     "shell":         {"desc": "在 Termux 里执行一条 shell 命令并返回输出。"
                              "长时间任务可传 run_in_background=true 立刻返回 jobId，"
                              "之后用 shell_job 查状态或终止",
-                      "icon": "💻", "readonly": False, "risk": "shell",
+                      "icon": "run_shell", "readonly": False, "risk": "shell",
                       "handler": "_h_shell",
                       "params": {
                           "cmd": {"type": "string", "required": True,
@@ -2220,7 +2865,7 @@ TOOLS = {
     # 不 fork 子进程。因此不受 termux-api 广播熔断器牵连，也没有孤儿进程风险。
     # 全部经 guard_path 限制在家目录内，写操作另有保护名单。
     "read_file":     {"desc": "读取本地文本文件内容（带行号，可用 offset/limit 分段读大文件）",
-                      "icon": "📖", "readonly": True, "risk": "safe",
+                      "icon": "read_file", "readonly": True, "risk": "safe",
                       "handler": "_h_read_file",
                       "params": {
                           "path": {"type": "string", "required": True,
@@ -2231,7 +2876,7 @@ TOOLS = {
                                     "minimum": 1, "maximum": FS_READ_MAX_LINES,
                                     "desc": f"最多读多少行（默认 {FS_READ_DEFAULT_LINES}）"}}},
     "write_file":    {"desc": "创建新文件或整体覆写已有文件（覆写前自动备份 .bak）",
-                      "icon": "✍️", "readonly": False, "risk": "fs-write",
+                      "icon": "write_file", "readonly": False, "risk": "fs-write",
                       "handler": "_h_write_file",
                       "params": {
                           "path": {"type": "string", "required": True,
@@ -2241,7 +2886,7 @@ TOOLS = {
                                       "desc": "要写入的完整内容（传空串即清空文件）"}}},
     "edit_file":     {"desc": "对文件做精确文本替换：把 old_string 换成 new_string。"
                             "匹配到多处时必须显式传 replace_all，否则报错不改",
-                      "icon": "✂️", "readonly": False, "risk": "fs-write",
+                      "icon": "edit_file", "readonly": False, "risk": "fs-write",
                       "handler": "_h_edit_file",
                       "params": {
                           "path": {"type": "string", "required": True,
@@ -2255,7 +2900,7 @@ TOOLS = {
                           "replace_all": {"type": "boolean", "default": False,
                                           "desc": "true = 替换所有匹配处；false = 只允许唯一匹配"}}},
     "glob_files":    {"desc": "按通配模式查找文件（如 *.md、config*.json），返回相对路径列表",
-                      "icon": "🔎", "readonly": True, "risk": "safe",
+                      "icon": "glob_files", "readonly": True, "risk": "safe",
                       "handler": "_h_glob_files",
                       "params": {
                           "pattern": {"type": "string", "required": True,
@@ -2263,7 +2908,7 @@ TOOLS = {
                           "root": {"type": "string", "default": "",
                                    "desc": "从哪个目录开始找，缺省为家目录"}}},
     "grep_files":    {"desc": "用正则在文件内容里搜索，返回匹配行（带文件名和行号）",
-                      "icon": "🧲", "readonly": True, "risk": "safe",
+                      "icon": "grep_files", "readonly": True, "risk": "safe",
                       "handler": "_h_grep_files",
                       "params": {
                           "pattern": {"type": "string", "required": True,
@@ -2277,11 +2922,55 @@ TOOLS = {
                           "files_with_matches": {"type": "boolean", "default": False,
                                                  "desc": "true = 只列文件名不列内容"}}},
     "list_dir":      {"desc": "列出目录内容（子目录在前、文件在后，带文件大小）",
-                      "icon": "🗂️", "readonly": True, "risk": "safe",
+                      "icon": "list_dir", "readonly": True, "risk": "safe",
                       "handler": "_h_list_dir",
                       "params": {
                           "path": {"type": "string", "default": "",
                                    "desc": "目录路径，缺省为家目录"}}},
+
+    # ---------- 视觉工具（独立视觉模型）----------
+    # 这两个是「看图」的入口，走的是 vision 段那套独立端点，与主模型通道无关。
+    # 分工对齐桌面端：read_image 读本地文件、read_image_url 读公网地址
+    # （后者原样直传，本机不下载，要副本请用 download_file）。
+    # 两个都标了「未配置视觉模型时会返回错误」—— 这不是免责声明，
+    # 而是给她一条明确的退路：如实告诉用户看不了，别猜图里有什么。
+    "read_image":    {"desc": "看一张本地图片的内容，返回文字描述（走独立视觉模型）。\n\n"
+                             "何时用：\n"
+                             "- 用户上传/提到本地图片，问「这图里是什么」\n"
+                             "- 需要确认截图、表情包、示意图的内容\n\n"
+                             "不要用于：\n"
+                             "- 公网图片地址 → read_image_url\n"
+                             "- 文本文件 → read_file\n"
+                             "- 只想把图存下来 → download_file\n\n"
+                             "未配置独立视觉模型时会返回错误，届时如实告诉用户看不了。\n"
+                             "参数：path（必填，图片路径）、question（可选，想重点看什么）",
+                      "icon": "read_image", "readonly": True, "risk": "safe",
+                      "handler": "_h_read_image",
+                      "params": {
+                          "path": {"type": "string", "required": True,
+                                   "desc": f"图片路径。绝对路径或相对家目录（{FS_ROOT_DEFAULT}）的路径"},
+                          "question": {"type": "string", "default": "",
+                                       "desc": "可选。想让她重点看什么（如「图里有几行字」）。"
+                                               "缺省是通读描述"}}},
+    "read_image_url": {"desc": "看一张公网图片的内容，返回文字描述（图片由厂商服务器直接拉取，"
+                               "本机不下载）\n\n"
+                               "何时用：\n"
+                               "- 对话/网页里出现图片 URL，用户问「这图里是什么」\n"
+                               "- web_search 或 fetch_url 拿到图片链接，想看内容\n\n"
+                               "不要用于：\n"
+                               "- 本地图片文件 → read_image\n"
+                               "- 想把图片保存到本地 → download_file\n"
+                               "- 厂商拉不到的地址（内网/失效/防盗链会报错，"
+                               "可先用 download_file 存下来再 read_image）\n\n"
+                               "未配置独立视觉模型时会返回错误，届时如实告诉用户看不了。\n"
+                               "参数：url（必填，完整 http(s) 图片地址）、question（可选）",
+                      "icon": "read_image_url", "readonly": True, "risk": "network",
+                      "handler": "_h_read_image_url",
+                      "params": {
+                          "url": {"type": "string", "required": True,
+                                  "desc": "要看的图片完整 URL（必须含 https:// 或 http://）"},
+                          "question": {"type": "string", "default": "",
+                                       "desc": "可选。想让她重点看什么。缺省是通读描述"}}},
 
     # ---------- 联网工具（阶段 2b）----------
     # 同样是 handler 型：进程内跑 urllib，不 fork 子进程。三个都标 risk="network"，
@@ -2289,7 +2978,7 @@ TOOLS = {
     # 是 unknown（见 run_agent_loop 的 halted 判定：network 不在 safe 白名单）。
     # 安全红线：_net_open 只放行 http/https，file:// 等本地协议一律拒（防 SSRF）。
     "web_search":    {"desc": "联网搜索，返回标题/链接/摘要列表（多搜索引擎自动降级）",
-                      "icon": "🌐", "readonly": True, "risk": "network",
+                      "icon": "web_search", "readonly": True, "risk": "network",
                       "handler": "_h_web_search",
                       "params": {
                           "query": {"type": "string", "required": True,
@@ -2298,7 +2987,7 @@ TOOLS = {
                                           "minimum": 1, "maximum": NET_MAX_RESULTS,
                                           "desc": f"最多返回几条（默认 {NET_DEFAULT_RESULTS}）"}}},
     "fetch_url":     {"desc": "抓取一个网页正文，HTML 自动转 Markdown 纯文本返回（超长会截断标注）",
-                      "icon": "📄", "readonly": True, "risk": "network",
+                      "icon": "fetch_url", "readonly": True, "risk": "network",
                       "handler": "_h_fetch_url",
                       "params": {
                           "url": {"type": "string", "required": True,
@@ -2307,7 +2996,7 @@ TOOLS = {
                                         "maximum": 200000,
                                         "desc": "正文最多保留多少字（0=用系统输出上限）"}}},
     "download_file": {"desc": "从 URL 下载文件（图片/压缩包/PDF 等）存到 downloads 目录，返回落地路径",
-                      "icon": "⬇️", "readonly": False, "risk": "network",
+                      "icon": "download_file", "readonly": False, "risk": "network",
                       "handler": "_h_download_file",
                       "params": {
                           "url": {"type": "string", "required": True,
@@ -2324,7 +3013,7 @@ TOOLS = {
     # 同轮其余调用一律合成 not_executed 闭合槽位，绝不边问边做。
     "update_todo":   {"desc": "更新本次任务的工作笔记（Todo）。整表替换：每次传入完整的"
                              "任务清单，含已完成、进行中和待办的全部条目",
-                      "icon": "📝", "readonly": False, "risk": "safe",
+                      "icon": "update_todo", "readonly": False, "risk": "safe",
                       "handler": "_h_update_todo", "needs_ctx": True,
                       "params": {
                           "todos": {"type": "array", "required": True,
@@ -2338,7 +3027,7 @@ TOOLS = {
     "ask_user":      {"desc": "需要用户做决定、补充信息或选择方向时提问。**排他工具**："
                              "调用后本轮立即结束，同批次其他工具都不会执行。"
                              "能自己查到的事不要用它，也不要拿它出测试题",
-                      "icon": "❓", "readonly": True, "risk": "safe",
+                      "icon": "ask_user", "readonly": True, "risk": "safe",
                       "handler": "_h_ask_user", "needs_ctx": True,
                       "params": {
                           "questions": {"type": "array", "required": True,
@@ -2351,7 +3040,7 @@ TOOLS = {
                      },
     "invoke_skill":  {"desc": "读取一个技能的完整执行指令（SKILL.md 正文）。"
                              "技能清单在系统提示里，需要详情时才调它，不要凭猜执行",
-                      "icon": "📚", "readonly": True, "risk": "safe",
+                      "icon": "invoke_skill", "readonly": True, "risk": "safe",
                       "handler": "_h_invoke_skill",
                       "params": {
                           "skill_id": {"type": "string", "required": True,
@@ -2363,7 +3052,7 @@ TOOLS = {
     "read_skill_reference": {
                       "desc": "读取技能 references/ 目录下的附件内容。"
                              "只有 invoke_skill 返回的清单里点名的附件才能读",
-                      "icon": "📎", "readonly": True, "risk": "safe",
+                      "icon": "read_skill_reference", "readonly": True, "risk": "safe",
                       "handler": "_h_read_skill_reference",
                       "params": {
                           "skill_id": {"type": "string", "required": True,
@@ -2377,7 +3066,7 @@ TOOLS = {
                      },
     "shell_job":     {"desc": "查询或终止 shell 后台任务（run_in_background=true 启动的）。"
                              "status 返回运行状态、退出码、累计输出字节数与日志尾部",
-                      "icon": "🛰️", "readonly": False, "risk": "shell",
+                      "icon": "shell_job", "readonly": False, "risk": "shell",
                       "handler": "_h_shell_job",
                       "params": {
                           "job_id": {"type": "string", "required": True,
@@ -2425,6 +3114,9 @@ TOOL_HANDLERS = {
     "_h_invoke_skill": _h_invoke_skill,
     "_h_read_skill_reference": _h_read_skill_reference,
     "_h_shell_job": _h_shell_job,
+    # 视觉工具（独立视觉模型）
+    "_h_read_image": _h_read_image,
+    "_h_read_image_url": _h_read_image_url,
 }
 
 # tool_schema 要剥掉的自定义字段（它们不是 JSON Schema 关键字，
@@ -2568,13 +3260,13 @@ def resolve_typed(name, args_dict):
 #   tools=False：Chat 模式按桌面端语义「不暴露、不调用、不执行任何工具」，
 #                系统提示里不注入工具块，run_tool 对 chat 会话也一律拒绝。
 MODES = {
-    "chat":  {"label": "聊天", "icon": "💬", "tools": False,
+    "chat":  {"label": "聊天", "icon": "chat", "tools": False,
               "desc": "自然陪伴对话，不调用任何工具"},
-    "work":  {"label": "工作", "icon": "🛠️", "tools": True,
+    "work":  {"label": "工作", "icon": "work", "tools": True,
               "desc": "通用任务，可串联手机工具完成事情"},
-    "code":  {"label": "代码", "icon": "💻", "tools": True,
+    "code":  {"label": "代码", "icon": "code", "tools": True,
               "desc": "编程 / 文件 / 命令，任务正确性优先"},
-    "learn": {"label": "学习", "icon": "📚", "tools": True,
+    "learn": {"label": "学习", "icon": "learn", "tools": True,
               "desc": "陪伴理解材料、整理笔记、生成练习"},
 }
 DEFAULT_MODE = "chat"
@@ -2796,6 +3488,14 @@ DEFAULT_SETTINGS = {
         "api_base": "https://api.openai.com/v1",
         "api_key": "",
         "model": "gpt-4o-mini",
+        # 主模型是否多模态。对齐桌面端 Cyrene-Agent 的 model-settings.multimodal：
+        #   "auto"（默认）沿用本文件原有的 VISION_SUPPORTED 探测 —— 实测端点不收图
+        #           （False）即视为「主模型非多模态」；
+        #   "on"   强制按多模态走（换了端点、想再试一次图）；
+        #   "off"  强制走图片转述（等价桌面端 multimodal: false）。
+        # 三态而不是布尔，是因为手机端多了一份「探测结论」这个事实来源，
+        # 布尔表达不了「用户显式覆盖 vs 系统自动判定」的差别。
+        "multimodal": "auto",
         "temperature": 0.7,
         "top_p": 1.0,
         "frequency_penalty": 0.0,
@@ -2842,6 +3542,26 @@ DEFAULT_SETTINGS = {
         "registry": {},      # {id: {version, enabled, source, sha256, installedAt, lastError}}
         "secrets": {},       # {id: {key: value}}，按插件命名空间隔离
     },
+    # 独立视觉模型（对齐桌面端 Cyrene-Agent 的 model-settings.vision 段）。
+    # 用途：主模型（本机是那台中转站）收不了图时，把图片交给另一个能收图的
+    # 端点转述成文字，再以文本形式进上下文。三个端点字段与主模型完全独立。
+    # 全部键都必须在 normalize_settings 里显式登记 —— 那个函数是白名单式的，
+    # 漏一个键就会在每次启动 / 每次前端保存设置时被静默抹回默认值（plugins
+    # 段当初就踩过这个坑，见上面的注释）。
+    "vision": {
+        "enabled": False,        # 总开关；关 = 整个子系统安静退场，不影响主链路
+        "api_base": "",          # 对应桌面端 vision.baseUrl
+        "api_key": "",           # 对应桌面端 vision.apiKey
+        "model": "",             # 对应桌面端 vision.model
+        # 上传图片时是否当场转述。默认 False = 严格按需：平时只把附件路径给她，
+        # 她想看时再调 read_image。开了就是「上传即转述一次」。
+        "autoCaption": False,
+        "request_timeout": 60,   # 视觉请求超时（秒）。比主模型的 120 短：
+                                 # 转述是附带动作，不该把整轮对话拖住。
+        "maxMb": 4,              # 单图传输上限（MB）。与 VISION_MAX_BYTES 同源。
+        "cacheTtlMin": 30,       # 描述缓存有效期（分钟），对齐桌面端 30 分钟。
+        "toolEnabled": True,     # 是否给 read_image / read_image_url 两个工具
+    },
 }
 
 
@@ -2873,6 +3593,90 @@ def normalize_typography(v):
     return out
 
 
+# 视觉段各键的取值范围：(下限, 上限, 默认值)。
+# 单独抽成表，是为了让「默认值」只有一个来源 —— 下面的 normalize 与
+# DEFAULT_SETTINGS 都从这里取，避免两处各写一份、改一处忘一处。
+VISION_RANGES = {
+    "request_timeout": (10, 300, 60),
+    "maxMb": (1, 16, 4),
+    "cacheTtlMin": (0, 1440, 30),
+}
+
+
+def normalize_vision(raw):
+    """归一化独立视觉模型配置。
+
+    这个函数与 normalize_plugins 的差别：这里全是**偏好设置**，不是用户数据，
+    所以走白名单式的回落语义 —— 缺项回落默认值，非法值夹回合法范围。
+    （plugins 段的 registry / secrets 反过来，绝不能回落，回落就是清空。）
+    """
+    v = raw if isinstance(raw, dict) else {}
+    out = {
+        "enabled": _as_bool(v.get("enabled"), False),
+        "autoCaption": _as_bool(v.get("autoCaption"), False),
+        "toolEnabled": _as_bool(v.get("toolEnabled"), True),
+        # api_base 去掉尾斜杠：拼 "/chat/completions" 时少一次踩坑
+        # （与 model.api_base 同一套处理）。
+        "api_base": _as_str(v.get("api_base"), "").strip().rstrip("/")[:500],
+        # api_key 不做长度截断 —— 截断会悄悄废掉一个 key，
+        # 用户看到的是「鉴权失败」而不是「配置被截断了」。
+        # 与 plugin secrets 的处理口径一致。
+        "api_key": _as_str(v.get("api_key"), ""),
+        "model": _as_str(v.get("model"), "")[:200],
+    }
+    for k, (lo, hi, fb) in VISION_RANGES.items():
+        # 整数键：maxMb 允许小数（1.5 MB 这种），但三个里只有它可能带小数，
+        # 统一按 float 夹再按需取整更省心 —— 这里全部保留数值语义，
+        # 前端展示与比较都不受影响。
+        n = _clamp(v.get(k), lo, hi, fb)
+        out[k] = int(n) if k in ("request_timeout", "cacheTtlMin") else round(n, 2)
+    return out
+
+
+def vision_cfg(key, fb=None):
+    """读单个视觉配置项。SETTINGS 未加载时回落默认值（与 plugins_cfg 同构）。
+
+    为什么要这个包装而不是到处 SETTINGS.get("vision", {}).get(...)：
+    SETTINGS 是模块级全局，在 load_settings() 跑之前访问会 NameError。
+    视觉子系统可能被早期调用（比如工具注册、路由判定），这层保护是必要的。
+    """
+    try:
+        return SETTINGS.get("vision", {}).get(key, fb)
+    except (NameError, AttributeError):
+        return fb
+
+
+def vision_ready():
+    """视觉通道是否可用：开关开着 + 三个端点字段齐（对齐桌面端三项齐全判据）。
+
+    只在「配置齐不齐」这一层下结论，不碰任何网络。真正的可用性由第一次
+    调用去证伪 —— 首页判定只负责把「肯定不行」的情况挡在门外。
+    """
+    if not vision_cfg("enabled", False):
+        return False
+    base = str(vision_cfg("api_base", "") or "").strip()
+    key = str(vision_cfg("api_key", "") or "").strip()
+    model = str(vision_cfg("model", "") or "").strip()
+    return bool(base and key and model)
+
+
+# 视觉工具 id。单独拎出来，是因为「给不给这两个工具」的判定要同时作用于
+# 三处：系统提示的工具清单（enabled_tools）、请求里的 tools 数组
+# （enabled_tool_names）、以及 /tools 面板的展示。写死字面量迟早会漏一处。
+VISION_TOOL_IDS = ("read_image", "read_image_url")
+
+
+def vision_tools_allowed():
+    """要不要把视觉工具摆给她。
+
+    判据只有 vision.toolEnabled 这一条（默认 True），**不要求端点已配好** ——
+    这是刻意的：端点没定时她仍能看到这两个工具，调了会拿到「请在设置 → 视觉
+    里配置」的可读提示。这比「工具时有时无」好：用户刚打开面板时能看见工具，
+    才知道有这么个能力存在，也才会去配。
+    """
+    return bool(vision_cfg("toolEnabled", True))
+
+
 def normalize_settings(raw):
     """把任意输入夹成合法结构。缺失项回落默认值，多余项丢弃。"""
     src = raw if isinstance(raw, dict) else {}
@@ -2898,6 +3702,11 @@ def normalize_settings(raw):
         "api_base": _as_str(mo.get("api_base"), d_mo["api_base"]).rstrip("/") or d_mo["api_base"],
         "api_key": _as_str(mo.get("api_key"), ""),
         "model": _as_str(mo.get("model"), d_mo["model"]),
+        # 三态枚举：认不出的值一律回落 auto（让原有的探测逻辑接手），
+        # 不落 on —— 免得一个错字就把「端点收不了图」的事实被静默推翻。
+        "multimodal": (mo.get("multimodal")
+                       if mo.get("multimodal") in ("auto", "on", "off")
+                       else d_mo["multimodal"]),
         "temperature": round(_clamp(mo.get("temperature"), 0, 2, d_mo["temperature"]), 3),
         "top_p": round(_clamp(mo.get("top_p"), 0.05, 1, d_mo["top_p"]), 3),
         "frequency_penalty": round(_clamp(mo.get("frequency_penalty"), -2, 2, 0), 3),
@@ -2952,6 +3761,7 @@ def normalize_settings(raw):
     out["reasoning"] = normalize_reasoning(src.get("reasoning"))
     out["agent"] = normalize_agent(src.get("agent"))
     out["plugins"] = normalize_plugins(src.get("plugins"))
+    out["vision"] = normalize_vision(src.get("vision"))
     return out
 
 
@@ -3237,7 +4047,9 @@ def load_prompt(name):
 def enabled_tools():
     """开关生效点 1/2：只有 enabled 的工具才进系统提示。"""
     t = SETTINGS.get("tools", {})
-    return {k: v for k, v in TOOLS.items() if t.get(k, True)}
+    allow_vision = vision_tools_allowed()
+    return {k: v for k, v in TOOLS.items()
+            if t.get(k, True) and (allow_vision or k not in VISION_TOOL_IDS)}
 
 
 def build_system_prompt(mode=None):
@@ -4569,9 +5381,11 @@ PLUGIN_READONLY_RISKS = frozenset({"safe", "fs-read"})
 
 # 桌面端 risk → 面板图标。内置工具在 TOOLS 里自带 icon，插件工具没有，
 # 补一个按风险级的默认图标，让工具面板不至于显示成 ⚙ 一片。
+# 风险等级 → 前端图标 id。前端 app.js 的 ICON_MAP 认得 risk_* 这组取值；
+# 认不出时会原样显示该字符串，不会留空白。
 PLUGIN_RISK_ICONS = {
-    "safe": "🧩", "fs-read": "🧩", "fs-write": "🧩",
-    "shell": "🧩", "network": "🧩", "input-control": "🧩",
+    "safe": "risk_safe", "fs-read": "risk_fs_read", "fs-write": "risk_fs_write",
+    "shell": "risk_shell", "network": "risk_network", "input-control": "risk_input",
 }
 
 
@@ -4633,7 +5447,7 @@ def plugin_tool_to_spec(plugin_id, tool):
 
     return {
         "desc": full_desc,
-        "icon": PLUGIN_RISK_ICONS.get(risk, "🧩"),
+        "icon": PLUGIN_RISK_ICONS.get(risk, "plugin"),
         "readonly": risk in PLUGIN_READONLY_RISKS,
         "risk": risk,
         "params": plugin_tool_params(tool.get("inputSchema") or {}),
@@ -7380,9 +8194,14 @@ def enabled_tool_names(mode=None):
     不传 mode 时不过滤（保持既有行为，验证脚本与单元测试依赖这一点）。
     """
     t = SETTINGS.get("tools", {})
+    allow_vision = vision_tools_allowed()
     out = []
     for n, spec in TOOLS.items():
         if not t.get(n, True):
+            continue
+        if not allow_vision and n in VISION_TOOL_IDS:
+            # 视觉工具总开关关掉时，连 tools 数组都不带它们 ——
+            # 只从系统提示里去掉是不够的：模型仍能从 tools 里看见并可调用。
             continue
         modes = spec.get("modes")
         if mode and isinstance(modes, list) and modes and mode not in modes:
@@ -7781,47 +8600,56 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
-<meta name="theme-color" content="#141414">
+<meta name="theme-color" content="#141414" id="meta-theme-color">
 <title>昔涟</title>
+<!-- 图标与形象素材对标桌面端 src/renderer/public/icons/ + avatars/ -->
+<link rel="icon" type="image/svg+xml" href="/static/icons/cyrene-avatar-line.svg">
+<link rel="alternate icon" type="image/png" href="/static/icons/mimi.png">
+<link rel="apple-touch-icon" href="/static/icons/mimi.png">
 <link rel="stylesheet" href="/static/hljs-theme.css">
 <link rel="stylesheet" href="/static/app.css">
 <link rel="stylesheet" href="/static/settings.css">
 </head>
 <body>
 
+<!--ICON_SPRITE-->
+
 <div id="sidebar">
   <div class="sidebar-header">
-    <h2>昔涟 ♪</h2>
-    <button id="new-chat-btn" type="button">+ 新对话</button>
-    <button id="sidebar-close" class="icon-btn" type="button" aria-label="关闭侧边栏">✕</button>
+    <div class="sidebar-brand">
+      <span class="sidebar-brand__avatar"><img src="/static/icons/cyrene-avatar-line.svg" alt=""></span>
+      <h2>昔涟</h2>
+    </div>
+    <button id="new-chat-btn" type="button"><svg class="ic ic--16"><use href="#ic-plus" xlink:href="#ic-plus"/></svg>新对话</button>
+    <button id="sidebar-close" class="icon-btn" type="button" aria-label="关闭侧边栏"><svg class="ic"><use href="#ic-x" xlink:href="#ic-x"/></svg></button>
   </div>
   <div id="session-list"></div>
   <div class="sidebar-footer">
     <div id="model-info"></div>
-    <button id="settings-btn" class="icon-btn" type="button" aria-label="打开设置" title="设置">⚙</button>
+    <button id="settings-btn" class="icon-btn" type="button" aria-label="打开设置" title="设置"><svg class="ic"><use href="#ic-settings" xlink:href="#ic-settings"/></svg></button>
   </div>
 </div>
 <div id="scrim"></div>
 
 <div id="main">
   <div id="topbar">
-    <button id="menu-btn" class="icon-btn" type="button" aria-label="打开侧边栏">☰</button>
+    <button id="menu-btn" class="icon-btn" type="button" aria-label="打开侧边栏"><svg class="ic"><use href="#ic-menu" xlink:href="#ic-menu"/></svg></button>
     <button id="mode-btn" type="button" aria-label="切换对话模式" aria-haspopup="true" aria-expanded="false">
-      <span id="mode-btn-icon">💬</span><span id="mode-btn-label">聊天</span><span class="mode-caret">▾</span>
+      <span id="mode-btn-icon"></span><span id="mode-btn-label">聊天</span><svg class="ic ic--16 mode-caret"><use href="#ic-chevron-down" xlink:href="#ic-chevron-down"/></svg>
     </button>
     <span class="title" id="chat-title">新对话</span>
     <span id="model-badge"></span>
-    <button id="top-settings-btn" class="icon-btn" type="button" aria-label="打开设置" title="设置">⚙</button>
+    <button id="top-settings-btn" class="icon-btn" type="button" aria-label="打开设置" title="设置"><svg class="ic"><use href="#ic-settings" xlink:href="#ic-settings"/></svg></button>
     <div id="status-dot"></div>
   </div>
   <div id="mode-menu" role="menu" aria-label="对话模式"></div>
   <div id="chat"></div>
   <div id="attach-bar"></div>
   <div id="input-bar">
-    <button id="attach-btn" type="button" aria-label="添加附件" title="添加附件">＋</button>
+    <button id="attach-btn" type="button" aria-label="添加附件" title="添加附件"><svg class="ic ic--20 ic--drawn"><use href="#ic-attach" xlink:href="#ic-attach"/></svg></button>
     <input id="attach-file" type="file" multiple hidden>
     <textarea id="input" placeholder="和昔涟说点什么..." rows="1" enterkeyhint="send"></textarea>
-    <button id="send-btn" type="button" aria-label="发送">➤</button>
+    <button id="send-btn" type="button" aria-label="发送"><svg class="ic ic--20"><use href="#ic-arrow-up" xlink:href="#ic-arrow-up"/></svg></button>
   </div>
 </div>
 
@@ -7830,7 +8658,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="settings-titlebar">
     <span class="settings-titlebar__title">设置</span>
     <span class="settings-titlebar__hint">昔涟 v8</span>
-    <button id="settings-close" class="icon-btn" type="button" aria-label="关闭设置">✕</button>
+    <button id="settings-close" class="icon-btn" type="button" aria-label="关闭设置"><svg class="ic"><use href="#ic-x" xlink:href="#ic-x"/></svg></button>
   </div>
   <nav class="settings-nav" id="settings-nav"></nav>
   <div class="settings-body" id="settings-body"></div>
@@ -8070,7 +8898,7 @@ class Handler(BaseHTTPRequestHandler):
     def _route_get(self, path):
         seg = self._seg(path)
         if path in ("/", "/index.html"):
-            self._html(HTML_PAGE)
+            self._html(render_index_html())
         elif path.startswith("/static/"):
             self._static(path[len("/static/"):])
         elif path == "/health":
@@ -8137,6 +8965,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"skills": self._skill_list()})
         elif path == "/plugins":
             self._json(self._plugin_overview())
+        elif path == "/vision/status":
+            self._json(self._vision_status())
         elif path == "/plugins/market":
             # ?refresh=1 强制刷新，绕过 5 分钟缓存
             q = urllib.parse.parse_qs(urlparse(self.path).query)
@@ -8168,6 +8998,17 @@ class Handler(BaseHTTPRequestHandler):
         s = json.loads(json.dumps(SETTINGS))
         m = s.get("model", {})
         m["api_key_set"] = bool(m.pop("api_key", ""))
+
+        # ⚠ 独立视觉模型的密钥同样要脱敏，理由与下面的插件密钥一模一样：
+        # 服务默认 bind 在局域网可达的地址上，不脱敏就是把凭据送给任何能打开
+        # 设置面板的人。
+        # 脱敏方式与 model 段保持一致（api_key → api_key_set 布尔）而不是用
+        # plugins 那套 "<set>" 占位符：vision 是偏好设置、不是用户数据，
+        # deep_merge_settings 走通用分支时 key 不在 DEFAULT_SETTINGS 里会被
+        # 直接丢弃（等价于「前端没改」），不需要占位符回传这一层。
+        vs = s.get("vision")
+        if isinstance(vs, dict):
+            vs["api_key_set"] = bool(vs.pop("api_key", ""))
 
         # ⚠ 插件密钥脱敏。s 是 SETTINGS 的全量深拷贝，plugins.secrets 里存的是
         # 插件通过 ctx.deps.secrets.set() 写入的真实凭据（OpenWeather key 之类）。
@@ -8229,7 +9070,7 @@ class Handler(BaseHTTPRequestHandler):
                 preview = ""
             params = spec.get("params") or {}
             out.append({
-                "id": tid, "desc": spec["desc"], "icon": spec.get("icon", "⚙"),
+                "id": tid, "desc": spec["desc"], "icon": spec.get("icon", "settings"),
                 "enabled": bool(t.get(tid, True)),
                 "readonly": bool(spec.get("readonly")),
                 "risk": spec.get("risk", "safe"),
@@ -8706,6 +9547,15 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_settings(body)
             return
 
+        # 独立视觉模型：自检与缓存清理。两条都是精确匹配的独立路径，
+        # 不会与上面的 /settings 或下面的 /plugins/* 相撞。
+        if path == "/vision/test":
+            self._handle_vision_test(body)
+            return
+        if path == "/vision/cache/clear":
+            self._json({"ok": True, "cleared": vision_cache_clear()})
+            return
+
         # ⚠ 顺序要紧：/tools/bulk 必须排在 /tools/{tid} 之前。
         # 反过来的话 seg=["tools","bulk"] 先命中 len==2 分支，被当成
         # 「开关一个叫 bulk 的工具」→ unknown tool → 404。
@@ -8892,6 +9742,117 @@ class Handler(BaseHTTPRequestHandler):
                     "toolCount": len(TOOLS)},
                    200 if ok else 500)
 
+    def _vision_status(self):
+        """独立视觉模型的运行态。**不回显 api_key**，只给「配没配」的布尔。
+
+        这个端点是给面板自检用的，也是真机验收的抓手：不调一次真实视觉请求
+        就能确认「配置读到了、路由判对了、缓存有多满」。
+        """
+        cfg = {
+            "enabled": bool(vision_cfg("enabled", False)),
+            "autoCaption": bool(vision_cfg("autoCaption", False)),
+            "toolEnabled": bool(vision_cfg("toolEnabled", True)),
+            "api_base": str(vision_cfg("api_base", "") or ""),
+            "api_key_set": bool(str(vision_cfg("api_key", "") or "").strip()),
+            "model": str(vision_cfg("model", "") or ""),
+            "request_timeout": vision_cfg("request_timeout", 60),
+            "maxMb": vision_cfg("maxMb", 4),
+            "cacheTtlMin": vision_cfg("cacheTtlMin", 30),
+        }
+        route = resolve_image_route("attachment")
+        # ⚠ caption 模式下 route 里带的 config **含 api_key 明文**。
+        # 这个端点是要回给浏览器的，不能原样吐出去 —— 只留 mode 与
+        # 「端点配没配」这个事实，配置细节由上面的 cfg 段（已脱敏）表达。
+        safe_route = {"mode": route.get("mode")}
+        if route.get("reason"):
+            safe_route["reason"] = route["reason"]
+        if route.get("config"):
+            safe_route["config"] = {
+                "api_base": route["config"].get("api_base", ""),
+                "model": route["config"].get("model", ""),
+                "api_key_set": bool(route["config"].get("api_key")),
+            }
+        last = dict(VISION_LAST) if VISION_LAST else None
+        if last and last.get("at"):
+            # 人读的时间戳比 epoch 秒有用得多
+            last["atText"] = time.strftime("%Y-%m-%d %H:%M:%S",
+                                           time.localtime(last["at"]))
+        try:
+            mm = SETTINGS.get("model", {}).get("multimodal", "auto")
+        except (NameError, AttributeError):
+            mm = "auto"
+        self._json({
+            "config": cfg,
+            "ready": vision_ready(),
+            "route": safe_route,
+            "multimodal": mm,
+            "multimodalEnabled": multimodal_enabled(),
+            "visionSupported": VISION_SUPPORTED,   # None/True/False 三态原样给
+            "cache": {"count": vision_cache_count(), "max": VISION_CAPTION_CACHE_MAX},
+            "maxBytes": vision_max_bytes(),
+            "last": last,
+            "tools": {t: (t in TOOLS) for t in VISION_TOOL_IDS},
+        })
+
+    def _handle_vision_test(self, body):
+        """POST /vision/test：当场跑一次转述，把结果与错误原文一起回显。
+
+        支持两种入参（对齐两个工具）：
+          {"path": "..."}   本地图片路径（走 guard_path，限制在 FS_ROOT 内）
+          {"url": "..."}    公网图片地址
+          {"id": "..."}     已上传附件的 id（面板选文件后最顺手的传法）
+        还可以带 {"question": "..."} 让她重点看某处。
+
+        这个端点**不做后台 job**：转述是单次请求、有超时兜底，同步返回的
+        信息最完整（进度轮询反而让面板多一层状态机）。超时由
+        vision.request_timeout 控制，最长 300 秒。
+        """
+        b = body if isinstance(body, dict) else {}
+        question = str(b.get("question") or "").strip()[:500]
+
+        source = None
+        kind = ""
+        if b.get("id"):
+            p = resolve_upload(str(b["id"]))
+            if p is None:
+                self._json({"ok": False, "error": "(认不出这个附件 id，可能已过期)"}, 400)
+                return
+            source, kind = {"path": p}, "path"
+        elif b.get("path"):
+            try:
+                p = guard_path(b["path"], want="file")
+            except PathGuardError as e:
+                self._json({"ok": False, "error": str(e)}, 400)
+                return
+            source, kind = {"path": p}, "path"
+        elif b.get("url"):
+            url = str(b["url"]).strip()
+            if not re.match(r"^https?://", url, re.I):
+                self._json({"ok": False, "error": "(url 必须以 http:// 或 https:// 开头)"}, 400)
+                return
+            source, kind = {"url": url}, "url"
+        else:
+            self._json({"ok": False,
+                        "error": "(缺少图片来源。传 path / url / id 之一)"}, 400)
+            return
+
+        ok, conf = resolve_caption_vision_config()
+        if not ok:
+            self._json({"ok": False, "configured": False, "error": str(conf)}, 400)
+            return
+
+        text = caption_image(source, question, cfg=(ok, conf))
+        failed = isinstance(text, str) and text.startswith("[错误")
+        self._json({
+            "ok": not failed,
+            "configured": True,
+            "source": kind,
+            "model": conf.get("model", ""),
+            "chars": len(text) if isinstance(text, str) else 0,
+            "text": text,
+            "last": dict(VISION_LAST) if VISION_LAST else None,
+        }, 200 if not failed else 502)
+
     def _handle_settings(self, body):
         with SETTINGS_LOCK:
             merged = deep_merge_settings(SETTINGS, body)
@@ -9032,14 +9993,56 @@ class Handler(BaseHTTPRequestHandler):
         # 历史里更早的附件不再重传 —— 它们的路径已经写在各自 content 里，
         # 每次都把 base64 拖上会把请求体撑成几十 MB。
         # 只在首轮注入，靠 run_agent_loop 的 first_turn 还原，见那里的说明。
+        #
+        # 走的是统一图片路由（三态），不再自己判 VISION_SUPPORTED：
+        #   direct  → 原来的 base64 直传（主模型能收图时）
+        #   caption → 主模型收不了图：按 autoCaption 决定「当场转述」还是「只给路径」
+        #   reject  → 两边都不行，写明原因，别让她以为看见了
         vision_skipped = []
-        if atts and VISION_SUPPORTED is not False and history:
+        vision_note = ""
+        if atts and history and history[-1].get("role") == "user":
             img_atts = [a for a in atts if a.get("isImage")]
             if img_atts:
-                content, vision_skipped = build_vision_content(
-                    history[-1].get("content", ""), img_atts)
-                if len(content) > 1:              # 真有图进来了才替换
-                    history[-1] = {"role": "user", "content": content}
+                route = resolve_image_route("attachment")
+                rmode = route.get("mode")
+                if rmode == IMAGE_ROUTE_DIRECT:
+                    content, vision_skipped = build_vision_content(
+                        history[-1].get("content", ""), img_atts)
+                    if len(content) > 1:              # 真有图进来了才替换
+                        history[-1] = {"role": "user", "content": content}
+                elif rmode == IMAGE_ROUTE_CAPTION:
+                    if vision_cfg("autoCaption", False):
+                        # 自动转述：上传时当场看一遍。默认不开 —— 多花一次
+                        # 视觉调用，且图片多时体感变慢，所以交给用户开关。
+                        lines = []
+                        for a in img_atts:
+                            p = resolve_upload(a["id"])
+                            if p is None:
+                                vision_skipped.append(a["name"])
+                                continue
+                            desc = caption_image({"path": p}, "", cfg=(True, route["config"]))
+                            if desc.startswith("[错误"):
+                                # 转述失败也要写进上下文：她据此如实说看不了，
+                                # 而不是对着一张没看见的图编内容
+                                lines.append(f"- {a['name']}：{desc}")
+                            else:
+                                lines.append(f"- {a['name']}：\n{desc}")
+                        if lines:
+                            vision_note = ("\n\n〔独立视觉模型转述〕\n" + "\n".join(lines))
+                    else:
+                        # 按需模式（默认）：只给提示，她想看时自己调 read_image。
+                        # 这样省一次视觉调用，也把「要不要看图」的决定权留给她。
+                        vision_note = (
+                            "\n\n〔图片说明〕当前主模型不能直接收图，图片已落盘。"
+                            "需要看内容就用 read_image（传上面的路径）——"
+                            "不要说你看不到图、也不要凭文件名猜内容。")
+                else:
+                    # reject：统一路由给出的、面向用户的说明
+                    vision_note = ("\n\n〔图片说明〕" + str(route.get("reason") or IMAGE_REJECT_REASON)
+                                   + "（图片已落盘，路径见上）")
+            if vision_note:
+                history[-1] = {"role": "user",
+                               "content": history[-1].get("content", "") + vision_note}
 
         mode_allows_tools = MODES[mode].get("tools", False)
         show_steps = agent_cfg("showSteps")

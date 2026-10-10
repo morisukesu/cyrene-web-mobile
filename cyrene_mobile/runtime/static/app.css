@@ -27,6 +27,11 @@
   --app-h:100vh; --app-h:100dvh;
   --safe-b:env(safe-area-inset-bottom,0px);
   --safe-t:env(safe-area-inset-top,0px);
+  /* 图标尺寸三档。图标全部走 <svg class="ic"><use href="#ic-xxx"/></svg>，
+     颜色由 CSS color 驱动（sprite 里 stroke 已是 currentColor）。 */
+  --ic-16:16px; --ic-18:18px; --ic-20:20px;
+  /* 头像直径。消息流与思考行共用同一个口径，改一处即可整体缩放。 */
+  --cy-avatar:32px;
 }
 
 /* ===== charcoal-pink（暗色，默认） ===== */
@@ -108,10 +113,46 @@ body{
   overscroll-behavior:none;transition:background .2s,color .2s;
 }
 button,input,select,textarea{font-family:inherit;letter-spacing:inherit}
-::-webkit-scrollbar{width:6px;height:6px}
-::-webkit-scrollbar-thumb{background:var(--rb-scroll-thumb);border-radius:3px}
-::-webkit-scrollbar-thumb:hover{background:var(--rb-scroll-thumb-hover)}
+/* 滚动条口径见下方「全局口径」段，这里不再重复定义 */
 ::selection{color:var(--rb-selection-fg);background:var(--rb-selection-bg)}
+
+/* ===== 全局口径（各只定义一次，别在局部重复写） ===== */
+/* 1. 滚动条：竖横一致，浅淡不抢视线 */
+*::-webkit-scrollbar{width:6px;height:6px}
+*::-webkit-scrollbar-track{background:transparent}
+*::-webkit-scrollbar-thumb{background:var(--rb-scroll-thumb);border-radius:3px}
+*::-webkit-scrollbar-thumb:hover{background:var(--rb-scroll-thumb-hover)}
+*{scrollbar-width:thin;scrollbar-color:var(--rb-scroll-thumb) transparent}
+/* 2. 键盘焦点环：只在键盘导航时出现，触摸点击不弹 */
+:focus{outline:none}
+:focus-visible{
+  outline:2px solid var(--rb-border-focus);
+  outline-offset:2px;border-radius:var(--rb-radius-sm);
+}
+/* 3. 禁用态：统一透明度口径 */
+button:disabled,[aria-disabled="true"]{cursor:not-allowed}
+
+/* ===== 图标基类 =====
+   图标 = sprite 里的 <symbol>，用法：
+     <svg class="ic"><use href="#ic-menu" xlink:href="#ic-menu"/></svg>
+   sprite 的 stroke 已是 currentColor，所以颜色只靠 color 控制；
+   主题切换、hover、禁用态一律不用另做。 */
+.ic{
+  width:var(--ic-18);height:var(--ic-18);flex-shrink:0;
+  display:inline-block;vertical-align:-.15em;
+  fill:none;stroke:currentColor;
+  stroke-width:2;stroke-linecap:round;stroke-linejoin:round;
+  pointer-events:none;
+}
+.ic--16{width:var(--ic-16);height:var(--ic-16)}
+.ic--20{width:var(--ic-20);height:var(--ic-20)}
+/* 自绘图标是 48×48 画布、stroke-width 4，等效视觉粗细与 lucide 24/2 一致，
+   但 viewBox 更大，缩放后描边略细，这里补偿一档。 */
+.ic--drawn{stroke-width:4}
+/* 空图标位在 sprite 缺失时不该占出错位 */
+.ic:empty{display:none}
+.icon-btn .ic,.btn .ic{stroke-width:2}
+.icon-btn{line-height:1}
 
 /* ===== 侧边栏 ===== */
 #sidebar{
@@ -120,50 +161,84 @@ button,input,select,textarea{font-family:inherit;letter-spacing:inherit}
   transition:transform .25s ease,background .2s;
 }
 #sidebar.hidden{transform:translateX(-100%);margin-left:-264px}
+/* 标题栏：头像 + 名称是一组，新对话按钮独立在右侧 */
 .sidebar-header{
   padding:calc(12px + var(--safe-t)) 12px 12px;border-bottom:1px solid var(--rb-border-subtle);
-  display:flex;align-items:center;gap:8px;
+  display:flex;align-items:center;gap:9px;
 }
-.sidebar-header h2{font-size:17px;color:var(--rb-accent);font-weight:600;flex:1;white-space:nowrap}
+.sidebar-brand{
+  display:flex;align-items:center;gap:9px;flex:1;min-width:0;
+}
+.sidebar-brand__avatar{
+  width:32px;height:32px;border-radius:50%;flex-shrink:0;
+  background:var(--rb-bg-2);border:1px solid var(--rb-border-default);
+  display:flex;align-items:center;justify-content:center;overflow:hidden;
+}
+.sidebar-brand__avatar img{
+  width:26px;height:26px;display:block;object-fit:contain;
+}
+.sidebar-header h2{
+  font-size:16px;color:var(--rb-text-primary);font-weight:600;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:0;
+}
 #new-chat-btn{
   background:var(--rb-accent);color:var(--rb-text-on-accent);border:none;
-  border-radius:var(--rb-radius-md);padding:0 13px;height:36px;cursor:pointer;
+  border-radius:var(--rb-radius-md);padding:0 12px;height:34px;cursor:pointer;
   font-size:13px;font-weight:600;box-shadow:var(--rb-shadow-bubble-accent);flex-shrink:0;
+  display:inline-flex;align-items:center;gap:5px;
+  transition:background .15s,transform .1s;
 }
-#new-chat-btn:active{background:var(--rb-accent-hover)}
+#new-chat-btn:active{background:var(--rb-accent-hover);transform:scale(.96)}
 .icon-btn{
   width:36px;height:36px;border:none;background:none;cursor:pointer;flex-shrink:0;
-  color:var(--rb-text-secondary);font-size:18px;border-radius:var(--rb-radius-sm);
+  color:var(--rb-text-secondary);border-radius:var(--rb-radius-sm);
   display:flex;align-items:center;justify-content:center;
+  transition:background .15s,color .15s,transform .1s;
 }
 .icon-btn:hover{background:var(--rb-surface-hover);color:var(--rb-text-primary)}
+.icon-btn:active{transform:scale(.9)}
 #sidebar-close{display:none}
 #session-list{flex:1;overflow-y:auto;padding:8px;-webkit-overflow-scrolling:touch}
 .session-item{
+  position:relative;
   padding:0 8px 0 12px;min-height:44px;border-radius:var(--rb-radius-lg);cursor:pointer;
   margin-bottom:4px;color:var(--rb-text-secondary);font-size:14px;
-  display:flex;justify-content:space-between;align-items:center;gap:6px;transition:background .15s;
+  display:flex;justify-content:space-between;align-items:center;gap:6px;
+  transition:background .15s,color .15s;
+}
+/* 选中项左侧强调条：用伪元素，不占布局 */
+.session-item.active::before{
+  content:'';position:absolute;left:3px;top:50%;transform:translateY(-50%);
+  width:3px;height:18px;border-radius:2px;background:var(--rb-accent);
 }
 .session-item .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .session-item:hover{background:var(--rb-surface-hover);color:var(--rb-text-primary)}
+.session-item:active{background:var(--rb-surface-active)}
 .session-item.active{
   background:var(--rb-surface-active);color:var(--rb-text-primary);
-  box-shadow:0 1px 5px rgb(0 0 0 / 12%);
+  box-shadow:0 1px 5px rgb(0 0 0 / 12%);font-weight:500;
 }
 .session-item .del{
   color:var(--rb-text-disabled);cursor:pointer;flex-shrink:0;
   width:36px;height:36px;display:flex;align-items:center;justify-content:center;
-  border-radius:var(--rb-radius-sm);font-size:15px;
+  border-radius:var(--rb-radius-sm);
 }
 .session-item .del:hover,.session-item .del:active{
   color:var(--rb-danger);background:color-mix(in srgb,var(--rb-danger) 14%,transparent);
 }
-.session-empty{padding:20px 12px;text-align:center;color:var(--rb-text-disabled);font-size:13px}
+.session-empty{
+  padding:34px 16px 26px;text-align:center;color:var(--rb-text-disabled);font-size:13px;
+  display:flex;flex-direction:column;align-items:center;gap:10px;
+}
+.session-empty img{
+  width:64px;height:64px;display:block;object-fit:contain;
+  opacity:.55;user-select:none;-webkit-user-drag:none;
+}
 .sidebar-footer{
   padding:8px 10px calc(8px + var(--safe-b));border-top:1px solid var(--rb-border-subtle);
-  font-size:12px;color:var(--rb-text-disabled);display:flex;align-items:center;gap:6px;
+  font-size:11.5px;color:var(--rb-text-disabled);display:flex;align-items:center;gap:6px;
 }
-#model-info{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#model-info{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:.2px}
 #scrim{display:none}
 
 /* ===== 主区 ===== */
@@ -172,18 +247,21 @@ button,input,select,textarea{font-family:inherit;letter-spacing:inherit}
   padding:calc(8px + var(--safe-t)) 12px 8px;background:var(--rb-surface-workspace);
   border-bottom:1px solid var(--rb-border-default);display:flex;align-items:center;gap:8px;flex-shrink:0;
 }
-#menu-btn{width:40px;height:40px;font-size:19px;border-radius:var(--rb-radius-md)}
-/* ---- 模式切换器 ---- */
+/* 顶栏：图标按钮统一 40×40，间距以 8px 为基线 */
+#menu-btn{width:40px;height:40px;border-radius:var(--rb-radius-md)}
+/* ---- 模式切换器（有边界的胶囊控件） ---- */
 #mode-btn{
-  display:flex;align-items:center;gap:5px;height:34px;padding:0 10px;flex-shrink:0;
+  display:flex;align-items:center;gap:6px;height:34px;padding:0 11px;flex-shrink:0;
   background:var(--rb-surface-elevated);border:1px solid var(--rb-border-default);
-  border-radius:var(--rb-radius-md);color:var(--rb-text-primary);cursor:pointer;
-  font-size:13px;font-weight:600;transition:background .15s,border-color .15s;
+  border-radius:var(--rb-radius-full);color:var(--rb-text-primary);cursor:pointer;
+  font-size:13px;font-weight:600;letter-spacing:0;
+  transition:background .15s,border-color .15s,transform .1s;
 }
 #mode-btn:hover{background:var(--rb-surface-hover);border-color:var(--rb-accent)}
+#mode-btn:active{transform:scale(.97)}
 #mode-btn[aria-expanded="true"]{border-color:var(--rb-accent);background:var(--rb-surface-hover)}
-#mode-btn-icon{font-size:15px;line-height:1}
-.mode-caret{font-size:9px;color:var(--rb-text-disabled);transition:transform .18s}
+#mode-btn-icon{display:inline-flex;align-items:center;line-height:1;color:var(--rb-accent)}
+.mode-caret{color:var(--rb-text-disabled);transition:transform .18s,color .18s}
 #mode-btn[aria-expanded="true"] .mode-caret{transform:rotate(180deg);color:var(--rb-accent)}
 #mode-menu{
   position:absolute;top:calc(8px + var(--safe-t) + 44px);left:56px;z-index:120;
@@ -195,12 +273,18 @@ button,input,select,textarea{font-family:inherit;letter-spacing:inherit}
 #mode-menu.open{display:block;animation:modeIn .14s ease-out}
 @keyframes modeIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
 .mode-item{
-  display:flex;align-items:flex-start;gap:9px;padding:9px 10px;cursor:pointer;
+  display:flex;align-items:flex-start;gap:10px;padding:9px 10px;cursor:pointer;
   border-radius:var(--rb-radius-md);transition:background .12s;
 }
 .mode-item:hover{background:var(--rb-surface-hover)}
+.mode-item:active{background:var(--rb-surface-active)}
 .mode-item.current{background:var(--rb-surface-active)}
-.mode-item-icon{font-size:17px;line-height:1.25;flex-shrink:0}
+.mode-item-icon{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:20px;height:20px;flex-shrink:0;margin-top:1px;
+  color:var(--rb-text-secondary);
+}
+.mode-item.current .mode-item-icon{color:var(--rb-accent)}
 .mode-item-text{flex:1;min-width:0}
 .mode-item-label{font-size:13.5px;font-weight:600;color:var(--rb-text-primary);line-height:1.3}
 .mode-item.current .mode-item-label{color:var(--rb-accent)}
@@ -208,15 +292,17 @@ button,input,select,textarea{font-family:inherit;letter-spacing:inherit}
   font-size:11.5px;color:var(--rb-text-secondary);line-height:1.45;margin-top:2px;
   overflow-wrap:anywhere;
 }
-.mode-item-check{color:var(--rb-accent);font-size:13px;font-weight:700;flex-shrink:0;line-height:1.4}
+.mode-item-check{color:var(--rb-accent);flex-shrink:0;display:inline-flex;line-height:1.4}
+/* 标题与模型徽标分层：标题是主信息，徽标退到弱化色 */
 #topbar .title{
   font-size:15px;color:var(--rb-text-primary);font-weight:600;flex:1;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
 #model-badge{
-  font-size:11px;color:var(--rb-text-secondary);background:var(--rb-bg-2);
-  padding:3px 10px;border-radius:var(--rb-radius-full);border:1px solid var(--rb-border-subtle);
+  font-size:10.5px;color:var(--rb-text-secondary);background:var(--rb-bg-2);
+  padding:3px 9px;border-radius:var(--rb-radius-full);border:1px solid var(--rb-border-subtle);
   max-width:30vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex-shrink:0;
+  letter-spacing:.2px;
 }
 #status-dot{
   width:8px;height:8px;border-radius:50%;background:var(--rb-success);flex-shrink:0;transition:background .2s;
@@ -227,13 +313,20 @@ button,input,select,textarea{font-family:inherit;letter-spacing:inherit}
 
 /* ===== 聊天 ===== */
 #chat{flex:1;overflow-y:auto;padding:16px 14px;-webkit-overflow-scrolling:touch}
-.msg-row{display:flex;margin-bottom:14px;gap:9px;align-items:flex-start}
+.msg-row{display:flex;margin-bottom:14px;gap:10px;align-items:flex-start}
 .msg-row.user{justify-content:flex-end}
-.msg-row.cont{margin-top:-8px}
+/* 连续消息（同一人分段）收紧间距，视觉上仍是一段话 */
+.msg-row.cont{margin-top:-9px}
 .avatar{
-  width:32px;height:32px;border-radius:50%;flex-shrink:0;
-  display:flex;align-items:center;justify-content:center;font-size:14px;
-  background:var(--rb-bg-2);color:var(--rb-pink-600);
+  width:var(--cy-avatar,32px);height:var(--cy-avatar,32px);border-radius:50%;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;
+  background:var(--rb-bg-2);color:var(--rb-text-secondary);
+  border:1px solid var(--rb-border-subtle);overflow:hidden;
+}
+/* 昔涟侧头像放桌面端同一份线稿形象 */
+.avatar__img{
+  width:calc(var(--cy-avatar,32px) - 6px);height:calc(var(--cy-avatar,32px) - 6px);
+  display:block;object-fit:contain;user-select:none;-webkit-user-drag:none;
 }
 .avatar.user{background:var(--rb-surface-active);color:var(--rb-text-secondary)}
 .msg-row.cont .avatar{visibility:hidden}
@@ -255,6 +348,16 @@ button,input,select,textarea{font-family:inherit;letter-spacing:inherit}
   border-bottom-right-radius:var(--rb-radius-xs);box-shadow:var(--rb-shadow-bubble-accent);
   white-space:pre-wrap;
 }
+/* 消息进入动效：淡入 + 轻微上移。 */
+@keyframes msgIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.msg-row{animation:msgIn .18s ease-out}
+/* 尊重系统的减弱动效偏好 */
+@media (prefers-reduced-motion:reduce){
+  .msg-row{animation:none}
+  .dots span,#status-dot.thinking{animation:none}
+  #mode-menu.open{animation:none}
+  .reasoning-caret{transition:none}
+}
 /* 失败轮次的错误气泡：与正文气泡区分开，不走 Markdown，带重试按钮 */
 .bubble.bot.bubble--error{
   background:color-mix(in srgb,var(--rb-danger) 9%,var(--rb-surface-elevated));
@@ -265,21 +368,26 @@ button,input,select,textarea{font-family:inherit;letter-spacing:inherit}
 .err-box__text{
   font-size:12.5px;line-height:1.55;color:var(--rb-danger);
   font-family:var(--rb-font-mono);letter-spacing:0;overflow-wrap:anywhere;
+  display:flex;align-items:flex-start;gap:6px;
 }
+.err-box__text .ic{margin-top:2px;flex-shrink:0}
 .err-box__acts{display:flex;gap:8px}
 .err-box__acts .btn{
   border-color:color-mix(in srgb,var(--rb-danger) 45%,transparent);
   color:var(--rb-danger);
 }
+/* 工具信息块：三类块里权重最低（正文 > 思考 > 工具），所以弱化配色、收窄内边距 */
 .tool-info{
-  margin-top:9px;padding:8px 11px;background:var(--rb-bg-0);
-  border-radius:var(--rb-radius-md);font-size:12px;color:var(--rb-pink-200);
+  margin-top:9px;padding:7px 10px;background:var(--rb-bg-0);
+  border-radius:var(--rb-radius-md);font-size:11.5px;color:var(--rb-text-secondary);
   font-family:var(--rb-font-mono);letter-spacing:0;line-height:1.55;
-  border:1px solid var(--rb-border-default);border-left:3px solid var(--rb-accent);
+  border:1px solid var(--rb-border-subtle);
   white-space:pre-wrap;overflow-wrap:anywhere;
+  display:flex;flex-wrap:wrap;align-items:flex-start;gap:4px;
 }
+.tool-info .ic{color:var(--rb-text-disabled);margin-top:2px}
 .reasoning-block{
-  margin:0 0 9px;border:1px solid var(--rb-border-default);
+  margin:0 0 9px;border:1px solid var(--rb-border-subtle);
   border-radius:var(--rb-radius-md);overflow:hidden;background:var(--rb-bg-0);
 }
 .reasoning-head{
@@ -287,7 +395,9 @@ button,input,select,textarea{font-family:inherit;letter-spacing:inherit}
   font-size:12.5px;color:var(--rb-text-secondary);user-select:none;
 }
 .reasoning-head:hover{color:var(--rb-text-primary)}
-.reasoning-caret{display:inline-block;font-size:10px;transition:transform .18s}
+.reasoning-head .ic{color:var(--rb-text-disabled)}
+.reasoning-label{display:inline-flex;align-items:center;gap:5px}
+.reasoning-caret{display:inline-flex;transition:transform .18s}
 .reasoning-block.open .reasoning-caret{transform:rotate(90deg)}
 .reasoning-body{
   display:none;padding:8px 11px 9px;font-size:13px;line-height:1.6;
@@ -379,33 +489,39 @@ button,input,select,textarea{font-family:inherit;letter-spacing:inherit}
 .md-fallback{white-space:pre-wrap}
 
 /* ===== 输入区 ===== */
+/* 三件套（附件 / 输入框 / 发送）统一 44px 高、同一圆角口径，基线对齐 */
 #input-bar{
   padding:10px 12px calc(10px + var(--safe-b));background:var(--rb-surface-workspace);
-  border-top:1px solid var(--rb-border-default);display:flex;gap:9px;align-items:flex-end;flex-shrink:0;
+  border-top:1px solid var(--rb-border-default);display:flex;gap:8px;align-items:flex-end;flex-shrink:0;
 }
+#attach-btn,#send-btn{width:44px;height:44px;border-radius:var(--rb-radius-lg)}
 #attach-btn{
-  width:44px;height:44px;flex-shrink:0;cursor:pointer;
-  border:1px solid var(--rb-border-default);border-radius:var(--rb-radius-lg);
+  flex-shrink:0;cursor:pointer;
+  border:1px solid var(--rb-border-default);
   background:var(--rb-surface-elevated);color:var(--rb-text-secondary);
-  font-size:19px;line-height:1;display:flex;align-items:center;justify-content:center;
+  line-height:1;display:flex;align-items:center;justify-content:center;
+  transition:background .15s,color .15s,border-color .15s,transform .1s;
 }
 #attach-btn:hover{background:var(--rb-surface-hover);color:var(--rb-accent);
   border-color:var(--rb-accent)}
+#attach-btn:active{transform:scale(.94)}
 #input{
   flex:1;padding:11px 14px;border-radius:var(--rb-radius-lg);
   border:1px solid var(--rb-input-border);background:var(--rb-input-bg);color:var(--rb-input-text);
   font-size:16px;line-height:1.5;outline:none;resize:none;
   min-height:44px;max-height:140px;
+  transition:border-color .15s,box-shadow .15s;
 }
 #input:focus{border-color:var(--rb-border-focus);box-shadow:var(--rb-shadow-control-focus)}
 #input::placeholder{color:var(--rb-input-placeholder)}
 #send-btn{
   background:var(--rb-accent);color:var(--rb-text-on-accent);border:none;
-  border-radius:var(--rb-radius-lg);width:44px;height:44px;cursor:pointer;
-  font-size:18px;flex-shrink:0;display:flex;align-items:center;justify-content:center;
+  cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;
   box-shadow:var(--rb-shadow-bubble-accent);
+  transition:background .15s,transform .1s,opacity .15s;
 }
 #send-btn:hover:not(:disabled){background:var(--rb-accent-hover)}
+#send-btn:active:not(:disabled){transform:scale(.94)}
 #send-btn:disabled{opacity:.4;cursor:default}
 #send-btn.cancel{
   background:var(--rb-bg-3);color:var(--rb-danger);box-shadow:none;
@@ -426,7 +542,7 @@ button,input,select,textarea{font-family:inherit;letter-spacing:inherit}
   font-size:12px;color:var(--rb-text-secondary);
 }
 .attach-chip--img{border-color:var(--rb-accent)}
-.attach-chip__ic{flex-shrink:0;font-size:13px;line-height:1}
+.attach-chip__ic{flex-shrink:0;display:inline-flex;align-items:center;line-height:1;color:var(--rb-text-secondary)}
 .attach-chip__name{
   min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   color:var(--rb-text-primary);

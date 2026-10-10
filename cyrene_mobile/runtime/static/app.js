@@ -7,6 +7,101 @@
 'use strict';
 
 var $ = function (id) { return document.getElementById(id); };
+
+/* ================= 图标 =================
+   图标全部来自 index 里内联的 sprite（<symbol id="ic-*">），来源是
+   lucide-static 与桌面端自绘 SVG。sprite 的 stroke 已是 currentColor，
+   所以颜色只由 CSS 的 color 决定 —— 主题切换、hover、禁用态都不用另做。
+
+   用 DOM 构造而不是 innerHTML：这些图标名有一部分来自后端数据
+   （/tools、/modes 的 icon 字段），拼字符串会开一个注入面。
+   全部走 createElementNS + setAttribute，名字只作 attribute 值使用。 */
+var SVG_NS = 'http://www.w3.org/2000/svg';
+var XLINK_NS = 'http://www.w3.org/1999/xlink';
+
+/* 后端 icon 取值 → sprite symbol 名。
+   未命中时 iconFor 返回 null，调用方回退为原样文本。 */
+var ICON_MAP = {
+  /* 模式 */
+  chat: 'chat', work: 'work', code: 'code', learn: 'learn',
+  /* 工具：设备 */
+  battery: 'battery', camera: 'camera', tts: 'volume', notify: 'bell',
+  vibrate: 'vibrate', torch: 'flashlight', location: 'map-pin',
+  clipboard_set: 'clipboard-copy', clipboard_get: 'clipboard',
+  wifi_info: 'wifi', brightness: 'sun',
+  /* 工具：命令与文件 */
+  run_shell: 'terminal', shell_job: 'satellite',
+  read_file: 'book-text', write_file: 'file-pen', edit_file: 'scissors',
+  glob_files: 'search', grep_files: 'search', list_dir: 'folder',
+  /* 工具：联网 */
+  web_search: 'globe', fetch_url: 'doc', download_file: 'download',
+  /* 工具：交互 */
+  update_todo: 'list-todo', ask_user: 'help', invoke_skill: 'sparkles',
+  read_skill_reference: 'clip', read_tool_result: 'history',
+  /* 插件风险等级 */
+  risk_safe: 'check', risk_low: 'info', risk_medium: 'warn',
+  risk_high: 'warn', risk_shell: 'terminal', risk_network: 'globe',
+  risk_fs_read: 'book-text', risk_fs_write: 'file-pen',
+  risk_input: 'user', plugin: 'puzzle'
+};
+
+function iconFor(name) {
+  if (!name) return null;
+  return ICON_MAP[name] || null;
+}
+
+/* 造一个 <svg class="ic"><use href="#ic-xxx"/></svg> */
+function iconEl(symbol, size) {
+  if (!symbol) return null;
+  var svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('class', 'ic' + (size === 16 ? ' ic--16' : size === 20 ? ' ic--20' : ''));
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  var use = document.createElementNS(SVG_NS, 'use');
+  var href = '#ic-' + symbol;
+  use.setAttribute('href', href);
+  use.setAttributeNS(XLINK_NS, 'xlink:href', href);
+  svg.appendChild(use);
+  return svg;
+}
+
+/* 用图标替换元素内容。
+   symbol 为空时保留原文本，绝不把内容清空 —— 拿不到图标也不该丢信息。 */
+function setIcon(el, symbol, size) {
+  if (!el) return false;
+  var svg = iconEl(symbol, size);
+  if (!svg) return false;
+  el.textContent = '';
+  el.appendChild(svg);
+  return true;
+}
+
+/* 骨架屏：异步面板首次加载时的占位，替代一句「加载中…」造成的空列表闪烁。
+   返回一个可直接 append 的容器；加载完成时调用方把容器清掉或整体替换即可。 */
+function skeletonEl(rows) {
+  var box = document.createElement('div');
+  box.className = 'skeleton';
+  var n = rows || 3;
+  for (var i = 0; i < n; i++) {
+    var r = document.createElement('div');
+    r.className = 'skeleton__row' + (i === 0 ? ' skeleton__row--lg' : '');
+    box.appendChild(r);
+  }
+  return box;
+}
+
+/* 后端 icon 取值 → 元素内容：能映射就上图标，映射不了就原文显示（不丢信息）。 */
+function renderBackendIcon(el, rawValue, size) {
+  if (!el) return;
+  var symbol = iconFor(rawValue);
+  if (symbol && setIcon(el, symbol, size)) {
+    el.classList.add('has-ic');
+    return;
+  }
+  el.classList.remove('has-ic');
+  el.textContent = rawValue == null ? '' : String(rawValue);
+}
+
 var chat = $('chat'), input = $('input'), sendBtn = $('send-btn'),
     sidebar = $('sidebar'), scrim = $('scrim'), sessionList = $('session-list'),
     statusDot = $('status-dot'), modelBadge = $('model-badge'),
@@ -235,7 +330,8 @@ input.addEventListener('keydown', function (e) {
    上限与后端 UPLOAD_MAX_MB 保持一致，这里是早拦截，后端还会再查一遍。 */
 var ATTACH_MAX_MB = 16;
 var ATTACH_MAX_COUNT = 8;
-var CHIP_ICON = { image: '🖼', doc: '📄', zip: '🗜', other: '📎' };
+/* 附件类型 → sprite symbol */
+var CHIP_ICON = { image: 'image', doc: 'doc', zip: 'archive', other: 'clip' };
 var pendingAtts = [];            /* [{id, name, size, isImage}]，发送后清空 */
 
 function chipKind(f) {
@@ -260,7 +356,7 @@ function renderAttachBar() {
     chip.className = 'attach-chip' + (f.isImage ? ' attach-chip--img' : '');
     var ic = document.createElement('span');
     ic.className = 'attach-chip__ic';
-    ic.textContent = CHIP_ICON[chipKind(f)];
+    setIcon(ic, CHIP_ICON[chipKind(f)] || 'clip', 16);
     var nm = document.createElement('span');
     nm.className = 'attach-chip__name';
     nm.textContent = f.name;
@@ -271,7 +367,7 @@ function renderAttachBar() {
     del.type = 'button';
     del.className = 'attach-chip__del';
     del.setAttribute('aria-label', '移除 ' + f.name);
-    del.textContent = '×';
+    setIcon(del, 'x', 16);
     del.addEventListener('click', function () {
       pendingAtts.splice(idx, 1);
       renderAttachBar();
@@ -348,11 +444,33 @@ function attsForSend() {
 }
 
 /* ================= 渲染 ================= */
+/* 头像：昔涟侧用桌面端同一份线稿形象（cyrene-avatar-line.svg），
+   用户侧用图标库的人形图标。形象是彩色/多色描边的矢量，
+   走 <img> 直接引用；它不需要跟随主题变色。 */
+var CYRENE_AVATAR_SRC = '/static/icons/cyrene-avatar-line.svg';
+
+function avatarEl(cls) {
+  var av = document.createElement('div');
+  av.className = 'avatar ' + cls;
+  if (cls === 'bot') {
+    var img = document.createElement('img');
+    img.className = 'avatar__img';
+    img.src = CYRENE_AVATAR_SRC;
+    img.alt = '';
+    img.setAttribute('aria-hidden', 'true');
+    av.appendChild(img);
+  } else {
+    av.classList.add('has-ic');
+    setIcon(av, 'user', 16);
+    av.setAttribute('aria-label', '你');
+  }
+  return av;
+}
+
 function makeBubble(cls, cont) {
   var row = document.createElement('div');
   row.className = 'msg-row ' + cls + (cont ? ' cont' : '');
-  var av = document.createElement('div'); av.className = 'avatar ' + cls;
-  av.textContent = cls === 'bot' ? '♪' : '你';
+  var av = avatarEl(cls);
   var bub = document.createElement('div'); bub.className = 'bubble ' + cls;
   if (cls === 'bot') { row.appendChild(av); row.appendChild(bub); }
   else { row.appendChild(bub); row.appendChild(av); }
@@ -366,7 +484,14 @@ function makeReasoning(text) {
   var head = document.createElement('div'); head.className = 'reasoning-head';
   head.setAttribute('role', 'button'); head.setAttribute('tabindex', '0');
   head.setAttribute('aria-expanded', 'false');
-  head.innerHTML = '<span class="reasoning-caret">\u25B8</span><span>\uD83D\uDCAD 思考过程</span>';
+  var caret = document.createElement('span');
+  caret.className = 'reasoning-caret';
+  setIcon(caret, 'chevron-right', 16);
+  var rLabel = document.createElement('span');
+  rLabel.className = 'reasoning-label';
+  rLabel.appendChild(iconEl('brain', 16));
+  rLabel.appendChild(document.createTextNode(' 思考过程'));
+  head.appendChild(caret); head.appendChild(rLabel);
   var body = document.createElement('div'); body.className = 'reasoning-body';
   mountMd(body, text);
   var toggle = function () {
@@ -391,7 +516,10 @@ function scrollBottom(force) { if (force || atBottom()) chat.scrollTop = chat.sc
      塞进气泡就会每轮多一坨重复内容，越滚越长。
    · 默认收起只显示一行摘要（3/7 完成），点开才看全表。手机上寸土寸金。
    · 全部 completed/cancelled 时自动收起并淡化，任务结束了就别再占视线。 */
-var TODO_ICONS = { pending: '○', in_progress: '◐', completed: '●', cancelled: '✕' };
+var TODO_ICONS = {
+  pending: 'todo-pending', in_progress: 'todo-running',
+  completed: 'todo-done', cancelled: 'todo-cancelled'
+};
 
 function todoBar() {
   var el = $('todo-bar');
@@ -426,9 +554,11 @@ function renderTodos(items) {
   head.className = 'todo-bar__head';
   head.setAttribute('aria-expanded', String(!allDone));
   var label = allDone
-    ? ('✓ 任务完成 ' + done + '/' + items.length)
-    : ('📝 ' + done + '/' + items.length + ' · ' + (running ? running.content : '待办 ' + (items.length - done) + ' 项'));
-  head.textContent = label;
+    ? ('任务完成 ' + done + '/' + items.length)
+    : (done + '/' + items.length + ' · ' + (running ? running.content : '待办 ' + (items.length - done) + ' 项'));
+  head.textContent = '';
+  setIcon(head, allDone ? 'todo-done' : 'list-todo', 16);
+  head.appendChild(document.createTextNode(' ' + label));
   bar.appendChild(head);
 
   var body = document.createElement('div');
@@ -439,7 +569,7 @@ function renderTodos(items) {
     li.className = 'todo-item todo-item--' + (t.status || 'pending');
     var ic = document.createElement('span');
     ic.className = 'todo-item__icon';
-    ic.textContent = TODO_ICONS[t.status] || '○';
+    setIcon(ic, TODO_ICONS[t.status] || 'todo-pending', 16);
     var tx = document.createElement('span');
     tx.className = 'todo-item__text';
     tx.textContent = t.status === 'in_progress' && t.activeForm ? t.activeForm : t.content;
@@ -470,7 +600,8 @@ function makeAskCard(ask, interactive) {
 
   var box = document.createElement('div'); box.className = 'ask-box';
   var title = document.createElement('div'); title.className = 'ask-box__title';
-  title.textContent = '❓ 需要你定一下';
+  title.appendChild(iconEl('help', 16));
+  title.appendChild(document.createTextNode('需要你定一下'));
   box.appendChild(title);
 
   var answers = {};                 /* qid → [value] 或 string */
@@ -600,7 +731,8 @@ function makeErrorBubble(errText) {
   p.bub.classList.add('bubble--error');
   var box = document.createElement('div'); box.className = 'err-box';
   var t = document.createElement('div'); t.className = 'err-box__text';
-  t.textContent = '⚠ ' + (errText || '请求失败');
+  t.appendChild(iconEl('warn', 16));
+  t.appendChild(document.createTextNode(' ' + (errText || '请求失败')));
   box.appendChild(t);
   var acts = document.createElement('div'); acts.className = 'err-box__acts';
   var rb = document.createElement('button');
@@ -667,8 +799,10 @@ function makeAttachBox(atts) {
     } else {
       var row = document.createElement('div');
       row.className = 'attach-line';
-      row.textContent = '📎 ' + (a.name || a.id || '文件')
-        + (a.size ? '（' + humanSize(a.size) + '）' : '');
+      row.appendChild(iconEl('clip', 16));
+      row.appendChild(document.createTextNode(
+        (a.name || a.id || '文件')
+        + (a.size ? '（' + humanSize(a.size) + '）' : '')));
       box.appendChild(row);
     }
   });
@@ -692,7 +826,7 @@ function addSegmented(text, reasoning) {
 function showThinking() {
   hideThinking();
   var row = document.createElement('div'); row.className = 'msg-row bot'; row.id = 'thinking-row';
-  var av = document.createElement('div'); av.className = 'avatar bot'; av.textContent = '♪';
+  var av = avatarEl('bot');
   var box = document.createElement('div'); box.className = 'thinking-box';
   box.style.flexWrap = 'wrap';
   box.style.cursor = 'pointer';
@@ -774,8 +908,8 @@ function findMode(id) {
   return null;
 }
 function applyModeUI(mode) {
-  var m = findMode(mode) || { id: mode, label: mode, icon: '💬' };
-  if (modeBtnIcon) modeBtnIcon.textContent = m.icon || '💬';
+  var m = findMode(mode) || { id: mode, label: mode, icon: mode };
+  if (modeBtnIcon) renderBackendIcon(modeBtnIcon, m.icon || m.id, 18);
   if (modeBtnLabel) modeBtnLabel.textContent = m.label || mode;
 }
 function closeModeMenu() {
@@ -793,7 +927,8 @@ function renderModeMenu() {
     it.setAttribute('role', 'menuitem');
     it.setAttribute('data-mode', m.id);
     var ic = document.createElement('span'); ic.className = 'mode-item-icon';
-    ic.textContent = m.icon || '';
+    /* 后端 icon 是语义 id；映射不到就用模式 id 兜底，再不行才显原文 */
+    renderBackendIcon(ic, m.icon || m.id, 18);
     var tx = document.createElement('div'); tx.className = 'mode-item-text';
     var lb = document.createElement('div'); lb.className = 'mode-item-label';
     lb.textContent = m.label || m.id;
@@ -802,7 +937,8 @@ function renderModeMenu() {
     tx.appendChild(lb); tx.appendChild(ds);
     it.appendChild(ic); it.appendChild(tx);
     if (m.id === currentMode) {
-      var ck = document.createElement('span'); ck.className = 'mode-item-check'; ck.textContent = '✓';
+      var ck = document.createElement('span'); ck.className = 'mode-item-check';
+      setIcon(ck, 'check', 16);
       it.appendChild(ck);
     }
     modeMenu.appendChild(it);
@@ -853,7 +989,14 @@ function renderSessions(list, current) {
     .sort(function (a, b) { return (b.created || 0) - (a.created || 0); });
   if (!arr.length) {
     var empty = document.createElement('div');
-    empty.className = 'session-empty'; empty.textContent = '还没有对话';
+    empty.className = 'session-empty';
+    /* 空态用迷迷形象（与桌面端同一份资产）代替一句干巴巴的提示 */
+    var eImg = document.createElement('img');
+    eImg.src = '/static/icons/mimi.png';
+    eImg.alt = '';
+    eImg.setAttribute('aria-hidden', 'true');
+    empty.appendChild(eImg);
+    empty.appendChild(document.createTextNode('还没有对话'));
     frag.appendChild(empty);
   }
   arr.forEach(function (s) {
@@ -861,7 +1004,8 @@ function renderSessions(list, current) {
     d.className = 'session-item' + (s.id === current ? ' active' : '');
     d.dataset.sid = s.id;
     var t = document.createElement('span'); t.className = 't'; t.textContent = s.title || '新对话';
-    var x = document.createElement('span'); x.className = 'del'; x.textContent = '✕';
+    var x = document.createElement('span'); x.className = 'del';
+    setIcon(x, 'x', 16);
     x.dataset.del = s.id; x.setAttribute('role', 'button'); x.setAttribute('aria-label', '删除对话');
     d.appendChild(t); d.appendChild(x);
     frag.appendChild(d);
@@ -1075,7 +1219,7 @@ function setBusy(on) {
   busy = on;
   setStatus(on ? 'thinking' : null);
   sendBtn.classList.toggle('cancel', on);
-  sendBtn.textContent = on ? '■' : '➤';
+  setIcon(sendBtn, on ? 'square' : 'arrow-up', 20);
   sendBtn.setAttribute('aria-label', on ? '停止等待' : '发送');
   sendBtn.disabled = false;
 }
@@ -1145,7 +1289,10 @@ function sendTurn(text, isRetry, atts) {
         var bub = last.querySelector('.bubble');
         if (bub) {
           var t = document.createElement('div'); t.className = 'tool-info';
-          t.textContent = '⚙️ ' + r.tool_line + '\n📎 ' + (r.tool_result || '');
+          t.appendChild(iconEl('settings', 16));
+          t.appendChild(document.createTextNode(' ' + r.tool_line + '\n'));
+          t.appendChild(iconEl('clip', 16));
+          t.appendChild(document.createTextNode(' ' + (r.tool_result || '')));
           bub.appendChild(t);
         }
       }
@@ -1213,6 +1360,7 @@ function stopSpeak() { speakToken++; apiPost('/tts/stop').catch(function () {});
 var SETTINGS_TABS = [
   { key: 'appearance', label: '外观' },
   { key: 'model',      label: '模型' },
+  { key: 'vision',     label: '视觉' },
   { key: 'mode',       label: '模式' },
   { key: 'reasoning',  label: '思考' },
   { key: 'tools',      label: '工具' },
@@ -1496,7 +1644,7 @@ function showServiceDown(mode) {
   card.className = 'service-overlay__card';
   var ico = document.createElement('div');
   ico.className = 'service-overlay__icon';
-  ico.textContent = mode === 'restart' ? '🔄' : '🌙';
+  setIcon(ico, mode === 'restart' ? 'refresh-cw' : 'square', 20);
   var h = document.createElement('h2');
   h.className = 'service-overlay__title';
   var p = document.createElement('p');
@@ -1575,7 +1723,8 @@ function saveSettings(patch, immediate) {
 /* ---------- 面板 ---------- */
 function renderSettingsPanel() {
   settingsBody.innerHTML = '';
-  if (!SETTINGS) return;
+  /* 设置还没拉回来时先铺骨架，别让面板空着闪一下 */
+  if (!SETTINGS) { settingsBody.appendChild(skeletonEl(4)); return; }
   var f = PANELS[activeTab];
   if (f) f(settingsBody, SETTINGS);
 }
@@ -1593,9 +1742,21 @@ PANELS.appearance = function (host, S) {
     b.type = 'button'; b.className = 'theme-card' + (ap.theme === pair[0] ? ' is-active' : '');
     b.dataset.theme = pair[0];
     b.setAttribute('aria-pressed', String(ap.theme === pair[0]));
-    b.innerHTML = '<span class="theme-card__preview" aria-hidden="true"><i></i><i></i><i></i></span>'
-      + '<span class="theme-card__label">' + pair[1]
-      + '<span class="theme-card__tick" aria-hidden="true">✓</span></span>';
+    var prev = document.createElement('span');
+    prev.className = 'theme-card__preview';
+    prev.setAttribute('aria-hidden', 'true');
+    prev.appendChild(document.createElement('i'));
+    prev.appendChild(document.createElement('i'));
+    prev.appendChild(document.createElement('i'));
+    var tLabel = document.createElement('span');
+    tLabel.className = 'theme-card__label';
+    tLabel.textContent = pair[1];
+    var tTick = document.createElement('span');
+    tTick.className = 'theme-card__tick';
+    tTick.setAttribute('aria-hidden', 'true');
+    setIcon(tTick, 'check', 16);
+    tLabel.appendChild(tTick);
+    b.appendChild(prev); b.appendChild(tLabel);
     b.addEventListener('click', function () {
       Array.prototype.forEach.call(grid.children, function (c) {
         c.classList.remove('is-active');
@@ -1747,6 +1908,19 @@ PANELS.model = function (host, S) {
     textInput(m.model, function (v) { saveSettings({ model: { model: v } }); },
       { mono: true, label: '模型名称' }), { stack: true }));
 
+  /* 主模型多模态三选。对齐桌面端 model-settings.multimodal 的语义：
+     auto 跟随实测探测（端点收不下图就自动走视觉转述），
+     on   强制按能收图处理，off  强制走转述。
+     放在「模型」这个 tab 里而不是视觉 tab：这是主模型的能力声明，
+     视觉 tab 只管那套独立端点。 */
+  c.appendChild(row('图片直传',
+    '主模型能否直接收图。"自动" 以实测为准：带图请求失败过就改走视觉转述',
+    segmented(m.multimodal || 'auto', [
+      { value: 'auto', label: '自动' },
+      { value: 'on',   label: '强制开启' },
+      { value: 'off',  label: '强制关闭' }
+    ], function (v) { saveSettings({ model: { multimodal: v } }); }), { stack: true }));
+
   /* 采样参数：对齐桌面端 customStyle.diversity 的 driver/value 语义，
      这里直接暴露底层参数，因为手机端只有一个模型通道 */
   var c2 = card();
@@ -1787,6 +1961,210 @@ PANELS.model = function (host, S) {
       .then(function () { renderSettingsPanel(); });
   }, 'btn--ghost'));
   host.lastChild.style.margin = '12px 14px 0';
+};
+
+/* ================= 视觉（独立视觉模型）=================
+   这一页管的是「主模型收不了图时，谁来替她看图」。
+   设计骨架与桌面端 Cyrene-Agent 的 image-router 一致：
+   结论只有三种（图片直传 / 交独立视觉转述 / 看不了），
+   而且这个结论必须能在这页上被看见 —— 不然用户没法判断问题出在哪。 */
+PANELS.vision = function (host, S) {
+  var v = S.vision || {};
+
+  /* 顶部：路由状态行。对齐桌面端「不允许模糊状态」那条设计 ——
+     与其让用户在两个 tab 之间猜，不如把当前结论直接摊开。 */
+  var st = card();
+  var routeBox = document.createElement('div');
+  routeBox.className = 'vision-route';
+  st.appendChild(routeBox);
+  host.appendChild(section('当前状态', '服务端按这个结论决定图片怎么走', st));
+
+  function routeText(d) {
+    var r = (d && d.route) || {};
+    var modes = {
+      direct:  ['图片直传', '主模型自己收图，不经过独立视觉模型。'],
+      caption: ['独立视觉转述', '主模型收不了图，图片交给下面配置的视觉模型转成文字。'],
+      reject:  ['看不了图', r.reason || '主模型不是多模态，且未配置独立视觉模型。']
+    };
+    return modes[r.mode] || ['未知', ''];
+  }
+
+  function paintStatus() {
+    routeBox.textContent = '读取中…';
+    fetch('/vision/status', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var t = routeText(d);
+        routeBox.innerHTML = '';
+        var big = document.createElement('div');
+        big.className = 'vision-route__mode' +
+          (d.route && d.route.mode === 'reject' ? ' is-bad' : ' is-ok');
+        big.textContent = t[0];
+        var sub = document.createElement('div');
+        sub.className = 'vision-route__why';
+        sub.textContent = t[1];
+        routeBox.appendChild(big); routeBox.appendChild(sub);
+
+        var meta = document.createElement('div');
+        meta.className = 'vision-route__meta';
+        var items = [
+          '主模型图片直传：' + (d.multimodal || 'auto') +
+            (d.multimodalEnabled ? '（当前按可收图处理）' : '（当前按收不了图处理）'),
+          '视觉端点：' + (d.ready ? '已就绪' : '未配置完整'),
+          '描述缓存：' + ((d.cache && d.cache.count) || 0) + ' / ' +
+            ((d.cache && d.cache.max) || 0) + ' 条',
+          '单图上限：' + Math.round(((d.maxBytes || 0) / 1024 / 1024) * 10) / 10 + ' MB'
+        ];
+        items.forEach(function (x) {
+          var li = document.createElement('div');
+          li.textContent = x;
+          meta.appendChild(li);
+        });
+        if (d.last) {
+          var last = document.createElement('div');
+          last.textContent = d.last.ok
+            ? ('上次调用：成功' + (d.last.cached ? '（命中缓存）' : '') +
+               (d.last.atText ? ' · ' + d.last.atText : ''))
+            : ('上次调用：失败 · ' + (d.last.error || ''));
+          meta.appendChild(last);
+        }
+        routeBox.appendChild(meta);
+      })
+      .catch(function () {
+        routeBox.textContent = '读不到状态（服务可能正在重启）';
+      });
+  }
+  paintStatus();
+
+  /* 端点配置 */
+  var c = card();
+  c.appendChild(row('启用独立视觉模型', '关掉后整个子系统退场，图片仍会落盘但不转述',
+    toggle(!!v.enabled, function (on) {
+      saveSettings({ vision: { enabled: on } }, true).then(paintStatus);
+    }, '启用独立视觉模型')));
+
+  c.appendChild(row('接口地址', 'OpenAI 兼容格式的 Base URL，与主模型可以不是同一家。'
+    + '填到 /v1 就行，直接把完整端点（…/v1/chat/completions）粘进来也认',
+    textInput(v.api_base, function (val) {
+      saveSettings({ vision: { api_base: val } }, true);
+    }, { mono: true, placeholder: 'https://…/v1', label: '视觉接口地址' }),
+    { stack: true }));
+
+  /* API Key 只写不回显：服务端只回 api_key_set 布尔 */
+  var kwrap = document.createElement('div'); kwrap.className = 'reveal-wrap';
+  var ki = document.createElement('input');
+  ki.className = 'form-input form-input--mono'; ki.type = 'password';
+  ki.placeholder = v.api_key_set ? '已配置（留空则不修改）' : '尚未配置';
+  ki.setAttribute('aria-label', '视觉 API Key');
+  var kshow = btn('显示', function () {
+    ki.type = ki.type === 'password' ? 'text' : 'password';
+    kshow.textContent = ki.type === 'password' ? '显示' : '隐藏';
+  }, 'btn--sm');
+  kwrap.appendChild(ki); kwrap.appendChild(kshow);
+  c.appendChild(row('API Key', '不会回显已保存的值；留空表示不修改',
+    kwrap, { stack: true }));
+  ki.addEventListener('change', function () {
+    if (!ki.value.trim()) return;
+    saveSettings({ vision: { api_key: ki.value.trim() } }, true)
+      .then(function () {
+        ki.value = '';
+        ki.placeholder = '已配置（留空则不修改）';
+        paintStatus();
+      });
+  });
+
+  c.appendChild(row('模型名称', '支持图片输入的模型，例如各家 VLM',
+    textInput(v.model, function (val) {
+      saveSettings({ vision: { model: val } }, true);
+    }, { mono: true, placeholder: '你的视觉模型', label: '视觉模型名称' }),
+    { stack: true }));
+
+  c.appendChild(row('上传时自动转述',
+    '开：发图时当场转述一次，她立刻看得见。关（默认）：只给路径，'
+    + '她想看时用 read_image 自己调 —— 省一次视觉调用',
+    toggle(!!v.autoCaption, function (on) {
+      saveSettings({ vision: { autoCaption: on } }, true);
+    }, '上传时自动转述')));
+
+  c.appendChild(row('提供看图工具',
+    '给她 read_image（本地图）与 read_image_url（网络图）两个工具。'
+    + '关掉后这两个工具不会出现在工具清单里',
+    toggle(v.toolEnabled !== false, function (on) {
+      saveSettings({ vision: { toolEnabled: on } }, true);
+    }, '提供看图工具')));
+
+  host.appendChild(section('视觉端点',
+    '与主模型完全独立的一套配置。主模型能收图时这里不会被用到', c));
+
+  /* 参数 */
+  var c3 = card();
+  c3.appendChild(row('请求超时', '秒。转述是附带动作，不必跟主模型一样长',
+    slider(10, 300, 5, v.request_timeout != null ? v.request_timeout : 60,
+      function (val) { saveSettings({ vision: { request_timeout: val } }); },
+      function (val) { return val + 's'; }), { stack: true }));
+  c3.appendChild(row('单图上限', 'MB。超过就不送视觉模型，只落盘',
+    slider(1, 16, 0.5, v.maxMb != null ? v.maxMb : 4,
+      function (val) { saveSettings({ vision: { maxMb: val } }); },
+      function (val) { return val + ' MB'; }), { stack: true }));
+  c3.appendChild(row('描述缓存', '分钟。同一张图同一个问题在有效期内不重复请求',
+    slider(0, 120, 5, v.cacheTtlMin != null ? v.cacheTtlMin : 30,
+      function (val) { saveSettings({ vision: { cacheTtlMin: val } }); },
+      function (val) { return val === 0 ? '不缓存' : val + ' 分钟'; }), { stack: true }));
+  host.appendChild(section('参数', null, c3));
+
+  /* 自检：选图 → 上传 → /vision/test，把结果原文摊出来 */
+  var c4 = card();
+  var fileInput = document.createElement('input');
+  fileInput.type = 'file'; fileInput.accept = 'image/*';
+  fileInput.style.display = 'none';
+  c4.appendChild(fileInput);
+
+  var testOut = document.createElement('div');
+  testOut.className = 'vision-testout';
+  testOut.textContent = '（还没有测试结果）';
+
+  var picking = btn('选择图片测试', function () { fileInput.click(); });
+  var actions = document.createElement('div');
+  actions.className = 'vision-actions';
+  actions.appendChild(picking);
+  actions.appendChild(btn('清空描述缓存', function () {
+    apiPost('/vision/cache/clear').then(function (d) {
+      testOut.textContent = '已清空 ' + ((d && d.cleared) || 0) + ' 条缓存描述';
+      paintStatus();
+    });
+  }, 'btn--ghost'));
+  c4.appendChild(actions);
+  c4.appendChild(testOut);
+
+  fileInput.addEventListener('change', function () {
+    var f = fileInput.files && fileInput.files[0];
+    if (!f) return;
+    testOut.textContent = '读取文件…';
+    readFileBase64(f).then(function (b64) {
+      testOut.textContent = '上传中…';
+      return apiPost('/upload', { filename: f.name, dataBase64: b64 });
+    }).then(function (up) {
+      if (!up || !up.file || !up.file.id) throw new Error('上传没有返回 id');
+      testOut.textContent = '正在让视觉模型看图…（最长 ' +
+        (v.request_timeout != null ? v.request_timeout : 60) + ' 秒）';
+      return apiPost('/vision/test', { id: up.file.id });
+    }).then(function (d) {
+      testOut.textContent = (d && d.text) || '（没有返回内容）';
+      paintStatus();
+    }).catch(function (e) {
+      /* 转述失败时后端回 502，apiPost 会抛错 —— 但 body 里的 text
+         才是真正有用的东西（"[错误·网络] …" 这种可读原因），
+         所以优先从 payload 里取，而不是只显示 HTTP 状态码。 */
+      var p = e && e.payload;
+      testOut.textContent = (p && p.text)
+        ? p.text
+        : ('测试失败：' + (e && e.message ? e.message : e));
+      paintStatus();
+    }).then(function () { fileInput.value = ''; });
+  });
+
+  host.appendChild(section('测试识图',
+    '选一张本地图片，当场走一遍完整链路（上传 → 转述 → 回显）', c4));
 };
 
 PANELS.tools = function (host, S) {
@@ -1830,7 +2208,7 @@ PANELS.tools = function (host, S) {
         var el = document.createElement('div');
         el.className = 'tool-card' + (t.enabled ? '' : ' is-off');
         var ic = document.createElement('span'); ic.className = 'tool-card__icon';
-        ic.textContent = t.icon || '⚙';
+        renderBackendIcon(ic, t.icon || t.id, 16);
         var bd = document.createElement('div'); bd.className = 'tool-card__body';
         var nm = document.createElement('div'); nm.className = 'tool-card__name';
         nm.textContent = t.desc || t.id;
@@ -1905,7 +2283,7 @@ PANELS.skills = function (host, S) {
       var el = document.createElement('div');
       el.className = 'tool-card' + (s.enabled ? '' : ' is-off');
       var ic = document.createElement('span'); ic.className = 'tool-card__icon';
-      ic.textContent = '✦';
+      setIcon(ic, 'sparkles', 16);
       var bd = document.createElement('div'); bd.className = 'tool-card__body';
       var nm = document.createElement('div'); nm.className = 'tool-card__name';
       nm.textContent = s.name || s.id;
@@ -2080,7 +2458,8 @@ PANELS.plugins = function (host, S) {
 
   /* ---------- 已安装视图 ---------- */
   function drawInstalled(root) {
-    root.innerHTML = '<div class="tool-panel__empty">加载中…</div>';
+    root.textContent = '';
+    root.appendChild(skeletonEl(3));
     api('/plugins').then(function (d) {
       root.innerHTML = '';
       var h = d.host || {}, list = d.plugins || [];
@@ -2190,8 +2569,13 @@ PANELS.plugins = function (host, S) {
     var el = document.createElement('div');
     el.className = 'tool-card' + (p.state === 'running' ? '' : ' is-off');
     var ic = document.createElement('span'); ic.className = 'tool-card__icon';
-    ic.textContent = p.icon ? '' : '🔌';
-    if (p.icon) { ic.style.cssText = 'background-size:cover;background-image:url(' + p.icon + ')'; }
+    /* 插件自带 icon 时它是个图片 URL，走背景图；没有才用通用插件图标 */
+    if (p.icon) {
+      ic.textContent = '';
+      ic.style.cssText = 'background-size:cover;background-image:url(' + p.icon + ')';
+    } else {
+      setIcon(ic, 'puzzle', 16);
+    }
     var bd = document.createElement('div'); bd.className = 'tool-card__body';
 
     var nm = document.createElement('div'); nm.className = 'tool-card__name';
@@ -2207,7 +2591,9 @@ PANELS.plugins = function (host, S) {
     }
     if (h.securityScan !== false && p.risky && p.risky.length) {
       var rb = document.createElement('span'); rb.className = 'tool-card__badge';
-      rb.textContent = '⚠ 高危调用'; rb.style.color = '#c8860d';
+      rb.style.color = '#c8860d';
+      rb.appendChild(iconEl('warn', 16));
+      rb.appendChild(document.createTextNode('高危调用'));
       rb.title = '静态扫描发现：' + p.risky.join(', ');
       nm.appendChild(rb);
     }
@@ -2369,7 +2755,7 @@ PANELS.plugins = function (host, S) {
         var lab = document.createElement('span');
         lab.style.cssText = 'font-size:13px;word-break:break-all';
         lab.textContent = it.filename + (it.id ? '  (' + it.id + (it.version ? ' v' + it.version : '') + ')' : '')
-          + (it.error ? '  ⚠ ' + it.error : '') + (it.oversize ? '  ⚠ 超过上限' : '');
+          + (it.error ? '  · ' + it.error : '') + (it.oversize ? '  · 超过上限' : '');
         var b = btn('安装', function () {
           if (it.error || it.oversize) { alert('这个包有问题：' + (it.error || '超过体积上限')); return; }
           prog.innerHTML = '';
@@ -2395,7 +2781,7 @@ PANELS.plugins = function (host, S) {
       if (p.stage === 'done') {
         bar.ok((p.info && p.info.info && p.info.info.id ? '已安装 ' + p.info.info.id : '安装完成')
           + ((p.info && p.info.info && p.info.info.risky && p.info.info.risky.length)
-            ? '（⚠ 含高危调用，见卡片黄标）' : ''));
+            ? '（含高危调用，见卡片黄标）' : ''));
         if (fileIn) fileIn.value = '';
         redraw();
       } else {
@@ -2435,14 +2821,23 @@ PANELS.plugins = function (host, S) {
         txt.style.color = 'var(--cy-text-dim,#aaa)';
         txt.textContent = msg || '';
       },
-      ok: function (msg) { fill.style.width = '100%'; fill.style.background = '#2e9e5b'; txt.style.color = '#2e9e5b'; txt.textContent = '✓ ' + (msg || '完成'); },
-      fail: function (msg) { fill.style.background = '#d9534f'; txt.style.color = '#d9534f'; txt.textContent = '✗ ' + (msg || '失败'); }
+      ok: function (msg) {
+        fill.style.width = '100%'; fill.style.background = '#2e9e5b'; txt.style.color = '#2e9e5b';
+        txt.textContent = ''; txt.appendChild(iconEl('check', 16));
+        txt.appendChild(document.createTextNode(' ' + (msg || '完成')));
+      },
+      fail: function (msg) {
+        fill.style.background = '#d9534f'; txt.style.color = '#d9534f';
+        txt.textContent = ''; txt.appendChild(iconEl('x', 16));
+        txt.appendChild(document.createTextNode(' ' + (msg || '失败')));
+      }
     };
   }
 
   /* ---------- 市场视图 ---------- */
   function drawMarket(root) {
-    root.innerHTML = '<div class="tool-panel__empty">加载市场…</div>';
+    root.textContent = '';
+    root.appendChild(skeletonEl(4));
     loadMarket(root, false);
   }
   function loadMarket(root, refresh) {
@@ -2507,7 +2902,7 @@ PANELS.plugins = function (host, S) {
     var el = document.createElement('div');
     el.className = 'tool-card';
     var ic = document.createElement('span'); ic.className = 'tool-card__icon';
-    ic.textContent = '📦';
+    setIcon(ic, 'package', 16);
     var bd = document.createElement('div'); bd.className = 'tool-card__body';
     var nm = document.createElement('div'); nm.className = 'tool-card__name';
     nm.textContent = p.name || p.id;
@@ -3036,10 +3431,10 @@ PANELS.mode = function (host, S) {
   var byMode = info.prompt_chars_by_mode || {};
   var cur = chat.defaultMode || 'chat';
   var list = (MODES && MODES.length) ? MODES : [
-    { id: 'chat', label: '聊天', icon: '💬', tools: false },
-    { id: 'work', label: '工作', icon: '🛠️', tools: true },
-    { id: 'code', label: '代码', icon: '💻', tools: true },
-    { id: 'learn', label: '学习', icon: '📚', tools: true }
+    { id: 'chat', label: '聊天', icon: 'chat', tools: false },
+    { id: 'work', label: '工作', icon: 'work', tools: true },
+    { id: 'code', label: '代码', icon: 'code', tools: true },
+    { id: 'learn', label: '学习', icon: 'learn', tools: true }
   ];
 
   /* 默认模式卡片列表，选中项高亮 */
@@ -3050,15 +3445,29 @@ PANELS.mode = function (host, S) {
     b.type = 'button';
     b.className = 'mode-card' + (active ? ' is-active' : '');
     b.setAttribute('aria-pressed', String(active));
-    b.innerHTML =
-      '<span class="mode-card__icon" aria-hidden="true">' + (m.icon || '💬') + '</span>'
-      + '<span class="mode-card__label">' + escHtml(m.label || m.id)
-      + '<span class="mode-card__tick" aria-hidden="true">✓</span></span>'
-      + '<span class="mode-card__desc">' + escHtml(m.desc || '') + '</span>'
-      + '<span class="mode-card__meta">'
-      + (m.tools ? '可用工具' : '无工具')
-      + (byMode[m.id] ? ' · ' + Number(byMode[m.id]).toLocaleString('en-US') + ' 字' : '')
-      + '</span>';
+    /* 用 DOM 构造而不是 innerHTML：label / desc 来自后端配置，
+       拼字符串会把它们当 HTML 解析。图标同理只作 attribute 值。 */
+    var mcIcon = document.createElement('span');
+    mcIcon.className = 'mode-card__icon';
+    mcIcon.setAttribute('aria-hidden', 'true');
+    renderBackendIcon(mcIcon, m.icon || m.id, 18);
+    var mcLabel = document.createElement('span');
+    mcLabel.className = 'mode-card__label';
+    mcLabel.textContent = m.label || m.id;
+    var mcTick = document.createElement('span');
+    mcTick.className = 'mode-card__tick';
+    mcTick.setAttribute('aria-hidden', 'true');
+    setIcon(mcTick, 'check', 16);
+    mcLabel.appendChild(mcTick);
+    var mcDesc = document.createElement('span');
+    mcDesc.className = 'mode-card__desc';
+    mcDesc.textContent = m.desc || '';
+    var mcMeta = document.createElement('span');
+    mcMeta.className = 'mode-card__meta';
+    mcMeta.textContent = (m.tools ? '可用工具' : '无工具')
+      + (byMode[m.id] ? ' · ' + Number(byMode[m.id]).toLocaleString('en-US') + ' 字' : '');
+    b.appendChild(mcIcon); b.appendChild(mcLabel);
+    b.appendChild(mcDesc); b.appendChild(mcMeta);
     b.addEventListener('click', function () {
       if (m.id === cur) return;
       cur = m.id;
@@ -3081,7 +3490,7 @@ PANELS.mode = function (host, S) {
   list.forEach(function (m) {
     var n = Number(byMode[m.id]) || 0;
     total += n;
-    c.appendChild(row((m.icon || '') + ' ' + (m.label || m.id),
+    c.appendChild(row(m.label || m.id,
       n ? n.toLocaleString('en-US') + ' 字符' : '未加载', null));
   });
   host.appendChild(section('系统提示词规模', '四个模式共用 soul.md 与语气基准，'

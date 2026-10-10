@@ -47,11 +47,14 @@
 .nav-item{
   flex-shrink:0;padding:7px 13px;border:none;background:none;cursor:pointer;
   font-size:13px;color:var(--rb-text-secondary);border-radius:var(--rb-radius-full);
-  white-space:nowrap;font-weight:500;
+  white-space:nowrap;font-weight:500;letter-spacing:.2px;
+  transition:background .15s,color .15s,transform .1s;
 }
 .nav-item:hover{background:var(--rb-surface-hover);color:var(--rb-text-primary)}
+.nav-item:active{transform:scale(.96)}
 .nav-item.is-active{
   background:var(--rb-surface-active);color:var(--rb-accent);font-weight:600;
+  box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--rb-accent) 32%,transparent);
 }
 
 /* ===== 分区与卡片 ===== */
@@ -265,7 +268,7 @@
   color:var(--rb-text-primary);background:var(--rb-surface-elevated);
   display:flex;align-items:center;justify-content:space-between;gap:5px;
 }
-.theme-card__tick{color:var(--rb-accent);font-size:13px;opacity:0}
+.theme-card__tick{color:var(--rb-accent);opacity:0;display:inline-flex}
 .theme-card.is-active .theme-card__tick{opacity:1}
 /* 预览块用固定色，不跟随当前主题 */
 .theme-card[data-theme="charcoal-pink"] .theme-card__preview{background:#141414}
@@ -287,7 +290,8 @@
 }
 .mode-card:hover{border-color:var(--rb-border-elevated)}
 .mode-card.is-active{border-color:var(--rb-accent);background:var(--rb-pink-50)}
-.mode-card__icon{font-size:19px;line-height:1}
+.mode-card:active{transform:scale(.985)}
+.mode-card__icon{display:inline-flex;align-items:center;color:var(--rb-accent);line-height:1}
 .mode-card__label{
   font-size:12.5px;font-weight:600;color:var(--rb-text-primary);
   display:flex;align-items:center;justify-content:space-between;gap:5px;
@@ -342,6 +346,49 @@
 }
 
 .hidden{display:none !important}
+
+/* ===== 骨架屏（首次加载占位，替代空列表闪烁） ===== */
+.skeleton{display:flex;flex-direction:column;gap:9px;padding:12px 14px}
+.skeleton__row{
+  height:44px;border-radius:var(--rb-radius-lg);
+  background:linear-gradient(90deg,
+    var(--rb-bg-2) 25%, var(--rb-bg-3) 37%, var(--rb-bg-2) 63%);
+  background-size:400% 100%;
+  animation:skeletonShift 1.3s ease-in-out infinite;
+}
+.skeleton__row--sm{height:28px}
+.skeleton__row--lg{height:64px}
+@keyframes skeletonShift{
+  0%{background-position:100% 50%}
+  100%{background-position:0 50%}
+}
+@media (prefers-reduced-motion:reduce){
+  .skeleton__row{animation:none;background:var(--rb-bg-2)}
+}
+
+/* ===== 视觉（独立视觉模型） =====
+   这一页最重要的是顶部那条「当前状态」：路由的三态结论必须一眼看得见，
+   所以给足字号和颜色区分，reject 用告警色。 */
+.vision-route{padding:2px 0}
+.vision-route__mode{
+  font-size:16px;font-weight:700;color:var(--rb-text-primary);
+  display:flex;align-items:center;gap:6px;margin-bottom:4px;
+}
+.vision-route__mode.is-ok::before{content:'';width:8px;height:8px;border-radius:50%;background:var(--rb-accent)}
+.vision-route__mode.is-bad{color:var(--rb-danger, #d9534f)}
+.vision-route__mode.is-bad::before{content:'';width:8px;height:8px;border-radius:50%;background:currentColor}
+.vision-route__why{font-size:12px;color:var(--rb-text-secondary);line-height:1.5;margin-bottom:8px}
+.vision-route__meta{
+  font-size:12px;color:var(--rb-text-secondary);line-height:1.7;
+  border-top:1px solid var(--rb-border-subtle);padding-top:8px;
+}
+.vision-actions{display:flex;gap:8px;flex-wrap:wrap;padding:12px 14px 0}
+.vision-testout{
+  margin:10px 14px 0;padding:10px 12px;border-radius:var(--rb-radius-lg);
+  background:var(--rb-bg-2);color:var(--rb-text-primary);
+  font-size:12.5px;line-height:1.65;white-space:pre-wrap;word-break:break-word;
+  max-height:320px;overflow:auto;
+}
 
 /* ===== 移动端 ===== */
 @media (max-width:768px){
