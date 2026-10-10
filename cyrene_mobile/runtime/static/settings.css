@@ -397,3 +397,91 @@
   .cy-settings-row{flex-wrap:wrap}
   .cy-settings-row__control{width:auto}
 }
+
+/* ===== 记忆面板（P5）=====
+   只复用上面主题里已有的 --rb-* 变量，不新增配色、不改主题：
+   换主题时这几十行跟着一起变，不会留下一块对不上色的白斑。 */
+
+/* 状态区：一格一个数字，窄屏自动折行 */
+.mem-stats{display:flex;flex-wrap:wrap;gap:8px;padding:12px 14px}
+.mem-stat{
+  flex:1 1 150px;min-width:0;padding:8px 10px;
+  border:1px solid var(--rb-border-subtle);border-radius:var(--rb-radius-md);
+  background:var(--rb-surface-workspace);
+}
+.mem-stat__k{display:block;font-size:12px;color:var(--rb-text-secondary)}
+.mem-stat__v{
+  display:block;margin-top:2px;font-size:14px;color:var(--rb-text-primary);
+  word-break:break-word;
+}
+
+/* 一句说明：空列表 / 正在整理 / 模块未加载 */
+.mem-note{padding:12px 14px;font-size:13px;line-height:1.6;color:var(--rb-text-secondary)}
+.mem-note--off{color:var(--rb-warning)}
+
+/* L0 / L1 字段 */
+.mem-subhead{
+  display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;
+  padding:12px 14px 6px;font-size:13px;font-weight:600;color:var(--rb-text-primary);
+}
+.mem-subhead__meta{font-weight:400;font-size:12px;color:var(--rb-text-disabled)}
+.mem-fields{padding-bottom:6px}
+.mem-field{
+  display:flex;gap:12px;align-items:flex-start;padding:8px 14px;
+  border-top:1px solid var(--rb-border-subtle);
+}
+.mem-field__k{flex:0 0 88px;font-size:13px;color:var(--rb-text-secondary)}
+.mem-field__v{
+  flex:1 1 auto;min-width:0;font-size:13px;line-height:1.6;
+  color:var(--rb-text-primary);white-space:pre-wrap;word-break:break-word;
+}
+.mem-field__v.is-empty{color:var(--rb-text-disabled)}
+.mem-field--block{flex-direction:column;gap:4px}
+.mem-field--block .mem-field__k{flex:none}
+/* 字段可编辑（L0 / L1 每格右边那个「改」）：按钮列靠右；进编辑态时值换成输入框 */
+.mem-field__act{flex:0 0 auto;display:flex;align-items:center;gap:4px}
+.mem-field__input{
+  flex:1;min-width:0;box-sizing:border-box;resize:vertical;
+  padding:6px 8px;font-size:13px;line-height:1.6;font-family:inherit;
+  border:1px solid var(--rb-border-default);border-radius:8px;
+  background:var(--rb-bg-1);color:var(--rb-text-primary);
+}
+.mem-field__input:focus{outline:none;border-color:var(--rb-text-secondary)}
+
+/* L2 列表 */
+.mem-list__head{padding:10px 14px 6px;font-size:12px;color:var(--rb-text-secondary)}
+.mem-list,.mem-log-list{display:flex;flex-direction:column}
+.mem-l2-row{
+  display:flex;gap:10px;align-items:flex-start;padding:10px 14px;
+  border-top:1px solid var(--rb-border-subtle);
+}
+.mem-l2-row__main{flex:1 1 auto;min-width:0}
+.mem-l2-row__text{
+  font-size:13px;line-height:1.6;color:var(--rb-text-primary);
+  white-space:pre-wrap;word-break:break-word;
+}
+.mem-l2-row__meta{
+  display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin-top:6px;
+  font-size:12px;color:var(--rb-text-secondary);
+}
+.mem-l2-row .btn{flex:0 0 auto}
+
+/* 三态 / 钉住 / 日志类型的小标签 */
+.mem-tag{
+  display:inline-block;padding:1px 7px;border-radius:var(--rb-radius-full);
+  font-size:11px;line-height:1.6;color:var(--rb-text-secondary);
+  border:1px solid var(--rb-border-default);background:var(--rb-surface-elevated);
+}
+.mem-tag.is-active{color:var(--rb-accent);border-color:var(--rb-accent)}
+.mem-tag.is-aging{color:var(--rb-warning)}
+.mem-tag.is-archived{color:var(--rb-text-disabled)}
+.mem-tag.is-pin{color:var(--rb-accent);border-color:var(--rb-accent)}
+
+/* 反思日志 */
+.mem-log-row{padding:10px 14px;border-top:1px solid var(--rb-border-subtle)}
+.mem-log-row__top{display:flex;align-items:center;gap:8px}
+.mem-log-row__time{font-size:12px;color:var(--rb-text-disabled);font-family:var(--rb-font-mono)}
+.mem-log-row__text{
+  margin-top:4px;font-size:13px;line-height:1.6;color:var(--rb-text-secondary);
+  white-space:pre-wrap;word-break:break-word;
+}

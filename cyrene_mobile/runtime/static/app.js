@@ -1365,6 +1365,7 @@ var SETTINGS_TABS = [
   { key: 'reasoning',  label: '思考' },
   { key: 'tools',      label: '工具' },
   { key: 'plugins',    label: '插件' },
+  { key: 'memory',     label: '记忆' },
   { key: 'skills',     label: '技能' },
   { key: 'tts',        label: '语音' },
   { key: 'usage',      label: '用量' },
@@ -2968,6 +2969,383 @@ PANELS.plugins = function (host, S) {
   draw();
 };
 
+/* ================= 记忆（P5） ================= */
+/* 四块：开关与状态 / L0 画像与 L1 近况 / L2 长期条目 / 反思日志。
+   数据一次从 GET /memory/panel 拿全（见 cyrene_web.memory_panel），前端不自己拼接口。
+   ⚠ L2 的「正在整理」和「没加载」必须分开说：后端拿不到锁时返回的正是空 items + busy。
+     要是跟着 items.length === 0 走，面板会显示成「什么都没记」——那是在骗她。所以 busy 先判。 */
+PANELS.memory = function (host, S) {
+  var m = S.memory || {};
+
+  /* 开关落盘：先改本地镜像 S.memory[key]，再 saveSettings。
+     saveSettings 之后 renderSettingsPanel() 重画用的是同一份 SETTINGS，
+     镜像没跟着改的话开关会「弹回原位」——reasoning 那边踩过的同一个坑。 */
+  function setMem(key, value) {
+    if (!S.memory) S.memory = {};
+    S.memory[key] = value;
+    var patch = {};
+    patch[key] = value;
+    saveSettings({ memory: patch }, true);
+  }
+
+  /* ---------- ① 开关与状态 ---------- */
+  var cs = card();
+  cs.appendChild(row('记忆总开关', '总闸。关掉后世界书不再注入，L2 也不写、不召回',
+    toggle(!!m.enabled, function (on) { setMem('enabled', on); renderSettingsPanel(); },
+      '记忆总开关')));
+  cs.appendChild(row('L2 长期记忆', '关于他的长期条目：抽取 / 召回 / 衰减。总闸关着时这一项不起作用',
+    toggle(!!m.l2Enabled, function (on) { setMem('l2Enabled', on); renderSettingsPanel(); },
+      'L2 长期记忆'),
+    { notice: m.enabled ? '' : '总开关还没打开' }));
+  var statBox = document.createElement('div');
+  cs.appendChild(statBox);
+  host.appendChild(section('开关与状态', '下面的数字每次进来重新从服务端读', cs));
+
+  /* ---------- ② L0 画像 / L1 近况 ---------- */
+  var cp = card();
+  var profBox = document.createElement('div');
+  cp.appendChild(profBox);
+  host.appendChild(section('她记住的', 'L0 是长期画像，L1 是最近这一段的状态', cp));
+
+  /* ---------- ③ L2 长期条目 ---------- */
+  var cl = card();
+  var l2Box = document.createElement('div');
+  cl.appendChild(l2Box);
+  host.appendChild(section('长期记忆', '按时间倒序，新的在前。删掉一条就是让她忘掉这件事', cl));
+
+  /* ---------- ④ 反思日志 ---------- */
+  var cr = card();
+  var logBox = document.createElement('div');
+  cr.appendChild(logBox);
+  host.appendChild(section('反思日志', '她自己整理记忆时留下的记录', cr));
+
+  /* ---------- 小工具 ---------- */
+  /* 毫秒时间戳（后端 _now_ms，对齐桌面端 Date.now）→ 「MM-DD HH:MM」 */
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+  function fmtTime(ms) {
+    var n = Number(ms);
+    if (!n) return '';
+    var d = new Date(n);
+    if (isNaN(d.getTime())) return '';
+    return pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' +
+      pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+  function fmtNum(v) {
+    var n = Number(v);
+    if (v == null || v === '' || isNaN(n)) return '—';
+    return String(Math.round(n * 100) / 100);
+  }
+  function note(text, warn) {
+    var e = document.createElement('div');
+    e.className = 'mem-note' + (warn ? ' mem-note--off' : '');
+    e.textContent = text;
+    return e;
+  }
+  function failBox(box, text, cls) {
+    box.innerHTML = '';
+    var w = document.createElement('div');
+    w.className = 'alert ' + (cls || 'alert--warn');
+    w.textContent = text;
+    box.appendChild(w);
+  }
+
+  /* L2 三态：后端的 status 只有这三个值（见 l2_panel_data 的 counts） */
+  var L2_STATUS = {
+    active:   { text: '活跃', cls: 'is-active' },
+    aging:    { text: '沉睡', cls: 'is-aging' },
+    archived: { text: '归档', cls: 'is-archived' }
+  };
+  /* 反思日志类型：compression / l0_update / l1_update，别发明第四种 */
+  var LOG_TYPE = { compression: '片段压缩', l0_update: '画像更新', l1_update: '近况更新' };
+
+  var L0_FIELDS = [
+    { key: 'nickname',          label: '昵称' },
+    { key: 'preferredName',     label: '称呼' },
+    { key: 'occupation',        label: '身份' },
+    { key: 'longTermInterests', label: '长期兴趣' },
+    { key: 'language',          label: '语言' },
+    { key: 'permanentNote',     label: '永久备注', block: true }
+  ];
+  var L1_FIELDS = [
+    { key: 'recentGoals',       label: '最近目标', block: true },
+    { key: 'recentPreferences', label: '最近偏好', block: true },
+    { key: 'currentProject',    label: '在做的事', block: true }
+  ];
+
+  /* 一个字段一格，且**可以直接改**。
+     显示态：label + 值 + 「改」；编辑态：输入框 + 保存/取消。
+     空值写「（空）」而不是留白 —— 留白看不出是「没填」还是「没读到」。 */
+  function fieldEl(level, f, value) {
+    var r = document.createElement('div');
+    r.className = 'mem-field' + (f.block ? ' mem-field--block' : '');
+    var k = document.createElement('div');
+    k.className = 'mem-field__k';
+    k.textContent = f.label;
+    var v = document.createElement('div');
+    v.className = 'mem-field__v';
+    var s = (value == null ? '' : String(value)).trim();
+    if (s) { v.textContent = s; }
+    else { v.classList.add('is-empty'); v.textContent = '（空）'; }
+    var act = document.createElement('div');
+    act.className = 'mem-field__act';
+    act.appendChild(btn('改', function () { editField(r, v, act, level, f, s); },
+      'btn--ghost btn--sm'));
+    r.appendChild(k); r.appendChild(v); r.appendChild(act);
+    return r;
+  }
+
+  /* 把一格切成编辑态。保存只提交这一个字段；改完整页重读，以服务端的值为准
+     （本地改镜像那一套对记忆库不适用——它不在 SETTINGS 里）。 */
+  function editField(row, v, act, level, f, cur) {
+    if (!row.isConnected) return;            /* 已经切走了就别动它 */
+    var box = document.createElement('textarea');
+    box.className = 'mem-field__input';
+    box.value = cur;
+    box.rows = f.block ? 3 : 1;
+    box.placeholder = '（留空就是清掉这一项）';
+    var bar = document.createElement('div');
+    bar.className = 'mem-field__act';
+    var save = btn('保存', function () {
+      if (!row.isConnected) return;
+      var patch = {};
+      patch[level] = {};
+      patch[level][f.key] = box.value;
+      save.disabled = true;
+      apiPost('/memory/profile', patch).then(function (d) {
+        if (d && d.ok) { renderSettingsPanel(); return; }
+        save.disabled = false;
+        alert('没改成：' + ((d && d.error) || '未知原因'));
+      }).catch(function (e) {
+        save.disabled = false;
+        alert('没改成：' + (e.message || e));
+      });
+    }, 'btn--sm');
+    bar.appendChild(save);
+    bar.appendChild(btn('取消', function () { renderSettingsPanel(); },
+      'btn--ghost btn--sm'));
+    row.replaceChild(box, v);
+    row.replaceChild(bar, act);
+    if (box.focus) box.focus();
+  }
+
+  function subHead(text, meta) {
+    var h = document.createElement('div');
+    h.className = 'mem-subhead';
+    var k = document.createElement('span');
+    k.textContent = text;
+    h.appendChild(k);
+    if (meta) {
+      var s = document.createElement('span');
+      s.className = 'mem-subhead__meta';
+      s.textContent = meta;
+      h.appendChild(s);
+    }
+    return h;
+  }
+
+  /* ---------- ① 状态 ---------- */
+  function paintStatus(st) {
+    statBox.innerHTML = '';
+    var tri = st.states || {};
+    var pol = st.policy || {};
+    if (st.engineLoaded === false) {
+      statBox.appendChild(note('世界书引擎没加载：条目数为 0 是真的没有，不是面板读错了。', true));
+    }
+    var box = document.createElement('div');
+    box.className = 'mem-stats';
+    var items = [
+      ['世界书条目', (st.entries || 0) + ' 条'],
+      ['其中永久', (st.permanent || 0) + ' 条'],
+      ['三态', '活跃 ' + (tri.Active || 0) + ' · 沉睡 ' + (tri.Dormant || 0) +
+        ' · 归档 ' + (tri.Archived || 0)],
+      ['策略', pol.loaded
+        ? ('在意 ' + (pol.care || 0) + ' 条 · 回避 ' + (pol.avoid || 0) + ' 条')
+        : '未加载'],
+      ['唤醒 / 衰减', '×' + fmtNum(pol.wakeScale == null ? 1 : pol.wakeScale) +
+        ' / ×' + fmtNum(pol.decayScale == null ? 1 : pol.decayScale)],
+      ['注入上限', (st.maxInjectChars || 0) + ' 字']
+    ];
+    items.forEach(function (it) {
+      var r = document.createElement('div');
+      r.className = 'mem-stat';
+      var k = document.createElement('div'); k.className = 'mem-stat__k'; k.textContent = it[0];
+      var v = document.createElement('div'); v.className = 'mem-stat__v'; v.textContent = it[1];
+      r.appendChild(k); r.appendChild(v);
+      box.appendChild(r);
+    });
+    statBox.appendChild(box);
+  }
+
+  /* ---------- ② 画像与近况 ---------- */
+  function paintProfile(l0, l1) {
+    profBox.innerHTML = '';
+    var upd = fmtTime(l0.updatedAt);
+    profBox.appendChild(subHead('L0 · 长期画像',
+      (l0.isPinned ? '已钉住 · ' : '') + (upd ? '更新于 ' + upd : '还没更新过')));
+    var f0 = document.createElement('div');
+    f0.className = 'mem-fields';
+    L0_FIELDS.forEach(function (f) { f0.appendChild(fieldEl('l0', f, l0[f.key])); });
+    profBox.appendChild(f0);
+
+    profBox.appendChild(subHead('L1 · 近况', '走过 ' + (l1.roundCount || 0) + ' 轮对话'));
+    var f1 = document.createElement('div');
+    f1.className = 'mem-fields';
+    L1_FIELDS.forEach(function (f) { f1.appendChild(fieldEl('l1', f, l1[f.key])); });
+    profBox.appendChild(f1);
+  }
+
+  /* ---------- ③ L2 列表 ---------- */
+  function paintL2(d) {
+    l2Box.innerHTML = '';
+    /* ⚠ 次序不能换：busy 时后端给的就是空列表，先判列表长度就会误报成「什么都没记」。 */
+    if (d.l2Busy === true) {
+      l2Box.appendChild(note('记忆库正在整理，过一会儿再看。'));
+      return;
+    }
+    if (d.l2Available === false) {
+      l2Box.appendChild(note('记忆模块未加载：设置里打开「L2 长期记忆」之后才会有条目。', true));
+      return;
+    }
+    var items = d.l2 || [];
+    var co = d.counts || {};
+    var head = document.createElement('div');
+    head.className = 'mem-list__head';
+    head.textContent = '共 ' + (co.total == null ? items.length : co.total) + ' 条 · 活跃 '
+      + (co.active || 0) + ' · 沉睡 ' + (co.aging || 0) + ' · 归档 ' + (co.archived || 0);
+    l2Box.appendChild(head);
+    if (!items.length) {
+      l2Box.appendChild(note('还没有记下什么。等她多聊几句，条目会自己长出来。'));
+      return;
+    }
+    var list = document.createElement('div');
+    list.className = 'mem-list';
+    items.forEach(function (it) { list.appendChild(l2El(it)); });
+    l2Box.appendChild(list);
+  }
+
+  function l2El(it) {
+    var line = document.createElement('div');
+    line.className = 'mem-l2-row';
+    var main = document.createElement('div');
+    main.className = 'mem-l2-row__main';
+    var txt = document.createElement('div');
+    txt.className = 'mem-l2-row__text';
+    txt.textContent = String(it.content || '');
+    main.appendChild(txt);
+    var meta = document.createElement('div');
+    meta.className = 'mem-l2-row__meta';
+    var st = L2_STATUS[it.status] || { text: String(it.status || '未知'), cls: '' };
+    var tag = document.createElement('span');
+    tag.className = 'mem-tag ' + st.cls;
+    tag.textContent = st.text;
+    meta.appendChild(tag);
+    if (it.isPinned) {
+      var pin = document.createElement('span');
+      pin.className = 'mem-tag is-pin';
+      pin.textContent = '钉住';
+      meta.appendChild(pin);
+    }
+    var bits = [
+      '权重 ' + fmtNum(it.weight),
+      '激活 ' + fmtNum(it.activation),
+      '召回 ' + (it.recallCount == null ? 0 : it.recallCount) + ' 次',
+      fmtTime(it.createdAt)
+    ];
+    bits.forEach(function (x) {
+      if (!x) return;
+      var s = document.createElement('span');
+      s.textContent = x;
+      meta.appendChild(s);
+    });
+    main.appendChild(meta);
+    line.appendChild(main);
+    var del = btn('删除', function () { doForget(it, del); }, 'btn--danger btn--sm');
+    del.setAttribute('aria-label', '删除这条记忆');
+    line.appendChild(del);
+    return line;
+  }
+
+  /* 删除是真删（后端 l2_forget 会把 DMAE 状态行一起清），所以先问一句。
+     成功后就地整块重绘：数字和列表一起更新，不用手写「本地摘掉一个 li」的乐观更新。 */
+  function doForget(it, btnEl) {
+    if (!confirm('让她忘掉这条？删掉之后不再参与召回。')) return;
+    btnEl.disabled = true;
+    btnEl.textContent = '删除中…';
+    apiPost('/memory/l2/forget', { id: it.id }).then(function () {
+      if (!host.isConnected) return;        // 异步回来时可能已经切走了 tab
+      load();
+    }).catch(function (e) {
+      if (!host.isConnected) return;
+      btnEl.disabled = false;
+      btnEl.textContent = '删除';
+      var s = e && e.status;
+      if (s === 503) { alert('删除失败：记忆库正在整理，过一会儿再试。'); }
+      else if (s === 404) { alert('这条已经不在库里了，刷新一下。'); load(); }
+      else { alert('删除失败：' + ((e && e.message) || '未知错误')); }
+    });
+  }
+
+  /* ---------- ④ 反思日志 ---------- */
+  function paintLogs(logs, busy) {
+    logBox.innerHTML = '';
+    if (!logs.length) {
+      logBox.appendChild(note(busy ? '记忆库正在整理，过一会儿再看。'
+        : '还没有整理记录。她整理过记忆之后，这里会留下痕迹。'));
+      return;
+    }
+    var list = document.createElement('div');
+    list.className = 'mem-log-list';
+    logs.forEach(function (lg) {
+      var line = document.createElement('div');
+      line.className = 'mem-log-row';
+      var top = document.createElement('div');
+      top.className = 'mem-log-row__top';
+      var t = document.createElement('span');
+      t.className = 'mem-tag';
+      t.textContent = LOG_TYPE[lg.type] || String(lg.type || '记录');
+      top.appendChild(t);
+      var time = document.createElement('span');
+      time.className = 'mem-log-row__time';
+      time.textContent = fmtTime(lg.createdAt);
+      top.appendChild(time);
+      line.appendChild(top);
+      var sum = document.createElement('div');
+      sum.className = 'mem-log-row__text';
+      sum.textContent = String(lg.summary || '') || '（没有摘要）';
+      line.appendChild(sum);
+      list.appendChild(line);
+    });
+    logBox.appendChild(list);
+  }
+
+  /* ---------- 一次读全 ---------- */
+  /* 骨架屏先占位：回来之前留白，看着像「本来就没有」。 */
+  function load() {
+    [statBox, profBox, l2Box, logBox].forEach(function (b) {
+      b.innerHTML = '';
+      b.appendChild(skeletonEl(2));
+    });
+    api('/memory/panel').then(function (d) {
+      /* 守卫：读的过程中用户可能已经切走 tab（renderSettingsPanel 清空了 settingsBody），
+         那时这几个盒子已脱离文档，再往里写是白写，重则碰到 null。 */
+      if (!host.isConnected) return;
+      paintStatus(d.status || {});
+      paintProfile(d.l0 || {}, d.l1 || {});
+      paintL2(d);
+      paintLogs(d.reflectionLogs || [], d.l2Busy === true);
+    }).catch(function (e) {
+      if (!host.isConnected) return;
+      failBox(statBox, '读不到记忆状态（服务可能正在重启）'
+        + (e && e.status ? '：HTTP ' + e.status : ''));
+      failBox(profBox, '画像与近况也没读到。', 'alert--info');
+      failBox(l2Box, '长期条目的状态未知，先不列出来，免得看成空库。', 'alert--info');
+      failBox(logBox, '反思日志同样没读到。', 'alert--info');
+    });
+  }
+
+  load();
+};
+
 PANELS.tts = function (host, S) {
   var t = S.tts || {};
   var eng = t.engine === 'minimax' ? 'minimax' : (t.engine === 'custom' ? 'custom' : 'system');
@@ -3369,7 +3747,7 @@ PANELS.server = function (host, S) {
   host.appendChild(section('运行时', null, c2));
 
   var c3 = card();
-  var info = row('版本', 'cyrene_web.py v8 · marked v15.0.12 · highlight.js v11.11.1', null);
+  var info = row('版本', 'cyrene_web.py v9 · marked v15.0.12 · highlight.js v11.11.1', null);
   c3.appendChild(info);
   c3.appendChild(row('数据目录', String(S.info && S.info.data_dir || '~/cyrene/data'), null));
   c3.appendChild(row('技能目录', String(S.info && S.info.skills_dir || '~/cyrene/skills'), null));

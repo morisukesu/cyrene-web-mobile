@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-昔涟 · 手机版 Web Agent 运行时 v8
+昔涟 · 手机版 Web Agent 运行时 v9
 
 对齐桌面端（github.com/Playa-Cyrene/Cyrene-Agent）的移植范围：
   外观      双主题 charcoal-pink / pearl-white + 回复排版四滑块
@@ -418,6 +418,79 @@ def _h_read_image_url(a):
     if isinstance(text, str) and text.startswith("[错误"):
         return OUTCOME_FAILURE, text
     return OUTCOME_SUCCESS, text
+
+
+def _memory_rerank(query, cands, limit=4):
+    """用现有对话模型从词法粗筛结果里挑最相关的若干条。
+
+    返回 None 表示「精排没成，按词法序走」—— 精排是提升项，一次调用失败
+    不该让召回整体失效，所以每条失败路径都返回 None，不抛异常。
+    """
+    if not cands:
+        return None
+    lines = []
+    for i, (_score, e) in enumerate(cands[:20]):
+        body = (getattr(e, "content", "") or "").replace("\n", " ")
+        lines.append("%d. [%s] %s" % (i, getattr(e, "title", "") or "", body[:120]))
+    sys_msg = ("你在帮「昔涟」从候选记忆里挑出与当前问题最相关的条目。"
+               "只输出序号，用逗号分隔，最多 %d 个，不要解释。"
+               "若都不相关就只输出「无」。" % int(limit))
+    usr_msg = "当前问题：%s\n\n候选：\n%s" % (str(query)[:300], "\n".join(lines))
+    try:
+        client = LLMClient(SETTINGS)
+        content, _reasoning, err = client.chat(
+            [{"role": "system", "content": sys_msg},
+             {"role": "user", "content": usr_msg}], max_tokens=64)
+        if err or not content:
+            return None
+        picked = []
+        for tok in re.findall(r"\d+", content):
+            i = int(tok)
+            if 0 <= i < len(cands) and i not in picked:
+                picked.append(i)
+        if not picked:
+            return None
+        return [cands[i] for i in picked[:int(limit)]]
+    except Exception as e:
+        print(f"⚠ 记忆精排失败（回退词法序）: {e}")
+        return None
+
+
+def _h_recall_memory(a):
+    """recall_memory：词法粗筛 + 模型精排，从世界书里翻出相关条目。
+
+    与「每轮自动注入」的分工：注入是不出声的底噪，把已激活的知识摆在上下文
+    里；这个工具是她主动翻旧账时用的，会额外走一次模型调用。
+    """
+    if _mem is None:
+        return OUTCOME_FAILURE, "(记忆模块未加载，这个功能现在不可用)"
+    if not memory_available():
+        return OUTCOME_FAILURE, "(记忆功能未开启：请在「设置 → 记忆」里打开总开关)"
+    query = (a.get("query") or "").strip()
+    if not query:
+        return OUTCOME_FAILURE, "(缺少 query：想找什么？)"
+    try:
+        top_k = int(a.get("top_k") or 20)
+    except (TypeError, ValueError):
+        top_k = 20
+    top_k = max(4, min(50, top_k))
+
+    memory_load()                       # 确保条目表已读（懒加载）
+    entries = _MEM_ENTRIES or []
+    cands = _mem.lexical_recall(query, entries, top_k=top_k)
+    if not cands:
+        return OUTCOME_SUCCESS, "(世界书里没有和这句相关的条目)"
+
+    picked = _memory_rerank(query, cands, limit=4)
+    used = "精排" if picked else "词法"
+    picked = picked or cands[:4]
+    lines = ["〔记忆召回·%s〕共 %d 条相关" % (used, len(picked))]
+    for _score, e in picked:
+        body = (getattr(e, "content", "") or "").strip()
+        if len(body) > 400:
+            body = body[:400] + "…"
+        lines.append("- [%s] %s" % (getattr(e, "title", "") or "", body))
+    return OUTCOME_SUCCESS, "\n".join(lines)
 
 
 def _h_read_file(a):
@@ -2971,6 +3044,24 @@ TOOLS = {
                                   "desc": "要看的图片完整 URL（必须含 https:// 或 http://）"},
                           "question": {"type": "string", "default": "",
                                        "desc": "可选。想让她重点看什么。缺省是通读描述"}}},
+    # 记忆召回（世界书）：词法粗筛 + 现有对话模型精排。
+    # 与视觉工具同一套「开关决定摆不摆」，判据是 memory.enabled。
+    "recall_memory": {"desc": "翻一翻记忆与世界书，找出和某句话相关的条目。\n\n"
+                              "何时用：\n"
+                              "- 需要回忆旧事、确认角色设定的细节，而不是靠猜\n"
+                              "- 用户提到「上次说过的那个」「以前那件事」\n\n"
+                              "不要用于：\n"
+                              "- 当前对话里已经出现过的信息（那些直接看得到）\n\n"
+                              "未开启记忆功能时会返回错误，届时如实告诉用户。\n"
+                              "参数：query（必填，要找什么）、top_k（可选，粗筛候选数，默认 20）",
+                      "icon": "search", "readonly": True, "risk": "safe",
+                      "handler": "_h_recall_memory",
+                      "params": {
+                          "query": {"type": "string", "required": True,
+                                    "desc": "要找的主题或那句话"},
+                          "top_k": {"type": "integer", "default": 20,
+                                    "minimum": 4, "maximum": 50,
+                                    "desc": "词法粗筛保留多少条候选再交模型精排"}}},
 
     # ---------- 联网工具（阶段 2b）----------
     # 同样是 handler 型：进程内跑 urllib，不 fork 子进程。三个都标 risk="network"，
@@ -3117,6 +3208,8 @@ TOOL_HANDLERS = {
     # 视觉工具（独立视觉模型）
     "_h_read_image": _h_read_image,
     "_h_read_image_url": _h_read_image_url,
+    # 记忆召回（世界书）
+    "_h_recall_memory": _h_recall_memory,
 }
 
 # tool_schema 要剥掉的自定义字段（它们不是 JSON Schema 关键字，
@@ -3562,6 +3655,32 @@ DEFAULT_SETTINGS = {
         "cacheTtlMin": 30,       # 描述缓存有效期（分钟），对齐桌面端 30 分钟。
         "toolEnabled": True,     # 是否给 read_image / read_image_url 两个工具
     },
+    # 世界书 / 记忆（对齐桌面端 Cyrene-Agent 的 rag/worldbook + DMAE 引擎）。
+    # 第一期只做「读」这一侧：把 prompts/worldbook/*.md 解析成条目，按激活度
+    # 决定谁进上下文；写入侧（L2 长期记忆的 LLM 抽取）留二期。
+    # 与 vision 段同理：全部键都必须在 normalize_settings 里显式登记 ——
+    # 那个函数是白名单式的，漏一个键就会被静默抹回默认值。
+    "memory": {
+        "enabled": False,          # 总开关；关 = 完全不注入，行为与改动前一致
+        "worldbookEnabled": True,  # 是否加载 prompts/worldbook/*.md
+        "autoInject": True,        # 是否每轮自动注入（关了就只剩 recall 工具）
+        "maxInjectChars": 2000,    # 注入文本字符上限，超了按条截断
+        "promptThreshold": 30,     # 激活度达到此值才算 Active（对齐桌面端默认）
+        "statePath": "",           # 状态文件路径；空串 = data/worldbook_state.json
+        # ── 二期：L2 长期记忆（关于他）──
+        # 与 worldbook 各自独立开关，但都挂在 enabled 之下：enabled 关着时整段不跑。
+        "l2Enabled": False,        # L2 总开关；默认关，与一期同款保守
+        "l2TopK": 8,               # 每轮词法召回候选数（位次 I 的来源；源码是向量 top-K）
+        "l2InjectLimit": 4,        # 注入条数上限（对齐桌面端 maxCount=4）
+        "l2MaxInjectChars": 1200,  # L2 注入文本字符上限，超了按条截断
+        "l2StatePath": "",         # L2 库路径；空串 = data/l2/memory.json（与 statePath 同构）
+        "judgeInterval": 6,        # 每几轮跑一次 judge（0 = 关；源码 MEMORY_JUDGE_INTERVAL）
+        "decayInterval": 50,       # 每几轮做一次权重衰减（0 = 关；源码 DECAY_INTERVAL）
+        # 覆盖任意 DMAE 参数（键名同引擎的 DEFAULT_DMAE_PARAMS）。
+        # 桌面端那套参数是按桌面交互节奏调的，手机端对话更碎；将来要重标定时
+        # 改这里就行，不用动代码。以上面顶层的 promptThreshold 为准。
+        "params": {},
+    },
 }
 
 
@@ -3677,6 +3796,841 @@ def vision_tools_allowed():
     return bool(vision_cfg("toolEnabled", True))
 
 
+# ---------- 世界书 / 记忆 ----------
+# 记忆段各键的取值范围：(下限, 上限, 默认值)，与 VISION_RANGES 同构。
+MEMORY_RANGES = {
+    "maxInjectChars": (200, 20000, 2000),
+    "promptThreshold": (0, 100, 30),
+    # 二期 L2。上限不设太宽：这些值直接决定每轮注入体积与 LLM 调用频率。
+    "l2TopK": (1, 50, 8),
+    "l2InjectLimit": (1, 10, 4),
+    "l2MaxInjectChars": (0, 8000, 1200),
+    "judgeInterval": (0, 200, 6),
+    "decayInterval": (0, 1000, 50),
+}
+
+
+def normalize_memory(raw):
+    """归一化世界书 / 记忆配置。
+
+    与 normalize_vision 同一套语义：全是偏好设置，缺项回落默认值、
+    非法值夹回合法范围。
+    """
+    v = raw if isinstance(raw, dict) else {}
+    out = {
+        "enabled": _as_bool(v.get("enabled"), False),
+        "worldbookEnabled": _as_bool(v.get("worldbookEnabled"), True),
+        "autoInject": _as_bool(v.get("autoInject"), True),
+        "l2Enabled": _as_bool(v.get("l2Enabled"), False),
+        "statePath": _as_str(v.get("statePath"), "")[:500],
+        "l2StatePath": _as_str(v.get("l2StatePath"), "")[:500],
+    }
+    for k, (lo, hi, fb) in MEMORY_RANGES.items():
+        out[k] = int(_clamp(v.get(k), lo, hi, fb))
+    # params：只收有限的数字。bool 是 int 的子类要单独挡掉，NaN 也要挡
+    # （_clamp 的同款考虑）。键名合法性交给引擎判 —— 它有一张
+    # DEFAULT_DMAE_PARAMS 白名单，认不出的键会被静默忽略。
+    pm = v.get("params")
+    params = {}
+    if isinstance(pm, dict):
+        for k, val in pm.items():
+            if not isinstance(k, str) or isinstance(val, bool):
+                continue
+            if not isinstance(val, (int, float)) or val != val:
+                continue
+            params[k] = float(val)
+    out["params"] = params
+    return out
+
+
+def memory_cfg(key, fb=None):
+    """读单个记忆配置项。SETTINGS 未加载时回落默认值（与 vision_cfg 同构）。
+
+    为什么要这层包装：SETTINGS 是模块级全局，在 load_settings() 跑之前访问会
+    NameError。世界书引擎可能被早期调用（回合钩子、状态端点），这层保护必要。
+    """
+    try:
+        return SETTINGS.get("memory", {}).get(key, fb)
+    except (NameError, AttributeError):
+        return fb
+
+
+# 引擎是同目录的独立模块。⚠ 不能直接 import 就完事：本机工作区自带的
+# python 是**嵌入式发行版**（python/python312._pth 存在），那种发行版下
+# 脚本目录不进 sys.path —— 实测直接 import 会报 No module named 'cyrene_memory'，
+# 而且悄无声息：服务照样起得来，只是世界书功能整块失效。
+# 显式把运行时目录补进搜索路径，嵌入式与常规发行版都能用。
+# 缺失时整个记忆子系统安静退场：世界书是附加能力，它坏了不该让服务起不来。
+if str(RUNTIME_DIR) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_DIR))
+try:
+    import cyrene_memory as _mem
+except Exception as _mem_err:                              # pragma: no cover
+    _mem = None
+    print(f"⚠ 记忆模块加载失败，世界书功能不可用: {_mem_err}")
+
+# 条目表首次用到时才读；状态表按 id 独立维护。
+# ⚠ 状态绝不能挂 entry 上 —— 桌面端 worldbook.ts:29-31 明确记过：
+#   重载条目表会整表替换，挂上去状态就全丢了。
+_MEM_LOCK = threading.Lock()
+_MEM_ENTRIES = None      # list[Entry] | None（None = 尚未加载）
+_MEM_MGR = None          # DmaeManager | None
+_MEM_LAST_NOTE = ""      # 最近一次注入文本，供状态端点查
+
+
+# 记忆工具 id。与 VISION_TOOL_IDS 同理：判定要同时作用于「系统提示的工具清单」
+# 与「请求里的 tools 数组」两处，写死字面量迟早漏一处。
+# 判据是 memory.enabled —— 总开关关着时这个工具根本不出现。与视觉工具那种
+# 「先摆出来、调了再给可读提示」不同：记忆不是用户会主动去配的能力，
+# 摆着只会白占一个工具位，还会让她以为自己有这份记忆。
+MEMORY_TOOL_IDS = ("recall_memory",)
+
+
+def memory_tools_allowed():
+    """要不要把召回工具摆给她。只认 memory.enabled 一个开关。"""
+    return bool(memory_cfg("enabled", False))
+
+
+_MEM_POLICY = {}         # 人设声明的记忆策略（首次加载后填）
+
+
+def _load_memory_policy():
+    """读人设里的记忆策略声明（prompts/memory_policy.md）。
+
+    文件不在、读不了、解析失败，一律返回空策略 —— 等价于「这件事她没意见」，
+    记忆照常按默认值工作。策略是锦上添花，不该成为单点故障。
+    """
+    if _mem is None or not hasattr(_mem, "parse_memory_policy"):
+        return {}
+    try:
+        pf = PROMPTS_DIR / "memory_policy.md"
+        if not pf.exists():
+            return {}
+        return _mem.parse_memory_policy(pf.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"⚠ 记忆策略解析失败（按「没意见」继续）: {e}")
+        return {}
+
+
+def _apply_policy_scales(params, policy):
+    """把人设的倾向换算成 DMAE 参数倍率，**乘在最终值上**。
+
+    刻意做成乘法而不是赋值：面板调的是基准，人设调的是相对倾向，
+    两者正交 —— 谁也不悄悄覆盖谁。系数为 1 时完全不碰那个键。
+    """
+    try:
+        w = float(policy.get("wakeScale") or 1.0)
+        d = float(policy.get("decayScale") or 1.0)
+    except (TypeError, ValueError):
+        return params
+    if w != 1.0 and "wakeGamma" in params:
+        params["wakeGamma"] = round(float(params["wakeGamma"]) * w, 4)
+    if d != 1.0:
+        for k in ("decayAlpha", "decayBeta"):
+            if k in params:
+                params[k] = round(float(params[k]) * d, 4)
+    return params
+
+
+def memory_state_path():
+    """状态文件路径。配置留空时落 data/worldbook_state.json，
+    与 sessions.json / usage.json 同处，备份脚本不用多认一个目录。"""
+    p = str(memory_cfg("statePath", "") or "").strip()
+    return Path(p) if p else (DATA_DIR / "worldbook_state.json")
+
+
+def memory_available():
+    """世界书通道是否可用：引擎在 + 总开关开着。只判配置层，不碰磁盘。"""
+    return _mem is not None and bool(memory_cfg("enabled", False))
+
+
+def memory_load(force=False):
+    """（懒）加载条目表 + 状态 + 引擎实例。返回条目数；任何异常都不外抛。
+
+    force=True 用于重读 .md（设置变更或手动重载时）。
+    """
+    global _MEM_ENTRIES, _MEM_MGR
+    if _mem is None:
+        return 0
+    if _MEM_ENTRIES is not None and not force:
+        return len(_MEM_ENTRIES)
+    with _MEM_LOCK:
+        if _MEM_ENTRIES is not None and not force:
+            return len(_MEM_ENTRIES)
+        try:
+            # 人设声明（策略层）：她说该记什么、忘得多慢
+            global _MEM_POLICY
+            _MEM_POLICY = _load_memory_policy()
+            entries = []
+            if memory_cfg("worldbookEnabled", True):
+                res = _mem.load_worldbook_dir(PROMPTS_DIR / "worldbook")
+                # 「不该记的」在这里拦一道：命中的条目不进注入。
+                # 召回工具走的是同一份 _MEM_ENTRIES，所以一并生效。
+                entries = _mem.filter_entries(list(res), _MEM_POLICY.get("avoid"))
+                for err in (getattr(res, "errors", None) or []):
+                    print(f"⚠ 世界书解析: {err}")
+            # 参数三层：默认值打底 → 顶层 promptThreshold → params 覆盖；
+            # 最后再乘上人设的倾向倍率（乘法，与面板正交）。
+            merged = dict(_mem.DEFAULT_DMAE_PARAMS)
+            merged["promptThreshold"] = float(
+                memory_cfg("promptThreshold", merged["promptThreshold"]) or 0)
+            for k, v in (memory_cfg("params", {}) or {}).items():
+                if k in merged:
+                    merged[k] = v
+            _apply_policy_scales(merged, _MEM_POLICY)
+            mgr = _mem.DmaeManager(merged)
+            try:
+                _turn, states = _mem.load_state(memory_state_path())
+                for eid, st in (states or {}).items():
+                    mgr.set_state(eid, st)
+            except Exception as e:
+                print(f"⚠ 世界书状态读取失败（按空状态继续）: {e}")
+            _MEM_MGR = mgr
+            _MEM_ENTRIES = entries
+        except Exception as e:
+            print(f"⚠ 世界书加载失败（本功能停用）: {e}")
+            _MEM_ENTRIES = []
+            try:
+                _MEM_MGR = _mem.DmaeManager(dict(_mem.DEFAULT_DMAE_PARAMS))
+            except Exception:
+                _MEM_MGR = None
+        return len(_MEM_ENTRIES or [])
+
+
+def memory_reload():
+    """重读世界书 .md。返回条目数。"""
+    return memory_load(force=True)
+
+
+def memory_round(user_text):
+    """一轮用户消息的记忆处理：推进激活度 → 落盘 → 返回本轮注入文本。
+
+    返回空串 = 这轮没什么可注入的，调用方跳过拼接。
+    全过程不抛异常 —— 记忆是附加能力，坏了也不该拖住对话。
+
+    二期的拼接顺序：**世界书在前、L2 在后**。世界书讲的是「她是谁、这世界什么
+    样」（角色设定），L2 讲的是「关于他，我知道什么」（他的事）。先立住人，再
+    谈他，读起来才顺；反过来会让一段他的旧事挡在角色设定前面。
+    """
+    global _MEM_LAST_NOTE
+    if not memory_available():
+        return ""
+    try:
+        text = str(user_text or "")
+        parts = []
+        # ---- 世界书（一期）----
+        memory_load()
+        mgr, entries = _MEM_MGR, (_MEM_ENTRIES or [])
+        # ⚠ 这里不再「没有条目就整段返回」：世界书为空不该连 L2 一起跳过。
+        if mgr is not None and entries:
+            for e in entries:
+                # 常驻条目旁路 DMAE（桌面端同款：permanent 不分配状态）
+                if e.permanent:
+                    continue
+                st = mgr.get_state(e.id)
+                if st is None:
+                    st = mgr.init_entry(e.id)
+                hit = _mem.match_keywords(text, e)
+                mgr.set_state(e.id, mgr.update_activation(st, hit, False, e.intrinsic_value))
+            try:
+                _mem.save_state(memory_state_path(), mgr.states)
+            except Exception as e:
+                print(f"⚠ 世界书状态落盘失败（本轮照常注入）: {e}")
+        # autoInject 管的是「要不要往 prompt 里塞东西」这件事本身，
+        # 所以它排在状态推进之后、两种注入之前 —— 关掉它，两边都不注入。
+        if not memory_cfg("autoInject", True):
+            _MEM_LAST_NOTE = ""
+            return ""
+        if mgr is not None and entries:
+            note = _mem.build_injection(
+                text, entries, mgr.states,
+                int(memory_cfg("maxInjectChars", 2000) or 2000),
+                float(memory_cfg("promptThreshold", 30) or 30)) or ""
+            if note:
+                parts.append(note)
+        # ---- L2（二期）----
+        # 自己的开关在 l2_round 里判（memory.enabled + memory.l2Enabled），这里不重复。
+        l2_note = l2_round(text)
+        if l2_note:
+            parts.append(l2_note)
+        _MEM_LAST_NOTE = "\n\n".join(parts)
+        return _MEM_LAST_NOTE
+    except Exception as e:
+        print(f"⚠ 世界书记忆处理失败（已跳过注入）: {e}")
+        return ""
+
+
+def memory_status():
+    """世界书运行状态快照，供 /memory/status 与排错用。不回显任何密钥。"""
+    entries = _MEM_ENTRIES or []
+    mgr = _MEM_MGR
+    counts = {"Active": 0, "Dormant": 0, "Archived": 0}
+    detail = []
+    if mgr is not None:
+        th = float(mgr.params.get("promptThreshold", 30) or 30)
+        for e in entries:
+            if e.permanent:
+                continue
+            st = mgr.get_state(e.id)
+            act = float(getattr(st, "activation", 0.0) or 0.0)
+            state = mgr.derive_state(act)
+            counts[state] = counts.get(state, 0) + 1
+            detail.append({"id": e.id, "activation": round(act, 3), "state": state})
+    detail.sort(key=lambda d: d["activation"], reverse=True)
+    return {
+        "engineLoaded": _mem is not None,
+        "enabled": bool(memory_cfg("enabled", False)),
+        "worldbookEnabled": bool(memory_cfg("worldbookEnabled", True)),
+        "autoInject": bool(memory_cfg("autoInject", True)),
+        "promptThreshold": float(memory_cfg("promptThreshold", 30) or 30),
+        "maxInjectChars": int(memory_cfg("maxInjectChars", 2000) or 2000),
+        "entries": len(entries),
+        "permanent": sum(1 for e in entries if e.permanent),
+        "states": counts,
+        "statePath": str(memory_state_path()),
+        "lastInjectChars": len(_MEM_LAST_NOTE or ""),
+        "topActive": detail[:10],
+        # 人设声明（策略层）。「在意的事」本期只报条数 —— 二期抽取层才真正用它。
+        "policy": {
+            "loaded": bool((_MEM_POLICY or {}).get("loaded")),
+            "care": len((_MEM_POLICY or {}).get("care") or []),
+            "avoid": len((_MEM_POLICY or {}).get("avoid") or []),
+            "wakeScale": (_MEM_POLICY or {}).get("wakeScale", 1.0),
+            "decayScale": (_MEM_POLICY or {}).get("decayScale", 1.0),
+        },
+        # 二期排错口：「她什么都没记住，却哪儿都不报错」时看这里。
+        # judge 的原始错误在 l2write.JUDGE_ERRORS，LLM 层的 error 在 _L2_LLM_ERRORS，
+        # 维护链路（resolver / 压缩 / 衰减）的在 l2maintain.ERRORS，各取最近几条。
+        "l2Debug": {
+            "l2Enabled": bool(memory_cfg("l2Enabled", False)),
+            "roundCount": int(_L2_ROUND.get("n") or 0),
+            "judgeInterval": getattr(_L2_SCHED, "judge_interval", None),
+            "decayInterval": getattr(_L2_SCHED, "decay_interval", None),
+            "judgeStat": dict(_L2_JUDGE_STAT),
+            "llmErrors": list(_L2_LLM_ERRORS)[-5:],
+            "judgeErrors": list(getattr(_l2w, "JUDGE_ERRORS", []) or [])[-5:],
+            "maintainErrors": list(getattr(_l2m, "ERRORS", []) or [])[-5:],
+            "lastLlmLen": _L2_LAST_LLM["len"],
+            "lastLlmHead": _L2_LAST_LLM["text"],
+        },
+    }
+
+
+# ========== 二期 L2 接线（P2-6 / P3）==========
+# 与上面的 worldbook 块同处一个文件，但模块导入放在这里：sys.path 已在文件头部补过，
+# 所以直接 import。两个模块任一拿不到就整体降级为 None —— 记忆是附加能力，坏了不能拖住对话。
+try:
+    import cyrene_l2store as _l2s
+    import cyrene_l2write as _l2w
+    import cyrene_l2maintain as _l2m        # P4：维护链路（resolver / 压缩 / 衰减 / 护栏）
+except Exception as _l2_err:                                # pragma: no cover
+    _l2s = None
+    _l2w = None
+    _l2m = None
+    print(f"⚠ L2 模块导入失败（二期记忆停用）: {_l2_err}")
+
+# L2 用独立的锁，不复用 STORE_LOCK —— 两者覆盖的数据不同，共用一把只会互相拖慢。
+# ⚠ 前台（_handle_send）与后台维护线程都会碰它，所以前台取锁必须带超时（见 l2_round）。
+_L2_LOCK = threading.Lock()
+_L2_SCHED = None            # MemoryScheduler | None
+_L2_ROUND = {"n": 0}        # 轮数缓存。选它而不另开一个 roundCount.json：
+                            # store 的 l1.roundCount 本就是这个字段（DEFAULT_L1 里就有），
+                            # 跟 memory.json 同生共死，少一个文件、少一个落盘点。
+_L2_CUR = {"store": None}   # 正在处理的 store；judge 回调从这里取
+_L2_JUDGE = {"obj": None}   # MemoryJudge 实例的懒加载容器
+
+
+def l2_store_path():
+    """L2 库路径：data/l2/memory.json；配了 l2StatePath 就用它（与一期 statePath 同构）。"""
+    # 配了 l2StatePath 就用它（与一期 statePath 同构）；留空回落 data/l2/memory.json。
+    # 这一条不只是给用户留口子 —— 冒烟脚本靠它把库指到临时目录，不碰项目数据。
+    p = str(memory_cfg("l2StatePath", "") or "").strip()
+    return Path(p) if p else (DATA_DIR / "l2" / "memory.json")
+
+
+# 维护链路的「最近失败原因」。为什么要单独留一份：
+#   judge 的错进的是 l2write.JUDGE_ERRORS（进程内），而 LLM 这一层的 error 原先
+#   被**静默吞掉** —— 结果就是「她什么都没记住，可哪儿都不报错」，只能靠猜。
+#   这两份再由 /memory/status 的 l2Debug 段露出来，一眼就能定位。
+_L2_LLM_ERRORS = []
+_L2_JUDGE_STAT = {"runs": 0, "turns": 0, "candidates": 0, "afterFilter": 0}
+# 模型最近一次吐了什么（截前 800 字）。「候选为 0」时，只有看原文才知道
+# 是模型真觉得没什么可记，还是输出格式不对被解析器丢了。
+_L2_LAST_LLM = {"len": 0, "text": ""}
+
+
+def _l2_note_llm_error(msg):
+    _L2_LLM_ERRORS.append(str(msg)[:200])
+    del _L2_LLM_ERRORS[:-10]                    # 只留最近 10 条
+
+
+def _l2_call_llm(messages):
+    """judge 用的 LLM 回调，签名对齐 LLMClient.chat()：返回 (content, reasoning, error)。
+
+    ⚠ 这里不重试、不抛异常：judge 失败就让这一轮不产出候选，下一轮还会再来。
+      超时沿用 SETTINGS.model.request_timeout 的同一套配置。
+    ⚠ 失败**必须记一笔**（`_L2_LLM_ERRORS`），否则上层看到的就是「无事发生」。
+    """
+    try:
+        content, _reasoning, error = LLMClient(SETTINGS).chat(messages)
+        if error:
+            _l2_note_llm_error("chat 返回 error：%s" % error)
+            return ""
+        if not (content or "").strip():
+            _l2_note_llm_error("chat 返回空正文（模型没吐内容）")
+        _L2_LAST_LLM["len"] = len(content or "")
+        _L2_LAST_LLM["text"] = (content or "")[:800]
+        return content or ""
+    except Exception as e:                                  # pragma: no cover
+        _l2_note_llm_error("调用异常：%r" % e)
+        print(f"⚠ L2 judge 调用 LLM 失败: {e}")
+        return ""
+
+
+def _l2_load_store():
+    """读 store 并修 schema：文件不存在 / 读坏了都返回一份全新的 store。"""
+    path = l2_store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = None
+    try:
+        if path.exists():
+            raw = _l2s.read_memory_file(str(path))
+    except Exception as e:
+        print(f"⚠ L2 库读取失败（按空库继续）: {e}")
+    return _l2s.repair_migrations(raw)
+
+
+def _l2_turns_from_session(sid, limit=8):
+    """从落盘的会话历史里取最近 limit 轮（user/assistant 成对）。
+
+    为什么要它：judge 要看的是「他俩最近聊了什么」，而会话历史是落盘的；
+    scheduler 内存里那份 `_recent_turns` 一重启就清零 —— 手机上服务常重启，
+    那会让 judge 手里只剩三五轮，甚至把很短的上下文当成全部来判。
+
+    ⚠ 落库的 user 内容是**注入世界书之前**的原文（见 _handle_send 里 entry_u 的位置），
+      所以这里取到的就是他真正说过的话。
+    ⚠ 只扫尾部（3 倍 limit 条）：会话可能上百条，没必要全遍历。
+    """
+    if not sid or int(limit) <= 0:
+        return []
+    try:
+        with STORE_LOCK:
+            s = SESSIONS.get(sid)
+            msgs = list((s or {}).get("messages") or [])
+    except Exception:
+        return []
+    pairs = []
+    pending = None
+    for m in msgs[-max(2, int(limit) * 3):]:
+        role = m.get("role")
+        if role == "user":
+            pending = str(m.get("content") or "")
+        elif role == "assistant" and pending is not None:
+            pairs.append({"userInput": pending,
+                          "assistantReply": str(m.get("content") or "")})
+            pending = None
+    return pairs[-int(limit):]
+
+
+def _l2_judge(turns, conversation_id):
+    """scheduler 调 judge 的入口：拿到本轮 store，抽取候选并落库。"""
+    store = _L2_CUR.get("store")
+    if store is None:
+        return
+    # 优先用落盘的会话历史（重启动不动都在）；拿不到才退回 scheduler 内存里那份。
+    # ⚠ 这里拿 STORE_LOCK 是安全的：加锁顺序只有「_L2_LOCK → STORE_LOCK」这一个方向，
+    #   主线程落库那条路只用 STORE_LOCK，不成环，不会死锁。
+    try:
+        _limit = int(getattr(_L2_SCHED, "context_turns", 8) or 8)
+    except Exception:
+        _limit = 8
+    from_session = _l2_turns_from_session(conversation_id, _limit)
+    if from_session:
+        turns = from_session
+    judge = _L2_JUDGE.get("obj")
+    if judge is None:
+        judge = _l2w.MemoryJudge(_l2_call_llm, policy_care=_l2w.load_policy_care())
+        _L2_JUDGE["obj"] = judge
+    result = judge.judge(turns, conversation_id)
+    raw_cands = result.get("candidates") or []
+    candidates = _l2w.post_filter_candidates(raw_cands)
+    _l2w.write_candidates(store, candidates, conversation_id)
+    # 统计落一份：判几轮、抽到几条、过滤后剩几条 —— 全 0 也能看出卡在哪一段
+    _L2_JUDGE_STAT["runs"] += 1
+    _L2_JUDGE_STAT["turns"] = len(turns or [])
+    _L2_JUDGE_STAT["candidates"] = len(raw_cands)
+    _L2_JUDGE_STAT["afterFilter"] = len(candidates)
+
+
+def _l2_ensure_scheduler():
+    """scheduler 的单例构造；节流值是 6/8/5/20/50，全部走配置。"""
+    global _L2_SCHED
+    if _L2_SCHED is None:
+        _L2_SCHED = _l2w.MemoryScheduler({
+            "judge_fn": _l2_judge,
+            # P4：三个维护钩子。调度器按 5 / 20 / 50 轮触发，全部跑在后台线程里。
+            "resolve_fn": _l2_resolve,
+            "compress_fn": _l2_compress,
+            "decay_fn": _l2_decay,
+            "get_round_count": lambda: int(_L2_ROUND.get("n") or 0),
+            "set_round_count": lambda n: _L2_ROUND.__setitem__("n", int(n)),
+            # 节流值走配置（P3-5）。0 = 关掉那一项；源码默认 6 / 50。
+            "judge_interval": int(memory_cfg("judgeInterval", 6) or 0),
+            "decay_interval": int(memory_cfg("decayInterval", 50) or 0),
+            # resolve / compress / decay 由 P4 接线；先留 None，scheduler 会自动跳过。
+        })
+    return _L2_SCHED
+
+
+# ---------- P3 召回与注入 ----------
+# L2 进 prompt 的文案：**源码没取到这一段** —— 桌面端拼 L2 注入的地方不在
+# `src/main/memory/` 里（P0 只拉了那个目录），所以下面是我们自定的措辞，
+# 沿用一期世界书的方括号风格。要改口吻就改这一处，别散到别处去。
+L2_INJECT_HEADER = "【关于他的记忆】"
+L2_INJECT_PREAMBLE = (
+    "以下是你记得的、关于他的事。它们来自过去的对话，可能已经过时或记岔了 ——"
+    "拿不准就自然地问一句，不要当成刚刚发生的事来说。"
+)
+
+# 前台召回与后台维护（judge 要调 LLM，慢）共用一把锁。前台只等这么久，
+# 拿不到就跳过本轮注入：记忆是附加能力，宁可这一轮不注入，也不能堵住回复。
+L2_RECALL_LOCK_TIMEOUT = 0.15
+
+
+def l2_available():
+    """L2 能不能工作：两个模块都导进来了 + memory.enabled + memory.l2Enabled。
+
+    ⚠ 二级开关的关系：`enabled` 是总闸（关掉整个记忆系统），`l2Enabled` 只关 L2。
+      两个都开才跑 —— 与 worldbook 那边的 `worldbookEnabled` 是同一种结构。
+    """
+    if _l2s is None or _l2w is None:
+        return False
+    if not memory_cfg("enabled", False):
+        return False
+    return bool(memory_cfg("l2Enabled", False))
+
+
+def build_l2_injection(active, max_chars=1200):
+    """把取到的 L2 拼成注入文本。
+
+    超限**按条截断**（与一期同款）：宁可少一条，也不把一句话的后半截塞进 prompt。
+    例外是第一条就超限 —— 那也截断它，否则长度设小了会一条都拿不到。
+    """
+    items = []
+    used = 0
+    limit = max(0, int(max_chars or 0))
+    for l2 in (active or []):
+        content = str((l2 or {}).get("content") or "").strip()
+        if not content:
+            continue
+        line = "- " + content
+        if limit and used + len(line) > limit:
+            if items:
+                break
+            line = line[:limit]
+        items.append(line)
+        used += len(line) + 1
+    if not items:
+        return ""
+    return L2_INJECT_HEADER + "\n" + L2_INJECT_PREAMBLE + "\n" + "\n".join(items)
+
+
+def l2_round(user_text):
+    """一轮的 L2 处理：词法召回 → DMAE 更新 → 落盘 → 返回可注入文本。
+
+    ⚠ 与 `_l2_after_turn`（后台线程，会调 LLM）共用 `_L2_LOCK`。这里的等待**带超时**：
+      后台正在 judge 时前台不等，直接跳过本轮注入（下一轮再来）。
+    ⚠ `model_text` 传空串：请求还没发出去，不知道她会怎么回。一期世界书那条链路
+      也是这么做的（memory_round 里 model_hit 恒 False）。拿她的回复再补一轮激活，
+      是 P4 维护链路的事。
+    ⚠ 全过程不抛异常：附加能力坏了也不能拖住对话（与一期同一条纪律）。
+    """
+    if not l2_available():
+        return ""
+    if not _L2_LOCK.acquire(timeout=L2_RECALL_LOCK_TIMEOUT):
+        return ""
+    try:
+        store = _l2_load_store()
+        l2_list = _l2s.get_all_l2(store)
+        if not l2_list:
+            return ""
+        text = str(user_text or "")
+        recalled = _l2s.recall_l2_ids(text, l2_list,
+                                      top_k=int(memory_cfg("l2TopK", 8) or 8))
+        mgr = _l2s.L2DmaeManager(store)
+        mgr.update_activation(l2_list, text, "", recalled)
+        active = mgr.get_active_l2_for_prompt(
+            l2_list, max_count=int(memory_cfg("l2InjectLimit", 4) or 4))
+        note = build_l2_injection(active, memory_cfg("l2MaxInjectChars", 1200))
+        try:
+            _l2s.write_memory_file(str(l2_store_path()), store)
+        except Exception as e:
+            print(f"⚠ L2 状态落盘失败（本轮照常注入）: {e}")
+        return note
+    except Exception as e:
+        print(f"⚠ L2 召回失败（已跳过注入）: {e}")
+        return ""
+    finally:
+        _L2_LOCK.release()
+
+
+# ---------- P5 面板数据 ----------
+# 面板一次拿全（状态 / L0 / L1 / L2 / 反思日志），前端不用拼好几个请求。
+# 形状照着「她的事要能被看见」定：L2 每条给出 weight + 三态 + 时间，
+# 反思日志给 type + 摘要 + 时间。
+def l2_panel_data(limit_logs=50):
+    """L2 库的只读快照。拿不到锁时如实返回 busy，不假装是空库。"""
+    empty = {"available": False, "busy": False, "items": [], "counts": {}, "logs": []}
+    if _l2s is None:
+        return empty
+    # ⚠ 后台维护（judge / resolver 都要调 LLM）可能正持有这把锁，
+    #   面板是只读展示，等不到就下次再看，绝不阻塞。
+    if not _L2_LOCK.acquire(timeout=L2_RECALL_LOCK_TIMEOUT):
+        busy = dict(empty)
+        busy["busy"] = True
+        return busy
+    try:
+        store = _l2_load_store()
+        states = {}
+        for s in (store.get("l2DmaeStates") or []):
+            if isinstance(s, dict):
+                states[s.get("l2Id")] = s
+        items = []
+        counts = {"active": 0, "aging": 0, "archived": 0, "total": 0}
+        for l2 in _l2s.get_all_l2(store):
+            st = states.get(l2.get("id")) or {}
+            status = str(l2.get("status") or "")
+            counts["total"] += 1
+            if status in counts:
+                counts[status] += 1
+            items.append({
+                "id": l2.get("id"),
+                "content": str(l2.get("content") or ""),
+                "weight": l2.get("weight"),
+                "status": status,
+                "activation": round(float(st.get("activation") or 0), 2),
+                "isPinned": bool(l2.get("isPinned")),
+                "recallCount": l2.get("recallCount"),
+                "createdAt": l2.get("createdAt"),
+            })
+        items.sort(key=lambda x: x.get("createdAt") or 0, reverse=True)
+        logs = []
+        for log in (_l2s.get_reflection_logs(store) or [])[-int(limit_logs):]:
+            if not isinstance(log, dict):
+                continue
+            logs.append({
+                "type": log.get("type"),
+                "summary": str(log.get("summary") or ""),
+                "details": str(log.get("details") or ""),
+                "createdAt": log.get("createdAt"),
+            })
+        logs.reverse()                      # 新的在前
+        return {"available": True, "busy": False, "items": items,
+                "counts": counts, "logs": logs}
+    except Exception as e:
+        print(f"⚠ L2 面板数据读取失败: {e}")
+        return empty
+    finally:
+        _L2_LOCK.release()
+
+
+def l2_forget(l2_id):
+    """删掉一条 L2（库里的条目 + 它的 DMAE 状态行），返回「是否真删到了」。
+
+    ⚠ 状态行不能留孤儿：条目没了还挂着一行 activation/silence，面板三态会数错，
+      以后同 id 复用还会串味。
+    ⚠ 抽成模块级函数（而不是埋在 HTTP handler 里）是为了能被离线冒烟直接调 ——
+      handler 只剩参数校验与响应。
+    """
+    if _l2s is None:
+        return False
+    if not _L2_LOCK.acquire(timeout=2.0):
+        raise TimeoutError("记忆库正忙")
+    try:
+        store = _l2_load_store()
+        if not _l2s.delete_l2(store, l2_id):
+            return False
+        states = store.get("l2DmaeStates")
+        if isinstance(states, list):
+            store["l2DmaeStates"] = [
+                s for s in states
+                if not (isinstance(s, dict) and s.get("l2Id") == l2_id)]
+        _l2s.write_memory_file(str(l2_store_path()), store)
+        return True
+    finally:
+        _L2_LOCK.release()
+
+
+# L0 / L1 允许手改的字段白名单（面板上那个「改」按钮走这里）。
+# ⚠ 为什么不放开整张表：里面还有 updatedAt / generatedAt / roundCount 这类由程序
+#   维护的字段，让它们被手改会把时间线和轮数弄乱。isPinned 单独放行（bool）。
+L0_EDITABLE = ("nickname", "preferredName", "occupation", "longTermInterests",
+               "language", "permanentNote", "isPinned")
+L1_EDITABLE = ("recentGoals", "recentPreferences", "currentProject")
+
+
+def memory_profile_update(patch):
+    """改 L0 画像 / L1 近况的字段（面板上的编辑）。
+
+    patch 形如 `{"l0": {"preferredName": "宝宝"}, "l1": {"recentGoals": "…"}}`。
+
+    ⚠ 白名单之外一律**忽略**（不报错也不写）：宁可少写，也不能让程序维护的字段
+      被手改坏。若一个都没命中，如实回「没有可改的字段」。
+    ⚠ 与所有写库操作一样持 `_L2_LOCK`（带超时）；手改也算一次画像变动，记一条
+      反思日志，这样「反思日志」里看得见「谁在什么时候改过什么」。
+    """
+    if _l2s is None:
+        return {"ok": False, "error": "记忆模块未加载"}
+    patch = patch if isinstance(patch, dict) else {}
+    l0 = patch.get("l0") if isinstance(patch.get("l0"), dict) else {}
+    l1 = patch.get("l1") if isinstance(patch.get("l1"), dict) else {}
+    if not _L2_LOCK.acquire(timeout=2.0):
+        return {"ok": False, "error": "记忆库正忙，稍后再试"}
+    try:
+        store = _l2_load_store()
+        applied = {"l0": [], "l1": []}
+        for k, v in l0.items():
+            if k not in L0_EDITABLE:
+                continue
+            if k == "isPinned":
+                _l2s.upsert_l0_field(store, k, bool(v))
+            else:
+                _l2s.upsert_l0_field(store, k, str(v if v is not None else "")[:2000])
+            applied["l0"].append(k)
+        for k, v in l1.items():
+            if k not in L1_EDITABLE:
+                continue
+            _l2s.replace_l1_field(store, k, str(v if v is not None else "")[:2000])
+            applied["l1"].append(k)
+        if not applied["l0"] and not applied["l1"]:
+            return {"ok": False, "error": "没有可改的字段（都在白名单之外）"}
+        _l2s.append_reflection_log(store, {
+            "type": "l0_update" if applied["l0"] else "l1_update",
+            "summary": "手动编辑：" + "、".join(
+                ["L0." + k for k in applied["l0"]] + ["L1." + k for k in applied["l1"]]),
+        })
+        _l2s.write_memory_file(str(l2_store_path()), store)
+        return {"ok": True, "applied": applied}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        _L2_LOCK.release()
+
+
+def memory_panel():
+    """GET /memory/panel：面板要的四块一次给全。
+
+    ⚠ 状态块复用一期的 memory_status()（世界书条目数与三态、策略摘要、开关都在里面）；
+      L2 与反思日志来自 l2_panel_data()。两者都不回显任何密钥。
+    ⚠ L0/L1 读的是同一个 store：没开 L2 时给默认空壳，面板不会因为空库报错。
+    """
+    st = memory_status()
+    l2 = l2_panel_data()
+    l0, l1 = {}, {}
+    if _l2s is not None:
+        try:
+            store = _l2_load_store()
+            l0 = dict(_l2s.create_default_l0())
+            l0.update(store.get("l0") or {})
+            l1 = dict(_l2s.DEFAULT_L1)
+            l1.update(store.get("l1") or {})
+        except Exception as e:
+            print(f"⚠ L0/L1 读取失败（面板按空画像显示）: {e}")
+    return {
+        "status": st,
+        "l0": l0,
+        "l1": l1,
+        "l2": l2["items"],
+        "counts": l2["counts"],
+        "reflectionLogs": l2["logs"],
+        "l2Available": l2["available"],
+        "l2Busy": l2["busy"],
+    }
+
+
+# ---------- P4 维护链路的三个回调 ----------
+# 它们由 MemoryScheduler 按节流点调用（默认 每 5 / 20 / 50 轮），跑在 `_l2_after_turn`
+# 的后台线程里 —— 那时 _L2_LOCK 已经持有、_L2_CUR["store"] 就是本轮 store。
+# ⚠ 这三个函数**不要自己取锁**：_L2_LOCK 是不可重入的 threading.Lock，再取一次会死锁。
+# ⚠ _l2m 导入失败时整段降级成 no-op：维护链路停用，但对话与召回照常。
+
+
+def _l2_maint_store():
+    """取本轮正在处理的 store；拿不到就返回 None（说明不在维护上下文里）。"""
+    if _l2m is None or _l2s is None:
+        return None
+    return _L2_CUR.get("store")
+
+
+def _l2_resolve(_count):
+    """每 5 轮：处理冲突队列，LLM 判定两条记忆的关系并落库。"""
+    store = _l2_maint_store()
+    if store is None:
+        return
+    try:
+        # ⚠ 每次最多处理 3 条：resolve 是「一条冲突一次 LLM」。用模块默认的 20，
+        #   队列满时会在这个后台线程里串行打 20 次，持着 _L2_LOCK 几十秒到几分钟 ——
+        #   那期间前台 l2_round 全部超时跳过，表现为「她突然记不起事」。
+        #   剩下的留到下一个 5 轮，反正队列不会跑。
+        _l2m.MemoryResolver(_l2_call_llm).resolve_once(store, limit=3)
+    except Exception as e:
+        print(f"⚠ L2 冲突裁决失败: {e}")
+
+
+def _l2_compress(_count):
+    """每 20 轮：相似 L2 合并 + 画像反思（L0/L1 更新）。"""
+    store = _l2_maint_store()
+    if store is None:
+        return
+    try:
+        _l2m.MemoryCompressor(_l2_call_llm).compress_once(store)
+    except Exception as e:
+        print(f"⚠ L2 压缩失败: {e}")
+
+
+def _l2_decay(_count):
+    """每 50 轮：权重衰减一轮，随后跑一次体积护栏。
+
+    ⚠ 顺序不能反：先衰减把冷条目降下去，护栏再按 weight 归档才挑得准。
+    ⚠ 护栏上限用 maintain 模块的默认值（L2_MAX_ENTRIES = 300，手机端自定）。
+    """
+    store = _l2_maint_store()
+    if store is None:
+        return
+    try:
+        _l2m.run_decay(store)
+        _l2m.enforce_l2_limit(store)
+    except Exception as e:
+        print(f"⚠ L2 衰减失败: {e}")
+
+
+def _l2_after_turn(user_text, assistant_text, sid):
+    """一轮结束后登记进 scheduler，命中节流点才调 LLM。**跑在后台线程，不阻塞回复。**
+
+    只在总闸与 L2 开关都开着时才做事；任一关着就直接 return，行为与改动前一致。
+    全程持 _L2_LOCK（与 STORE_LOCK 分开），做完把 store 的 l1.roundCount 落盘。
+    """
+    # ⚠ 判据用 l2_available()（总闸 + L2 开关 + 模块都在），不是只判总闸：
+    #   只开总闸、不开 L2 时，后台照样会跑 judge —— 每次都调 LLM、写 L2 库，
+    #   而注入侧又不注入，等于白花额度、还留下一份面板上看不见的数据。
+    if not l2_available():
+        return
+    try:
+        with _L2_LOCK:
+            store = _l2_load_store()
+            _L2_ROUND["n"] = int((store.get("l1") or {}).get("roundCount") or 0)
+            _L2_CUR["store"] = store
+            try:
+                _l2_ensure_scheduler().after_turn(
+                    str(user_text or ""), str(assistant_text or ""), str(sid or ""))
+            finally:
+                _L2_CUR["store"] = None
+            store["l1"]["roundCount"] = int(_L2_ROUND.get("n") or 0)
+            _l2s.write_memory_file(str(l2_store_path()), store)
+    except Exception as e:
+        print(f"⚠ L2 后台维护失败: {e}")
+
+
 def normalize_settings(raw):
     """把任意输入夹成合法结构。缺失项回落默认值，多余项丢弃。"""
     src = raw if isinstance(raw, dict) else {}
@@ -3762,6 +4716,7 @@ def normalize_settings(raw):
     out["agent"] = normalize_agent(src.get("agent"))
     out["plugins"] = normalize_plugins(src.get("plugins"))
     out["vision"] = normalize_vision(src.get("vision"))
+    out["memory"] = normalize_memory(src.get("memory"))
     return out
 
 
@@ -4048,8 +5003,11 @@ def enabled_tools():
     """开关生效点 1/2：只有 enabled 的工具才进系统提示。"""
     t = SETTINGS.get("tools", {})
     allow_vision = vision_tools_allowed()
+    allow_memory = memory_tools_allowed()
     return {k: v for k, v in TOOLS.items()
-            if t.get(k, True) and (allow_vision or k not in VISION_TOOL_IDS)}
+            if t.get(k, True)
+            and (allow_vision or k not in VISION_TOOL_IDS)
+            and (allow_memory or k not in MEMORY_TOOL_IDS)}
 
 
 def build_system_prompt(mode=None):
@@ -8195,9 +9153,13 @@ def enabled_tool_names(mode=None):
     """
     t = SETTINGS.get("tools", {})
     allow_vision = vision_tools_allowed()
+    allow_memory = memory_tools_allowed()
     out = []
     for n, spec in TOOLS.items():
         if not t.get(n, True):
+            continue
+        if not allow_memory and n in MEMORY_TOOL_IDS:
+            # 记忆总开关关着时也不带这个工具，理由同下面视觉那段。
             continue
         if not allow_vision and n in VISION_TOOL_IDS:
             # 视觉工具总开关关掉时，连 tools 数组都不带它们 ——
@@ -8657,7 +9619,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <aside id="settings" aria-label="设置">
   <div class="settings-titlebar">
     <span class="settings-titlebar__title">设置</span>
-    <span class="settings-titlebar__hint">昔涟 v8</span>
+    <span class="settings-titlebar__hint">cyrene v9</span>
     <button id="settings-close" class="icon-btn" type="button" aria-label="关闭设置"><svg class="ic"><use href="#ic-x" xlink:href="#ic-x"/></svg></button>
   </div>
   <nav class="settings-nav" id="settings-nav"></nav>
@@ -8967,6 +9929,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(self._plugin_overview())
         elif path == "/vision/status":
             self._json(self._vision_status())
+        elif path == "/memory/status":
+            self._json(self._memory_status())
+        elif path == "/memory/panel":
+            self._json(self._memory_panel())
         elif path == "/plugins/market":
             # ?refresh=1 强制刷新，绕过 5 分钟缓存
             q = urllib.parse.parse_qs(urlparse(self.path).query)
@@ -9556,6 +10522,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "cleared": vision_cache_clear()})
             return
 
+        # 世界书 / 记忆：注入预览与 L2 删除。与上面两条同样精确匹配，
+        # 不会与 /settings 或 /plugins/* 相撞。
+        if path == "/memory/inject/test":
+            self._handle_memory_inject_test(body)
+            return
+        if path == "/memory/l2/forget":
+            self._handle_memory_l2_forget(body)
+            return
+        if path == "/memory/profile":
+            self._handle_memory_profile(body)
+            return
+
         # ⚠ 顺序要紧：/tools/bulk 必须排在 /tools/{tid} 之前。
         # 反过来的话 seg=["tools","bulk"] 先命中 len==2 分支，被当成
         # 「开关一个叫 bulk 的工具」→ unknown tool → 404。
@@ -9793,6 +10771,100 @@ class Handler(BaseHTTPRequestHandler):
             "last": last,
             "tools": {t: (t in TOOLS) for t in VISION_TOOL_IDS},
         })
+
+    def _memory_status(self):
+        """GET /memory/status：世界书与记忆的运行态。**不回显任何密钥**。
+
+        面板自检与真机验收的抓手：不聊一句就能确认「条目读到了多少、
+        状态表有没有动静、注入上限是多少」。memory_status() 是模块级纯读
+        函数，这里补上懒加载与工具位这两件只有端点才关心的事。
+        """
+        if memory_available():
+            memory_load()          # 面板一打开就该看到真实条目数，不是 0
+        snap = memory_status()
+        snap["tools"] = {t: (t in TOOLS) for t in MEMORY_TOOL_IDS}
+        return snap
+
+    def _memory_panel(self):
+        """GET /memory/panel：记忆面板的四块（状态 / L0 / L1 / L2 与反思日志）。
+
+        与 _memory_status 同样先做懒加载：面板一打开就该看到真实内容，
+        而不是「条目数 0、等她聊过一句才对」。
+        """
+        if memory_available():
+            memory_load()
+        return memory_panel()
+
+    def _handle_memory_l2_forget(self, body):
+        """POST /memory/l2/forget：删掉一条 L2（面板上的删除按钮）。
+
+        ⚠ 这是**真删**：库里的条目和它的 DMAE 状态行一起移除。
+          用户点删除的意图是「让她忘掉这件事」，留个 archived 壳会继续参与
+          计数与统计，反而更让人困惑。
+        ⚠ 锁只等 2 秒：删除是用户主动动作，卡住时如实报忙，比转圈好。
+        """
+        if _l2s is None:
+            self._json({"ok": False, "error": "记忆模块未加载"}, 503); return
+        lid = str((body or {}).get("id") or "").strip()
+        if not lid:
+            self._json({"ok": False, "error": "缺少 id"}, 400); return
+        try:
+            if not l2_forget(lid):
+                self._json({"ok": False, "error": "没找到这条记忆"}, 404); return
+            self._json({"ok": True, "id": lid})
+        except TimeoutError:
+            self._json({"ok": False, "error": "记忆库正忙，稍后再试"}, 503)
+        except Exception as e:
+            self._json({"ok": False, "error": str(e)}, 500)
+
+    def _handle_memory_profile(self, body):
+        """POST /memory/profile：改 L0 画像 / L1 近况的字段（面板上的编辑）。
+
+        只收 `{"l0": {...}, "l1": {...}}`；字段白名单在模块级 `L0_EDITABLE` /
+        `L1_EDITABLE`，表外的一律忽略 —— 详情见 `memory_profile_update` 的注释。
+        """
+        res = memory_profile_update(body or {})
+        self._json(res, 200 if res.get("ok") else 400)
+
+    def _handle_memory_inject_test(self, body):
+        """POST /memory/inject/test：传一段文本，回显「这一轮会注入什么」。
+
+        只跑注入构造：不改状态、不落盘、不调 LLM —— 纯粹用来调参。
+        想看真实召回结果请用 recall_memory 工具（那条路会走模型精排）。
+        """
+        text = str((body or {}).get("text") or "").strip()
+        if not text:
+            self._json({"error": "empty", "hint": '传 {"text": "..."}'}, 400)
+            return
+        if _mem is None:
+            self._json({"ok": False, "reason": "记忆模块未加载"}, 200)
+            return
+        if not memory_cfg("enabled", False):
+            self._json({"ok": False,
+                        "reason": "记忆功能未开启（memory.enabled 为 false）"}, 200)
+            return
+        try:
+            memory_load()
+            entries = _MEM_ENTRIES or []
+            mgr = _MEM_MGR
+            states = mgr.states if mgr is not None else {}
+            note = _mem.build_injection(
+                text, entries, states,
+                int(memory_cfg("maxInjectChars", 2000) or 2000),
+                float(memory_cfg("promptThreshold", 30) or 30)) or ""
+            self._json({
+                "ok": True,
+                "entries": len(entries),
+                "injected": bool(note),
+                "chars": len(note),
+                "text": note,
+                # 本轮会命中哪些条目（只报 id，不重复吐正文）
+                "hitIds": [e.id for e in entries
+                           if e.enabled and not e.permanent
+                           and _mem.match_keywords(text, e)],
+            })
+        except Exception as e:
+            self._json({"ok": False, "reason": f"{type(e).__name__}: {e}"}, 200)
 
     def _handle_vision_test(self, body):
         """POST /vision/test：当场跑一次转述，把结果与错误原文一起回显。
@@ -10044,6 +11116,31 @@ class Handler(BaseHTTPRequestHandler):
                 history[-1] = {"role": "user",
                                "content": history[-1].get("content", "") + vision_note}
 
+        # 世界书注入：与视觉同一套路 —— 拼进**本轮** user 消息，不落库。
+        # 下一条用户消息会按最新激活状态重算一次（知识随沉默衰减、也会被
+        # 重新唤醒）。memory.enabled 关着时整段跳过，行为与改动前完全一致。
+        # 只改这一条消息就够：run_agent_loop 内的多轮请求共用同一份 history，
+        # 所以 loop 的每一轮都看得到它。
+        if memory_available() and history and history[-1].get("role") == "user":
+            try:
+                mem_note = memory_round(history[-1].get("content", ""))
+            except Exception as e:                       # 双保险：引擎内部已吞异常
+                mem_note = ""
+                print(f"⚠ 世界书注入失败（已跳过）: {e}")
+            if mem_note:
+                cur = history[-1].get("content", "")
+                if isinstance(cur, list):
+                    # 多模态：追加到最后一个 text part，别碰 image_url part
+                    for part in reversed(cur):
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            part["text"] = str(part.get("text", "")) + "\n\n" + mem_note
+                            break
+                    else:
+                        cur.append({"type": "text", "text": mem_note})
+                else:
+                    history[-1] = {"role": "user",
+                                   "content": str(cur or "") + "\n\n" + mem_note}
+
         mode_allows_tools = MODES[mode].get("tools", False)
         show_steps = agent_cfg("showSteps")
 
@@ -10097,6 +11194,15 @@ class Handler(BaseHTTPRequestHandler):
                 #   提问卡选项与进度条就再也回不来（本 bug 的最底层根因）。
                 #   s 即 SESSIONS.get(sid)，与重新取一次是同一个对象，直接复用。
                 todos_out = list((s or {}).get("todos") or [])
+
+            # ?? L2 ?????P2-6?????????? scheduler???????
+            # **????**?? LLM ???????????????????????
+            # ???? L2 ?????_L2_LOCK???? STORE_LOCK???????????
+            threading.Thread(
+                target=_l2_after_turn,
+                args=(msg, resp, sid),
+                name="l2-after-turn", daemon=True,
+            ).start()
 
             self._json({
                 "response": resp,
@@ -10216,10 +11322,12 @@ UPDATE_BRANCH = "main"
 # 实测一次 tree API 只要 0.2 秒；GitHub 要 1.5 秒，国内还可能被掐。
 UPDATE_SOURCES = (
     ("Gitee", "morisuke/cyrene-web-mobile",
-     "https://gitee.com/api/v5/repos/%s/git/trees/%s?recursive=1"),
+     "https://gitee.com/api/v5/repos/%s/git/trees/%s?recursive=1", 15),
     ("GitHub", "morisukesu/cyrene-web-mobile",
-     "https://api.github.com/repos/%s/git/trees/%s?recursive=1"),
+     "https://api.github.com/repos/%s/git/trees/%s?recursive=1", 10),
 )
+# ⚠ 每项最后那个数是「这个源最多等多久」。GitHub 只作兜底，给它长超时纯属白等：
+#   国内连不上时它会一直挂到超时，而用户在前端那头早就以为死了。
 # 参与比对的目录，与 update.sh 里的 fp_of 保持一致
 CODE_DIRS = ("prompts", "runtime", "skills")
 
@@ -10254,35 +11362,61 @@ def _local_code_shas():
     return out
 
 
-def _remote_code_shas(timeout=25):
-    """远端同一批文件的 blob sha。两个源按顺序试，谁先答上来用谁。
+def _fetch_remote_tree(name, slug, tpl, timeout):
+    """问一个源要 tree，返回 (路径 -> sha, 源名字)。失败就抛，由调用方收拢。"""
+    req = urllib.request.Request(tpl % (slug, UPDATE_BRANCH), headers={
+        "User-Agent": "cyrene-web-mobile",
+        "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = json.loads(r.read().decode("utf-8", "replace"))
+    out = {}
+    for e in d.get("tree") or []:
+        p = e.get("path") or ""
+        if e.get("type") != "blob" or not p.startswith("cyrene_mobile/"):
+            continue
+        parts = p.split("/")
+        if not (len(parts) >= 3 and parts[1] in CODE_DIRS) \
+                and p != "cyrene_mobile/setup.sh":
+            continue
+        out[p] = e.get("sha") or ""
+    if not out:
+        raise ValueError("这个源没回文件列表")
+    return out, name
 
-    返回 (路径 -> sha, 源名字)。
+
+def _remote_code_shas():
+    """远端同一批文件的 blob sha：**两个源同时问**，谁先答上来用谁。
+
+    为什么要并行：以前是串行试（Gitee → GitHub）。Gitee 一抖动就得先白等它超时，
+    再等 GitHub —— 两个超时加起来半分钟起，前端那头早被浏览器掐断了，
+    表现出来就是「检测更新有时候会中断」。并行之后最坏只有一个超时的长度。
+
+    ⚠ 总等待取「所有源里最长的超时 + 2 秒」，不无限等：urllib 的超时管不住
+      DNS 卡死之类的极端情况，宁可放弃这一轮也别把请求线程钉在这儿。
     """
-    last = None
-    for name, slug, tpl in UPDATE_SOURCES:
+    results, errors = [], []
+    lock = threading.Lock()
+
+    def worker(nm, sg, tp, to):
         try:
-            req = urllib.request.Request(tpl % (slug, UPDATE_BRANCH), headers={
-                "User-Agent": "cyrene-web-mobile",
-                "Accept": "application/vnd.github+json"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                d = json.loads(r.read().decode("utf-8", "replace"))
-            out = {}
-            for e in d.get("tree") or []:
-                p = e.get("path") or ""
-                if e.get("type") != "blob" or not p.startswith("cyrene_mobile/"):
-                    continue
-                parts = p.split("/")
-                if not (len(parts) >= 3 and parts[1] in CODE_DIRS) \
-                        and p != "cyrene_mobile/setup.sh":
-                    continue
-                out[p] = e.get("sha") or ""
-            if not out:
-                raise ValueError("这个源没回文件列表")
-            return out, name
+            got = _fetch_remote_tree(nm, sg, tp, to)
+            with lock:
+                results.append(got)
         except Exception as e:
-            last = "%s: %s" % (name, e)
-    raise RuntimeError(last or "两个源都没答上来")
+            with lock:
+                errors.append("%s: %s" % (nm, e))
+
+    threads = []
+    for item in UPDATE_SOURCES:
+        t = threading.Thread(target=worker, args=item, daemon=True)
+        t.start()
+        threads.append(t)
+    wait = max([it[-1] for it in UPDATE_SOURCES] or [10]) + 2
+    for t in threads:
+        t.join(timeout=wait)
+    if results:
+        return results[0]
+    raise RuntimeError("；".join(errors) or "两个源都没答上来")
 
 
 def _fp_of(mapping):
@@ -10321,12 +11455,17 @@ def _update_check_via_script(note=""):
     if not bash:
         return {"ok": False, "supported": False, "error": why}
     try:
+        # ⚠ 90 秒封顶，不是 900。这条是**同步**请求（前端正等着 HTTP 响应），
+        #   而备用通道要下整包，网慢时十几分钟都可能。等满 15 分钟毫无意义——
+        #   前端早断了，用户只看到「检测失败」，还以为是程序坏了。
+        #   宁可如实说「慢通道没在 90 秒内出结果」，并告诉他去哪看完整过程。
         p = subprocess.run([bash, str(UPDATE_SH), "--check"], cwd=str(REPO_DIR),
-                           capture_output=True, timeout=900)
+                           capture_output=True, timeout=90)
         text = ((p.stdout or b"") + (p.stderr or b"")).decode("utf-8", "replace")
     except subprocess.TimeoutExpired:
         return {"ok": False, "supported": True,
-                "error": "备用方式也超时了（它要下整包，网慢时十几分钟都可能）。"}
+                "error": "备用方式 90 秒内没出结果（它要下整包，网慢时就是这样）。"
+                         "可以在 Termux 里手动跑 bash update.sh --check 看完整过程。"}
     except Exception as e:
         return {"ok": False, "supported": True, "error": "检测失败：%s" % e}
     info = _update_parse(text)
@@ -10572,7 +11711,7 @@ def main():
     global HTTP_SERVER
     # SYSTEM_PROMPTS 已在模块加载时按四种模式预建，无需在此重算
     print("=" * 50)
-    print("  昔涟 · 手机版 Web Agent  v8")
+    print("  昔涟 · 手机版 Web Agent  v9")
     print("  主题: charcoal-pink / pearl-white（桌面端真值）")
     print("=" * 50)
     m = SETTINGS.get("model", {})
