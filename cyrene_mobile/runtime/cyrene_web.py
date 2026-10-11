@@ -1051,17 +1051,19 @@ def _html_to_markdown(body, content_type):
     return "", stripped.strip()
 
 
-# ---------- 博查搜索后端（对齐桌面端 web-search-tool）----------
-# 桌面端那份的要点照搬：engine 由设置注入、POST /v1/web-search、Bearer key、
+# ---------- 结构化搜索后端（博查 / Tavily）----------
+# 桌面端那份的要点照搬：engine 由设置注入、POST 一小段 JSON、Bearer key、
 # 结果统一成 {title,url,snippet,source}、snippet 截断、30 分钟 TTL 缓存。
 # 手机端两点差别：
 #   ① 只用 urllib + json（零第三方依赖）；
-#   ② 博查失败要能落回下面那套 HTML 抓取，所以这里只负责「拿到就返回」，
-#      「什么时候该降级」留在 _h_web_search 里决定。
+#   ② API 通道失败要能落回下面那套 HTML 抓取，所以每个 client 只负责
+#      「拿到就返回」，「什么时候该降级」留在 _h_web_search 里决定。
+# 两条 API 通道共用超时、响应上限与结果缓存 —— 差别只在端点、请求体、响应字段。
 BOCHA_SEARCH_URL = "https://api.bochaai.com/v1/web-search"
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 SEARCH_CACHE_MAX = 64                        # 内存条数上限（与视觉缓存同款考虑）
 SEARCH_RESULT_MAX_BYTES = 2 * 1024 * 1024    # 搜索响应读取上限，防 OOM
-SEARCH_FALLBACK_TIMEOUT = 8                  # 博查失败后落回抓取时的超时封顶（秒）
+SEARCH_FALLBACK_TIMEOUT = 8                  # API 失败后落回抓取时的超时封顶（秒）
 
 _search_cache = {}                   # key -> (ts, items)；dict 保序，天然 FIFO 淘汰
 _search_cache_lock = threading.Lock()
@@ -1205,6 +1207,58 @@ def bocha_search(query, count, timeout):
         {"Authorization": "Bearer " + key},
         SEARCH_RESULT_MAX_BYTES, timeout)
     return _bocha_items(data, snippet_chars)
+
+
+def _tavily_items(data, snippet_chars):
+    """把 Tavily 响应映射成统一的 [(title, url, snippet, source)]。
+
+    官方形态是根上的 results[]（每项 title/url/content/score/raw_content）；
+    网关包装过的写法见过 data.results，收宽一点不会错（与 _bocha_items 同款思路）。
+    Tavily 不返回站点名，source 用 URL 的 host —— 总比空串有用，也和博查那条路
+    「有来源就填」的语义一致（抓取那条路拿不到站点名，仍是空串）。
+    """
+    results = None
+    if isinstance(data.get("data"), dict):
+        results = data["data"].get("results")
+    if not isinstance(results, list):
+        results = data.get("results")
+    items = []
+    for r in (results or []):
+        if not isinstance(r, dict):
+            continue
+        title = str(r.get("title") or r.get("name") or "").strip()
+        url = str(r.get("url") or "").strip()
+        snippet = re.sub(r"\s+", " ",
+                         str(r.get("content") or r.get("snippet") or "")).strip()
+        if len(snippet) > snippet_chars:
+            snippet = snippet[:snippet_chars] + "…"
+        source = ""
+        try:
+            source = urlparse(url).netloc
+        except Exception:
+            source = ""
+        if url.startswith("http"):
+            items.append((title, url, snippet, source))
+    return items
+
+
+def tavily_search(query, count, timeout):
+    """调 Tavily /search。返回 [(title,url,snippet,source)]；失败抛 NetError。
+
+    search_depth 固定 basic：advanced 更慢也更吃额度，而调用方（模型）拿到的是
+    同样的 标题/链接/摘要 三元组，这里不划算。
+    """
+    key = str(search_cfg("tavilyKey", "") or "").strip()
+    if not key:
+        raise NetError("(没配 Tavily key)")
+    snippet_chars = int(search_cfg("snippetChars", 500) or 500)
+    data = _net_post_json(
+        TAVILY_SEARCH_URL,
+        {"query": query, "max_results": count, "search_depth": "basic",
+         "include_answer": False},
+        {"Authorization": "Bearer " + key},
+        SEARCH_RESULT_MAX_BYTES, timeout)
+    return _tavily_items(data, snippet_chars)
 
 
 # ---------- web_search 后端解析 ----------
@@ -2112,9 +2166,21 @@ def caption_image(source, question="", cfg=None):
 
 # ---------- 三个 handler ----------
 
+# 三条结构化 API 通道的 client 与显示名。收成表是为了让 _h_web_search 里只剩
+# 一条分支 —— 以后加第三条通道只改这几张表 + search_engine()，不动主流程。
+# （这三张表在函数定义之后才出现在源码里，但模块级执行顺序保证拿得到函数对象。）
+_SEARCH_API_CLIENTS = {"bocha": bocha_search, "tavily": tavily_search}
+_SEARCH_API_LABELS = {"bocha": "博查 API", "tavily": "Tavily API"}
+_SEARCH_API_SHORT = {"bocha": "博查", "tavily": "Tavily"}
+
+
 def _search_engine_pinned():
-    """用户是否显式选了「只用博查」—— 决定博查失败时要不要偷偷换成抓取。"""
-    return str(search_cfg("engine", "auto") or "auto").strip().lower() == "bocha"
+    """引擎是否被用户显式硬钉（只用博查 / 只用 Tavily）。
+
+    硬钉档失败要如实报错：他要的就是那家的结果，偷偷塞一份抓来的网页结果
+    给他反而是骗人。只有 auto 档才允许落回抓取。
+    """
+    return str(search_cfg("engine", "auto") or "auto").strip().lower() in ("bocha", "tavily")
 
 
 def _fetch_search_fallback(query, n, timeout):
@@ -2162,11 +2228,11 @@ def _fetch_search_fallback(query, n, timeout):
 
 
 def _h_web_search(a):
-    """web_search：配了博查 key 就先走 API（对齐桌面端），失败再抓结果页。
+    """web_search：按设置选一条结构化 API（博查 / Tavily），失败再抓结果页。
 
-    降级链：**博查 API → 网页抓取**。没配 key 时整条路径与改动前完全一致；
-    engine=bocha（用户显式「只用博查」）时失败就如实报错 —— 他要的是博查的
-    结果，塞一份抓来的网页结果给他反而是骗人。
+    降级链：**API（auto 档下博查优先，其次 Tavily）→ 网页抓取**。没配任何 key
+    时整条路径与改动前完全一致；engine 硬钉成 bocha / tavily 时失败就如实报错
+    —— 他要的是那一家的结果，塞一份抓来的网页结果给他反而是骗人。
     """
     query = (a.get("query") or "").strip()
     if not query:
@@ -2175,39 +2241,46 @@ def _h_web_search(a):
     timeout = _net_timeout()
 
     items, head, notes = [], "", []
+    provider = search_engine()
+    label = ""          # 只有走了 API 通道才有值，给下面拼错误文案用
 
-    if search_engine() == "bocha":
-        ckey = "bocha|%s|%d" % (query, n)
+    if provider in _SEARCH_API_CLIENTS:
+        label = _SEARCH_API_LABELS.get(provider, provider)
+        ckey = "%s|%s|%d" % (provider, query, n)
         cached = search_cache_get(ckey)
         if cached is not None:
             items = list(cached)
-            head = f"搜索「{query}」· 博查 API（缓存）· {len(items)} 条结果"
+            head = f"搜索「{query}」· {label}（缓存）· {len(items)} 条结果"
             notes.append("同一关键词在缓存有效期内，未重复请求")
         else:
             try:
-                items = bocha_search(query, n, int(search_cfg("request_timeout", 20) or 20))
+                items = _SEARCH_API_CLIENTS[provider](
+                    query, n, int(search_cfg("request_timeout", 20) or 20))
                 search_cache_put(ckey, items)
-                head = f"搜索「{query}」· 博查 API · {len(items)} 条结果"
+                head = f"搜索「{query}」· {label} · {len(items)} 条结果"
                 SEARCH_LAST.clear()
                 SEARCH_LAST.update({"ok": True, "at": time.time(),
-                                    "engine": "bocha", "count": len(items)})
+                                    "engine": provider, "count": len(items)})
             except NetError as e:
                 err = str(e)
                 SEARCH_LAST.clear()
                 SEARCH_LAST.update({"ok": False, "at": time.time(),
-                                    "engine": "bocha", "error": err[:200]})
+                                    "engine": provider, "error": err[:200]})
                 if _search_engine_pinned():
+                    short = _SEARCH_API_SHORT.get(provider, provider)
                     return OUTCOME_FAILURE, (
-                        "(博查搜索失败：%s。当前搜索设置是「只用博查」，没给你换成网页抓取；"
-                        "想让它自动落回抓取就把引擎改成 auto)" % err)
-                notes.append("博查失败，已落回网页抓取（%s）" % err)
+                        "(%s搜索失败：%s。当前搜索设置是「只用%s」，没给你换成网页抓取；"
+                        "想让它自动落回抓取就把引擎改成 auto)" % (short, err, short))
+                notes.append("%s失败，已落回网页抓取（%s）" % (label, err))
                 # 降级时把抓取超时压到 8 秒封顶：别让总等待变成两次超时相加
                 timeout = min(timeout, SEARCH_FALLBACK_TIMEOUT)
 
     if not items:
         backend, items, errors = _fetch_search_fallback(query, n, timeout)
         if not items:
-            prefix = "(博查与网页抓取都失败了。" if notes else "(所有搜索后端都失败了。"
+            prefix = ("(%s与网页抓取都失败了。"
+                      % _SEARCH_API_SHORT.get(provider, provider)
+                      if notes else "(所有搜索后端都失败了。")
             return OUTCOME_FAILURE, (prefix + " | ".join(errors) +
                                      "。可稍后重试，或用 fetch_url 直接抓已知网址)")
         head = f"搜索「{query}」· 后端 {backend} · {len(items)} 条结果"
@@ -3899,17 +3972,18 @@ DEFAULT_SETTINGS = {
         # 改这里就行，不用动代码。以上面顶层的 promptThreshold 为准。
         "params": {},
     },
-    # 联网搜索（对齐桌面端 Cyrene-Agent 的 web-search-tool：博查 API + 填 key）。
+    # 联网搜索（对齐桌面端 Cyrene-Agent 的 web-search-tool：结构化 API + 填 key）。
     # 手机端原来只会抓 bing / duckduckgo 的结果页 HTML 再正则解析 —— 页面结构
-    # 一变就「解析出 0 条」。填了 key 就走博查的结构化接口，失败再落回抓取，
-    # 两条路都断了才报错。
+    # 一变就「解析出 0 条」。填了 key 就走结构化接口，失败再落回抓取，
+    # 两条路都断了才报错。目前有两条 API 通道：博查、Tavily。
     # 与 vision 段同理：全部键都必须在 normalize_settings 里显式登记。
     "search": {
-        "engine": "auto",        # auto = 有 key 走博查、失败落抓取；bocha = 只走博查；off = 只用抓取
+        "engine": "auto",        # auto = 有 key 走 API（博查优先，其次 Tavily）、失败落抓取；bocha / tavily = 只用那一条；off = 只用抓取
         "bochaKey": "",          # 博查 API key（api.bochaai.com 申请）
+        "tavilyKey": "",         # Tavily API key（tavily.com 申请，Bearer tvly-...）
         "resultCount": 8,        # 每次请求条数（1~15）
         "snippetChars": 500,     # 摘要截断长度（100~1000）
-        "request_timeout": 20,   # 博查请求超时（秒）
+        "request_timeout": 20,   # API 请求超时（秒）
         "cacheTtlMin": 30,       # 结果缓存有效期（分钟）；0 = 不缓存
     },
 }
@@ -4003,8 +4077,8 @@ SEARCH_RANGES = {
     "request_timeout": (5, 60, 20),
     "cacheTtlMin": (0, 240, 30),
 }
-# 只认这三个值，其余一律回落 auto（前端下拉也只给这三个）。
-SEARCH_ENGINES = ("auto", "bocha", "off")
+# 只认这四个值，其余一律回落 auto（前端下拉也只给这四个）。
+SEARCH_ENGINES = ("auto", "bocha", "tavily", "off")
 
 
 def normalize_search(raw):
@@ -4017,8 +4091,9 @@ def normalize_search(raw):
     out = {
         "engine": eng if eng in SEARCH_ENGINES else "auto",
         # key 不做长度截断 —— 截断会悄悄废掉一个 key，用户看到的是「鉴权失败」
-        # 而不是「配置被截断了」（与 vision.api_key 同口径）。
+        # 而不是「配置被截断了」（与 vision.api_key 同口径；两把 key 一致）。
         "bochaKey": _as_str(s.get("bochaKey"), "").strip(),
+        "tavilyKey": _as_str(s.get("tavilyKey"), "").strip(),
     }
     for k, (lo, hi, fb) in SEARCH_RANGES.items():
         out[k] = int(_clamp(s.get(k), lo, hi, fb))
@@ -4034,14 +4109,19 @@ def search_cfg(key, fb=None):
 
 
 def search_engine():
-    """当前生效的搜索链路：'bocha' 或 'fetch'。只看配置齐不齐，不碰网络。"""
+    """当前生效的搜索链路：'bocha' / 'tavily' / 'fetch'。只看配置齐不齐，不碰网络。"""
     eng = str(search_cfg("engine", "auto") or "auto").strip().lower()
     if eng == "off":
         return "fetch"
-    if eng == "bocha":
+    if eng in _SEARCH_API_CLIENTS:
+        return eng
+    # auto：博查优先、其次 Tavily，谁配了 key 用谁；都没配就还是抓取 ——
+    # 不填 key 的用户行为与改动前完全一致。
+    if str(search_cfg("bochaKey", "") or "").strip():
         return "bocha"
-    # auto：配了 key 才走博查；没配就还是抓取 —— 不填 key 的用户行为与改动前一致。
-    return "bocha" if str(search_cfg("bochaKey", "") or "").strip() else "fetch"
+    if str(search_cfg("tavilyKey", "") or "").strip():
+        return "tavily"
+    return "fetch"
 
 
 def vision_ready():
@@ -10328,11 +10408,12 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(vs, dict):
             vs["api_key_set"] = bool(vs.pop("api_key", ""))
 
-        # 联网搜索的博查 key 同理：不回明文，只回「配没配」。
+        # 联网搜索的两把 key（博查 / Tavily）同理：不回明文，只回「配没配」。
         # 前端保存时只发它真正改过的那几个键，所以脱敏不会把 key 抹掉。
         ss = s.get("search")
         if isinstance(ss, dict):
             ss["bochaKey_set"] = bool(str(ss.pop("bochaKey", "") or "").strip())
+            ss["tavilyKey_set"] = bool(str(ss.pop("tavilyKey", "") or "").strip())
 
         # ⚠ 插件密钥脱敏。s 是 SETTINGS 的全量深拷贝，plugins.secrets 里存的是
         # 插件通过 ctx.deps.secrets.set() 写入的真实凭据（OpenWeather key 之类）。
@@ -11086,7 +11167,7 @@ class Handler(BaseHTTPRequestHandler):
                    200 if ok else 500)
 
     def _search_status(self):
-        """联网搜索的运行态。**不回显 bochaKey**，只给「配没配」的布尔。
+        """联网搜索的运行态。**不回显 bochaKey / tavilyKey**，只给「配没配」的布尔。
 
         面板自检与真机验收的抓手：不真搜一次就能确认「引擎选对没、key 读到没、
         缓存有多满、上一次走的是哪条路」。
@@ -11094,6 +11175,7 @@ class Handler(BaseHTTPRequestHandler):
         cfg = {
             "engine": str(search_cfg("engine", "auto") or "auto"),
             "bochaKey_set": bool(str(search_cfg("bochaKey", "") or "").strip()),
+            "tavilyKey_set": bool(str(search_cfg("tavilyKey", "") or "").strip()),
             "resultCount": search_cfg("resultCount", 8),
             "snippetChars": search_cfg("snippetChars", 500),
             "request_timeout": search_cfg("request_timeout", 20),
@@ -11105,7 +11187,7 @@ class Handler(BaseHTTPRequestHandler):
                                            time.localtime(last["at"]))
         self._json({
             "config": cfg,
-            "engine": search_engine(),              # 实际生效的链路：bocha / fetch
+            "engine": search_engine(),              # 实际生效的链路：bocha / tavily / fetch
             "fetchBackends": list(NET_SEARCH_BACKENDS),
             "cache": {"count": search_cache_count(), "max": SEARCH_CACHE_MAX},
             "fallbackTimeout": SEARCH_FALLBACK_TIMEOUT,
@@ -11262,8 +11344,8 @@ class Handler(BaseHTTPRequestHandler):
         """POST /search/test：当场搜一次，把结果原文与错误一起回显。
 
         入参 {"query": "...", "count": N}；不传 query 就用一个探针词。
-        ⚠ 这条路径**会真的发请求**（博查要花额度），所以只由用户在设置页点
-          「测试搜索」时才走，不放进任何自动流程。
+        ⚠ 这条路径**会真的发请求**（走 API 通道要花额度），所以只由用户在设置页
+          点「测试搜索」时才走，不放进任何自动流程。
         """
         b = body if isinstance(body, dict) else {}
         query = str(b.get("query") or "").strip()[:100] or "昔涟"

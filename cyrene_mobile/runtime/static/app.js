@@ -1967,9 +1967,17 @@ PANELS.model = function (host, S) {
 
 /* ================= 搜索（联网搜索引擎）=================
    这一页管的是「她上网搜东西时走哪条路」。
-   对齐桌面端 Cyrene-Agent 的 web-search-tool：填了博查 key 就走结构化 API，
-   没填 / 失败就落回抓取 bing / duckduckgo 的结果页。
-   当前走的是哪条路必须在这页上看得见 —— 不然用户分不清 key 到底生效没有。 */
+   对齐桌面端 Cyrene-Agent 的 web-search-tool：填了 API key 就走结构化接口
+   （博查 / Tavily 二选一，auto 档下博查优先），没填 / 失败就落回抓取
+   bing / duckduckgo 的结果页。
+   当前走的是哪条路必须在这页上看得见 —— 不然用户分不清 key 到底生效没有。
+   引擎下拉切完立刻生效（下一次 web_search 就走新路），不需要重启服务。 */
+/* 引擎标识 → 给人看的名字。两条 API 通道共用这一张表：
+   写死「不是 bocha 就当抓取」会在切到 Tavily 之后显示错。 */
+var SEARCH_ENGINE_NAMES = { bocha: '博查 API', tavily: 'Tavily API' };
+/* 硬钉档在文案里要用的短名：「只用博查」/「只用 Tavily」读起来才顺。 */
+var SEARCH_ENGINE_SHORT = { bocha: '博查', tavily: 'Tavily' };
+
 PANELS.search = function (host, S) {
   var s = S.search || {};
 
@@ -1984,23 +1992,33 @@ PANELS.search = function (host, S) {
     fetch('/search/status', { cache: 'no-store' })
       .then(function (r) { return r.json(); })
       .then(function (d) {
-        var viaApi = d.engine === 'bocha';
+        var apiName = SEARCH_ENGINE_NAMES[d.engine] || '';
+        var viaApi = !!apiName;
+        var engCfg = (d.config && d.config.engine) || 'auto';
+        /* 硬钉档（只用博查 / 只用 Tavily）失败是直接报错、不会落回抓取。
+           状态卡必须和后端说同一件事 —— 不然等于当着用户的面说反话。 */
+        var pinned = viaApi && engCfg !== 'auto';
         box.innerHTML = '';
         var big = document.createElement('div');
         big.className = 'vision-route__mode' + (viaApi ? ' is-ok' : '');
-        big.textContent = viaApi ? '博查 API' : '网页抓取';
+        big.textContent = viaApi ? apiName : '网页抓取';
         var sub = document.createElement('div');
         sub.className = 'vision-route__why';
         sub.textContent = viaApi
-          ? ('有 key，走博查的结构化接口；它失败会自动落回网页抓取（超时 ' +
-             (d.fallbackTimeout || 8) + ' 秒封顶）。')
-          : '没配 key，或引擎设成了「只用网页抓取」。';
+          ? (pinned
+             ? ('有 key，走' + apiName + '的结构化接口；当前引擎是「只用' +
+                (SEARCH_ENGINE_SHORT[d.engine] || d.engine) +
+                '」，它失败会如实报错，不会落回网页抓取。')
+             : ('有 key，走' + apiName + '的结构化接口；它失败会自动落回网页抓取（超时 ' +
+                (d.fallbackTimeout || 8) + ' 秒封顶）。'))
+          : '没配任何 API key，或引擎设成了「只用网页抓取」。';
         box.appendChild(big); box.appendChild(sub);
 
         var meta = document.createElement('div');
         meta.className = 'vision-route__meta';
         var items = [
           '博查 Key：' + ((d.config && d.config.bochaKey_set) ? '已配置' : '未配置'),
+          'Tavily Key：' + ((d.config && d.config.tavilyKey_set) ? '已配置' : '未配置'),
           '结果缓存：' + ((d.cache && d.cache.count) || 0) + ' / ' +
             ((d.cache && d.cache.max) || 0) + ' 条',
           '抓取后端：' + (((d.fetchBackends || []).join(' / ')) || '—')
@@ -2027,8 +2045,9 @@ PANELS.search = function (host, S) {
 
   var sel = document.createElement('select');
   sel.className = 'form-input';
-  [['auto', '自动：有 key 用博查，失败落抓取'],
+  [['auto', '自动：有 key 用 API（博查优先，其次 Tavily），失败落抓取'],
    ['bocha', '只用博查（失败就报错）'],
+   ['tavily', '只用 Tavily（失败就报错）'],
    ['off', '只用网页抓取']].forEach(function (o) {
     var opt = document.createElement('option');
     opt.value = o[0]; opt.textContent = o[1];
@@ -2038,41 +2057,48 @@ PANELS.search = function (host, S) {
   sel.addEventListener('change', function () {
     saveSettings({ search: { engine: sel.value } }, true).then(paintStatus);
   });
-  c.appendChild(row('搜索引擎', '默认的自动档：没填 key 时行为和以前完全一样', sel,
+  c.appendChild(row('搜索引擎', '默认的自动档：两把 key 都没填时，行为和以前完全一样', sel,
     { stack: true }));
 
-  /* 博查 key 只写不回显：服务端只回 bochaKey_set 布尔 */
-  var kwrap = document.createElement('div'); kwrap.className = 'reveal-wrap';
-  var ki = document.createElement('input');
-  ki.className = 'form-input form-input--mono'; ki.type = 'password';
-  ki.placeholder = s.bochaKey_set ? '已配置（留空则不修改）' : '尚未配置';
-  ki.setAttribute('aria-label', '博查 API Key');
-  var kshow = btn('显示', function () {
-    ki.type = ki.type === 'password' ? 'text' : 'password';
-    kshow.textContent = ki.type === 'password' ? '显示' : '隐藏';
-  }, 'btn--sm');
-  kwrap.appendChild(ki); kwrap.appendChild(kshow);
-  c.appendChild(row('博查 API Key', 'api.bochaai.com 申请；不会回显已保存的值',
-    kwrap, { stack: true }));
-  ki.addEventListener('change', function () {
-    if (!ki.value.trim()) return;
-    saveSettings({ search: { bochaKey: ki.value.trim() } }, true)
-      .then(function () {
-        ki.value = '';
-        ki.placeholder = '已配置（留空则不修改）';
+  /* 两把 API key 的输入块结构一模一样：密码框 + 显示/隐藏 + 只写不回显
+     （服务端只回 xxxKey_set 布尔）。收成一个小工厂，加第三家时不用再抄一遍。 */
+  function keyRow(title, hint, field, isSet) {
+    var wrap = document.createElement('div'); wrap.className = 'reveal-wrap';
+    var input = document.createElement('input');
+    input.className = 'form-input form-input--mono'; input.type = 'password';
+    input.placeholder = isSet ? '已配置（留空则不修改）' : '尚未配置';
+    input.setAttribute('aria-label', title);
+    var show = btn('显示', function () {
+      input.type = input.type === 'password' ? 'text' : 'password';
+      show.textContent = input.type === 'password' ? '显示' : '隐藏';
+    }, 'btn--sm');
+    wrap.appendChild(input); wrap.appendChild(show);
+    c.appendChild(row(title, hint, wrap, { stack: true }));
+    input.addEventListener('change', function () {
+      var v = input.value.trim();
+      if (!v) return;
+      var patch = {}; patch[field] = v;
+      saveSettings({ search: patch }, true).then(function () {
+        input.value = '';
+        input.placeholder = '已配置（留空则不修改）';
         paintStatus();
       });
-  });
+    });
+  }
+  keyRow('博查 API Key', 'api.bochaai.com 申请；不会回显已保存的值',
+    'bochaKey', s.bochaKey_set);
+  keyRow('Tavily API Key', 'tavily.com 申请（免费额度 1000 次/月）；不会回显已保存的值',
+    'tavilyKey', s.tavilyKey_set);
 
-  c.appendChild(row('每次条数', '发给博查的 count；抓取那条路按它截断',
+  c.appendChild(row('每次条数', '发给 API 的条数；抓取那条路按它截断',
     slider(1, 15, 1, s.resultCount != null ? s.resultCount : 8,
       function (val) { saveSettings({ search: { resultCount: val } }); })),
     { stack: true });
-  c.appendChild(row('摘要长度', '字符。博查返回的 summary 会截到这个长度',
+  c.appendChild(row('摘要长度', '字符。API 返回的摘要会截到这个长度',
     slider(100, 1000, 50, s.snippetChars != null ? s.snippetChars : 500,
       function (val) { saveSettings({ search: { snippetChars: val } }); })),
     { stack: true });
-  c.appendChild(row('请求超时', '秒。博查这条路的单次上限',
+  c.appendChild(row('请求超时', '秒。API 这条路的单次上限',
     slider(5, 60, 1, s.request_timeout != null ? s.request_timeout : 20,
       function (val) { saveSettings({ search: { request_timeout: val } }); })),
     { stack: true });
@@ -2086,7 +2112,7 @@ PANELS.search = function (host, S) {
   var c2 = card();
   var out = document.createElement('div');
   out.className = 'vision-testout';
-  out.textContent = '点下面的按钮会真发一次搜索请求（博查要花额度）。';
+  out.textContent = '点下面的按钮会真发一次搜索请求（走 API 通道要花额度）。';
   var actions = document.createElement('div');
   actions.className = 'vision-actions';
   var qi = textInput('', function () {}, { placeholder: '想搜什么（留空用「昔涟」）', label: '测试关键词' });
@@ -2096,7 +2122,7 @@ PANELS.search = function (host, S) {
     apiPost('/search/test', { query: qi.value.trim() || '昔涟' })
       .then(function (d) {
         out.textContent = (d.ok
-          ? '✓ 通了（' + (d.engine === 'bocha' ? '博查 API' : '网页抓取') + '）\n\n'
+          ? '✓ 通了（' + (SEARCH_ENGINE_NAMES[d.engine] || '网页抓取') + '）\n\n'
           : '✗ 没通\n\n') + (d.result || '');
         paintStatus();
       })
