@@ -1051,6 +1051,162 @@ def _html_to_markdown(body, content_type):
     return "", stripped.strip()
 
 
+# ---------- 博查搜索后端（对齐桌面端 web-search-tool）----------
+# 桌面端那份的要点照搬：engine 由设置注入、POST /v1/web-search、Bearer key、
+# 结果统一成 {title,url,snippet,source}、snippet 截断、30 分钟 TTL 缓存。
+# 手机端两点差别：
+#   ① 只用 urllib + json（零第三方依赖）；
+#   ② 博查失败要能落回下面那套 HTML 抓取，所以这里只负责「拿到就返回」，
+#      「什么时候该降级」留在 _h_web_search 里决定。
+BOCHA_SEARCH_URL = "https://api.bochaai.com/v1/web-search"
+SEARCH_CACHE_MAX = 64                        # 内存条数上限（与视觉缓存同款考虑）
+SEARCH_RESULT_MAX_BYTES = 2 * 1024 * 1024    # 搜索响应读取上限，防 OOM
+SEARCH_FALLBACK_TIMEOUT = 8                  # 博查失败后落回抓取时的超时封顶（秒）
+
+_search_cache = {}                   # key -> (ts, items)；dict 保序，天然 FIFO 淘汰
+_search_cache_lock = threading.Lock()
+
+# 上一次搜索的结果，供 /search/status 与设置页自检显示（**不含 key 明文**）
+SEARCH_LAST = {}
+
+
+def _search_cache_ttl():
+    """当前生效的结果缓存 TTL（秒）。0 = 不缓存（用户把 cacheTtlMin 拉到 0）。"""
+    try:
+        return max(0, int(search_cfg("cacheTtlMin", 30) or 0)) * 60
+    except (TypeError, ValueError):
+        return 30 * 60
+
+
+def search_cache_get(key):
+    """读结果缓存。命中返回 items，否则 None。
+
+    与视觉缓存同款：TTL 按**读取时**的当前配置判，用户在面板上调了立刻生效。
+    """
+    if not key:
+        return None
+    ttl = _search_cache_ttl()
+    if ttl <= 0:
+        return None
+    now = time.time()
+    with _search_cache_lock:
+        item = _search_cache.get(key)
+        if item is None:
+            return None
+        ts, items = item
+        if now - ts > ttl:
+            _search_cache.pop(key, None)
+            return None
+        return items
+
+
+def search_cache_put(key, items):
+    """写结果缓存。只缓存成功结果 —— 错误缓存下来等于把一次网络抖动固化半小时。"""
+    if not key or not items:
+        return
+    with _search_cache_lock:
+        while len(_search_cache) >= SEARCH_CACHE_MAX:
+            try:
+                _search_cache.popitem(last=False)
+            except KeyError:
+                break
+        _search_cache[key] = (time.time(), list(items))
+
+
+def search_cache_clear():
+    """清空结果缓存，返回清掉的条数。"""
+    with _search_cache_lock:
+        n = len(_search_cache)
+        _search_cache.clear()
+        return n
+
+
+def search_cache_count():
+    with _search_cache_lock:
+        return len(_search_cache)
+
+
+def _net_post_json(url, payload, headers, max_bytes, timeout):
+    """POST 一段 JSON 并把响应按 JSON 解回来，返回 dict。
+
+    为什么另写一个而不给 _net_open 加参数：_net_open 是 GET-only 的读通道
+    （fetch_url 那条工具全靠它），把 POST / 自定义头揉进去会让那条路径多出一堆
+    分支；搜索这边只需要「发一小段 JSON、收一小段 JSON」，独立成函数更清楚。
+    错误口径与 _net_open 一致：一律抛 NetError，调用方只管降级。
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise NetError("(URL 为空)")
+    url = url.strip()
+    if urlparse(url).scheme.lower() not in ("http", "https"):
+        raise NetError("(只支持 http/https 网址)")
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    hdrs = {"User-Agent": NET_UA, "Content-Type": "application/json",
+            "Accept": "application/json"}
+    for k, v in (headers or {}).items():
+        hdrs[str(k)] = str(v)
+    req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read(max_bytes + 1)
+    except urllib.error.HTTPError as e:
+        # 401/403（key 不对）最常见，把状态码原样带出来，用户能自己判断
+        raise NetError(f"(HTTP {e.code} 错误：{e.reason})")
+    except urllib.error.URLError as e:
+        raise NetError(f"(连不上目标：{getattr(e, 'reason', e)})")
+    except Exception as e:
+        raise NetError(f"(请求失败：{type(e).__name__}: {e})")
+    if len(raw) > max_bytes:
+        raise NetError("(响应过大，已放弃)")
+    try:
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except (ValueError, UnicodeDecodeError):
+        raise NetError("(响应不是合法 JSON)")
+    if not isinstance(data, dict):
+        raise NetError("(响应结构不认识)")
+    return data
+
+
+def _bocha_items(data, snippet_chars):
+    """把博查响应映射成统一的 [(title, url, snippet, source)]。
+
+    两种形态都收：文档里的 data.webPages.value，以及直接把 webPages 放在根上的
+    写法（不同版本/网关都见过，收宽一点不会错）。
+    """
+    pages = None
+    if isinstance(data.get("data"), dict):
+        pages = data["data"].get("webPages")
+    if not isinstance(pages, dict):
+        pages = data.get("webPages")
+    values = pages.get("value") if isinstance(pages, dict) else None
+    items = []
+    for r in (values or []):
+        if not isinstance(r, dict):
+            continue
+        title = str(r.get("name") or r.get("title") or "").strip()
+        url = str(r.get("url") or "").strip()
+        snippet = re.sub(r"\s+", " ", str(r.get("summary") or r.get("snippet") or "")).strip()
+        if len(snippet) > snippet_chars:
+            snippet = snippet[:snippet_chars] + "…"
+        source = str(r.get("siteName") or "").strip()
+        if url.startswith("http"):
+            items.append((title, url, snippet, source))
+    return items
+
+
+def bocha_search(query, count, timeout):
+    """调博查 /v1/web-search。返回 [(title,url,snippet,source)]；失败抛 NetError。"""
+    key = str(search_cfg("bochaKey", "") or "").strip()
+    if not key:
+        raise NetError("(没配博查 key)")
+    snippet_chars = int(search_cfg("snippetChars", 500) or 500)
+    data = _net_post_json(
+        BOCHA_SEARCH_URL,
+        {"query": query, "count": count, "summary": True},
+        {"Authorization": "Bearer " + key},
+        SEARCH_RESULT_MAX_BYTES, timeout)
+    return _bocha_items(data, snippet_chars)
+
+
 # ---------- web_search 后端解析 ----------
 
 def _search_parse_bing(html_text):
@@ -1956,15 +2112,20 @@ def caption_image(source, question="", cfg=None):
 
 # ---------- 三个 handler ----------
 
-def _h_web_search(a):
-    """web_search：抓搜索引擎结果页，返回标题/链接/摘要列表。多后端降级。"""
-    query = (a.get("query") or "").strip()
-    if not query:
-        return OUTCOME_FAILURE, "(缺少 query)"
-    n = _int_arg(a.get("max_results"), NET_DEFAULT_RESULTS, 1, NET_MAX_RESULTS)
+def _search_engine_pinned():
+    """用户是否显式选了「只用博查」—— 决定博查失败时要不要偷偷换成抓取。"""
+    return str(search_cfg("engine", "auto") or "auto").strip().lower() == "bocha"
 
+
+def _fetch_search_fallback(query, n, timeout):
+    """原来那套 HTML 抓取链（bing / cn.bing / ddg 轮流降级）。
+
+    返回 (backend, items, errors)：items 非空表示某个后端拿到了结果；全挂时
+    backend 为 None、items 为空、errors 里是每个后端失败的原因。
+    items 元素统一成 (title, url, snippet, source)，与博查那条路同形 ——
+    抓取拿不到站点名，source 一律空串。
+    """
     q = urllib.parse.quote(query)
-    timeout = _net_timeout()
     errors = []
     for backend in NET_SEARCH_BACKENDS:
         tmpl, parser = _NET_SEARCH_SOURCES[backend]
@@ -1978,33 +2139,90 @@ def _h_web_search(a):
         ctype = _headers.get("content-type", "")
         text, _ = _decode_body(body, ctype)
         try:
-            items = parser(text)
+            parsed = parser(text)
         except Exception as e:
             errors.append(f"{backend}: 解析失败 {type(e).__name__}")
             continue
-        if not items:
+        if not parsed:
             errors.append(f"{backend}: 解析出 0 条（页面结构可能变了）")
             continue
         # 去重（按 URL）后截到 n 条
         seen, uniq = set(), []
-        for title, uurl, snippet in items:
+        for title, uurl, snippet in parsed:
             if uurl in seen:
                 continue
             seen.add(uurl)
-            uniq.append((title, uurl, snippet))
+            uniq.append((title, uurl, snippet, ""))
             if len(uniq) >= n:
                 break
-        lines = [f"搜索「{query}」· 后端 {backend} · {len(uniq)} 条结果"]
-        for i, (title, uurl, snippet) in enumerate(uniq, 1):
-            lines.append(f"{i}. {title}")
-            lines.append(f"   {uurl}")
-            if snippet:
-                sn = snippet if len(snippet) <= 200 else snippet[:200] + "…"
-                lines.append(f"   {sn}")
-        return OUTCOME_SUCCESS, "\n".join(lines)
+        if uniq:
+            return backend, uniq, errors
+        errors.append(f"{backend}: 去重后没有可用结果")
+    return None, [], errors
 
-    return OUTCOME_FAILURE, ("(所有搜索后端都失败了。" + " | ".join(errors) +
-                             "。可稍后重试，或用 fetch_url 直接抓已知网址)")
+
+def _h_web_search(a):
+    """web_search：配了博查 key 就先走 API（对齐桌面端），失败再抓结果页。
+
+    降级链：**博查 API → 网页抓取**。没配 key 时整条路径与改动前完全一致；
+    engine=bocha（用户显式「只用博查」）时失败就如实报错 —— 他要的是博查的
+    结果，塞一份抓来的网页结果给他反而是骗人。
+    """
+    query = (a.get("query") or "").strip()
+    if not query:
+        return OUTCOME_FAILURE, "(缺少 query)"
+    n = _int_arg(a.get("max_results"), NET_DEFAULT_RESULTS, 1, NET_MAX_RESULTS)
+    timeout = _net_timeout()
+
+    items, head, notes = [], "", []
+
+    if search_engine() == "bocha":
+        ckey = "bocha|%s|%d" % (query, n)
+        cached = search_cache_get(ckey)
+        if cached is not None:
+            items = list(cached)
+            head = f"搜索「{query}」· 博查 API（缓存）· {len(items)} 条结果"
+            notes.append("同一关键词在缓存有效期内，未重复请求")
+        else:
+            try:
+                items = bocha_search(query, n, int(search_cfg("request_timeout", 20) or 20))
+                search_cache_put(ckey, items)
+                head = f"搜索「{query}」· 博查 API · {len(items)} 条结果"
+                SEARCH_LAST.clear()
+                SEARCH_LAST.update({"ok": True, "at": time.time(),
+                                    "engine": "bocha", "count": len(items)})
+            except NetError as e:
+                err = str(e)
+                SEARCH_LAST.clear()
+                SEARCH_LAST.update({"ok": False, "at": time.time(),
+                                    "engine": "bocha", "error": err[:200]})
+                if _search_engine_pinned():
+                    return OUTCOME_FAILURE, (
+                        "(博查搜索失败：%s。当前搜索设置是「只用博查」，没给你换成网页抓取；"
+                        "想让它自动落回抓取就把引擎改成 auto)" % err)
+                notes.append("博查失败，已落回网页抓取（%s）" % err)
+                # 降级时把抓取超时压到 8 秒封顶：别让总等待变成两次超时相加
+                timeout = min(timeout, SEARCH_FALLBACK_TIMEOUT)
+
+    if not items:
+        backend, items, errors = _fetch_search_fallback(query, n, timeout)
+        if not items:
+            prefix = "(博查与网页抓取都失败了。" if notes else "(所有搜索后端都失败了。"
+            return OUTCOME_FAILURE, (prefix + " | ".join(errors) +
+                                     "。可稍后重试，或用 fetch_url 直接抓已知网址)")
+        head = f"搜索「{query}」· 后端 {backend} · {len(items)} 条结果"
+
+    lines = [head]
+    lines.extend(notes)
+    for i, it in enumerate(items, 1):
+        title, uurl, snippet = it[0], it[1], it[2]
+        source = it[3] if len(it) > 3 else ""
+        lines.append(f"{i}. {title}" + (f"（{source}）" if source else ""))
+        lines.append(f"   {uurl}")
+        if snippet:
+            sn = snippet if len(snippet) <= 200 else snippet[:200] + "…"
+            lines.append(f"   {sn}")
+    return OUTCOME_SUCCESS, "\n".join(lines)
 
 
 def _h_fetch_url(a):
@@ -3681,6 +3899,19 @@ DEFAULT_SETTINGS = {
         # 改这里就行，不用动代码。以上面顶层的 promptThreshold 为准。
         "params": {},
     },
+    # 联网搜索（对齐桌面端 Cyrene-Agent 的 web-search-tool：博查 API + 填 key）。
+    # 手机端原来只会抓 bing / duckduckgo 的结果页 HTML 再正则解析 —— 页面结构
+    # 一变就「解析出 0 条」。填了 key 就走博查的结构化接口，失败再落回抓取，
+    # 两条路都断了才报错。
+    # 与 vision 段同理：全部键都必须在 normalize_settings 里显式登记。
+    "search": {
+        "engine": "auto",        # auto = 有 key 走博查、失败落抓取；bocha = 只走博查；off = 只用抓取
+        "bochaKey": "",          # 博查 API key（api.bochaai.com 申请）
+        "resultCount": 8,        # 每次请求条数（1~15）
+        "snippetChars": 500,     # 摘要截断长度（100~1000）
+        "request_timeout": 20,   # 博查请求超时（秒）
+        "cacheTtlMin": 30,       # 结果缓存有效期（分钟）；0 = 不缓存
+    },
 }
 
 
@@ -3763,6 +3994,54 @@ def vision_cfg(key, fb=None):
         return SETTINGS.get("vision", {}).get(key, fb)
     except (NameError, AttributeError):
         return fb
+
+
+# search 段的数值区间 (lo, hi, fallback)，与 VISION_RANGES 同款：越界一律夹回。
+SEARCH_RANGES = {
+    "resultCount": (1, 15, 8),
+    "snippetChars": (100, 1000, 500),
+    "request_timeout": (5, 60, 20),
+    "cacheTtlMin": (0, 240, 30),
+}
+# 只认这三个值，其余一律回落 auto（前端下拉也只给这三个）。
+SEARCH_ENGINES = ("auto", "bocha", "off")
+
+
+def normalize_search(raw):
+    """归一化联网搜索配置。白名单式：缺项回落默认值，非法值夹回合法范围。
+
+    与 normalize_vision 同一套语义（都是偏好设置，不是用户数据）。
+    """
+    s = raw if isinstance(raw, dict) else {}
+    eng = _as_str(s.get("engine"), "auto").strip().lower()
+    out = {
+        "engine": eng if eng in SEARCH_ENGINES else "auto",
+        # key 不做长度截断 —— 截断会悄悄废掉一个 key，用户看到的是「鉴权失败」
+        # 而不是「配置被截断了」（与 vision.api_key 同口径）。
+        "bochaKey": _as_str(s.get("bochaKey"), "").strip(),
+    }
+    for k, (lo, hi, fb) in SEARCH_RANGES.items():
+        out[k] = int(_clamp(s.get(k), lo, hi, fb))
+    return out
+
+
+def search_cfg(key, fb=None):
+    """读单个搜索配置项。SETTINGS 未加载时回落默认值（与 vision_cfg 同构）。"""
+    try:
+        return SETTINGS.get("search", {}).get(key, fb)
+    except (NameError, AttributeError):
+        return fb
+
+
+def search_engine():
+    """当前生效的搜索链路：'bocha' 或 'fetch'。只看配置齐不齐，不碰网络。"""
+    eng = str(search_cfg("engine", "auto") or "auto").strip().lower()
+    if eng == "off":
+        return "fetch"
+    if eng == "bocha":
+        return "bocha"
+    # auto：配了 key 才走博查；没配就还是抓取 —— 不填 key 的用户行为与改动前一致。
+    return "bocha" if str(search_cfg("bochaKey", "") or "").strip() else "fetch"
 
 
 def vision_ready():
@@ -4018,6 +4297,11 @@ def memory_round(user_text):
     try:
         text = str(user_text or "")
         parts = []
+        # ---- L0 画像：该怎么称呼他 ----
+        # 排在最先：这是「他是谁」里最基本的一条，比世界书条目更该先立住。
+        l0_note = l0_calling_note()
+        if l0_note:
+            parts.append(l0_note)
         # ---- 世界书（一期）----
         memory_load()
         mgr, entries = _MEM_MGR, (_MEM_ENTRIES or [])
@@ -4291,6 +4575,37 @@ L2_INJECT_PREAMBLE = (
     "以下是你记得的、关于他的事。它们来自过去的对话，可能已经过时或记岔了 ——"
     "拿不准就自然地问一句，不要当成刚刚发生的事来说。"
 )
+
+# L0 画像里「该怎么称呼他」也得进上下文。
+# 为什么单拎出来：L0 是「关于他是谁」的核心画像，之前只显示在记忆面板上，
+# **从没进过 prompt** —— 用户在面板里改了称呼，她依然不会用；那句写死的
+# 「用户昵称：（可在设置中自定义）」也只是个占位，设置里根本没有这一项。
+# 这里只注入称呼这一个字段，别的 L0 字段一律不碰：注入面越小越不容易跟 L2 打架。
+L0_CALLING_KEYS = ("preferredName", "nickname")
+
+
+def l0_calling_note():
+    """从 L0 取「该怎么称呼他」，拼成一小句；取不到返回空串。
+
+    只读不写、永不上抛：记忆是附加能力，坏了也不能拖住这一轮对话。
+    """
+    if _l2s is None:
+        return ""
+    try:
+        store = _l2_load_store()
+        l0 = store.get("l0") if isinstance(store, dict) else None
+        if not isinstance(l0, dict):
+            return ""
+        name = ""
+        for k in L0_CALLING_KEYS:
+            name = str(l0.get(k) or "").strip()
+            if name:
+                break
+        if not name:
+            return ""
+        return "【关于他】称呼他「%s」。" % name[:30]
+    except Exception:
+        return ""
 
 # 前台召回与后台维护（judge 要调 LLM，慢）共用一把锁。前台只等这么久，
 # 拿不到就跳过本轮注入：记忆是附加能力，宁可这一轮不注入，也不能堵住回复。
@@ -4717,6 +5032,7 @@ def normalize_settings(raw):
     out["plugins"] = normalize_plugins(src.get("plugins"))
     out["vision"] = normalize_vision(src.get("vision"))
     out["memory"] = normalize_memory(src.get("memory"))
+    out["search"] = normalize_search(src.get("search"))
     return out
 
 
@@ -5123,7 +5439,8 @@ def build_system_prompt(mode=None):
 {tool_block}
 {skill_block}{md_hint}
 
-用户昵称：（可在设置中自定义）
+称呼他的方式：见他记忆里的【关于他】那一行；没写就用自然的称呼，
+不要用「用户」「对方」这类生硬的说法。
 """
 
 
@@ -5195,6 +5512,12 @@ def usage_reset():
         USAGE["startedAt"] = time.time()
 
 
+# 流式撞 554（中转站限流）时的快速退避序列（秒）。
+# 比 chat_ex 那套（1/3/9）短：流式这条路的定位是「先把瞬时抖动熬过去」，
+# 真正持续的限流交给 chat_ex 的长退避兜底。
+STREAM_554_BACKOFF = (1.0, 2.5)
+
+
 # ========== LLM ==========
 class LLMClient:
     def __init__(self, cfg):
@@ -5254,6 +5577,11 @@ class LLMClient:
         url = self.base + "/chat/completions"
         body = dict(payload)
         body["stream"] = True
+        # ⚠ 不带这个开关时，端点只吐 delta、**不回 usage** —— 结果就是走了流式的
+        # 每一轮 token 用量全丢（「用量一直显示 0」的真根因）。不认这个字段的
+        # 端点一般会忽略它；真被它拒了，下面那趟失败会落回 chat_ex（那条有
+        # usage，也本来就走非流式）。
+        body["stream_options"] = {"include_usage": True}
         req = urllib.request.Request(
             url, data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json",
@@ -5271,6 +5599,7 @@ class LLMClient:
             return None, {"_error": str(e)}
 
         content_parts, reasoning_parts, tc_acc = [], [], {}
+        usage_acc = None            # 流式下 usage 只在最后一个 chunk 出现
         finish_reason = None
         try:
             for raw in resp:
@@ -5286,6 +5615,11 @@ class LLMClient:
                     obj = json.loads(chunk)
                 except Exception:
                     continue
+                # usage 挂在 chunk 顶层，而且那一片的 choices 是空数组 ——
+                # 所以必须在下面「没有 choices 就 continue」之前先捞出来，
+                # 否则最后一片会被整个跳过，用量又丢了。
+                if isinstance(obj.get("usage"), dict):
+                    usage_acc = obj["usage"]
                 choices = obj.get("choices") or []
                 if not choices:
                     continue
@@ -5354,6 +5688,7 @@ class LLMClient:
                      "reasoning": reasoning,
                      "tool_calls": tool_calls,
                      "finish_reason": finish_reason,
+                     "usage": usage_acc,
                      "error": None,
                      "message": message}
 
@@ -5516,11 +5851,26 @@ class LLMClient:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
-        status, data = self._post_stream(payload, on_delta=on_delta, cancel=cancel)
+        # ⚠ 554 = 中转站限流。以前这里撞上就直接落回 chat_ex —— 那等于在限流
+        #   窗口里**又打一次请求**，火上浇油；思考链长的时候最容易撞上（上游
+        #   被占用得久）。先就地快速退避重试两次，多半能熬过去；还不行才交回
+        #   chat_ex，那边有 1/3/9 秒的完整退避兜底。
+        status, data = None, {}
+        for gap in (0,) + STREAM_554_BACKOFF:
+            if gap:
+                time.sleep(gap)
+            status, data = self._post_stream(payload, on_delta=on_delta, cancel=cancel)
+            if status != 554:
+                break
         if status == 200:
             out = dict(data)
             out["fc_rejected"] = False
             out["length_hit"] = out.get("finish_reason") == "length"
+            # ⚠ 走流式这条路的用量必须在这里记：_post_stream 只解析、不记账，
+            #   漏了这一句就是「用量一直显示 0」（本轮修的那个 bug）。
+            #   失败那一支不在这里记 —— 下面会落回 chat_ex，由它记（含 error），
+            #   两处都记会把同一次调用算两遍。
+            usage_record(self.model, out.get("usage"))
             return out
         return self.chat_ex(messages, max_tokens=max_tokens, tools=tools)
 
@@ -9929,6 +10279,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(self._plugin_overview())
         elif path == "/vision/status":
             self._json(self._vision_status())
+        elif path == "/search/status":
+            self._json(self._search_status())
         elif path == "/memory/status":
             self._json(self._memory_status())
         elif path == "/memory/panel":
@@ -9975,6 +10327,12 @@ class Handler(BaseHTTPRequestHandler):
         vs = s.get("vision")
         if isinstance(vs, dict):
             vs["api_key_set"] = bool(vs.pop("api_key", ""))
+
+        # 联网搜索的博查 key 同理：不回明文，只回「配没配」。
+        # 前端保存时只发它真正改过的那几个键，所以脱敏不会把 key 抹掉。
+        ss = s.get("search")
+        if isinstance(ss, dict):
+            ss["bochaKey_set"] = bool(str(ss.pop("bochaKey", "") or "").strip())
 
         # ⚠ 插件密钥脱敏。s 是 SETTINGS 的全量深拷贝，plugins.secrets 里存的是
         # 插件通过 ctx.deps.secrets.set() 写入的真实凭据（OpenWeather key 之类）。
@@ -10521,6 +10879,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/vision/cache/clear":
             self._json({"ok": True, "cleared": vision_cache_clear()})
             return
+        # 联网搜索：自检与结果缓存清理（与上面视觉那两条同形）。
+        if path == "/search/test":
+            self._handle_search_test(body)
+            return
+        if path == "/search/cache/clear":
+            self._json({"ok": True, "cleared": search_cache_clear()})
+            return
 
         # 世界书 / 记忆：注入预览与 L2 删除。与上面两条同样精确匹配，
         # 不会与 /settings 或 /plugins/* 相撞。
@@ -10720,6 +11085,33 @@ class Handler(BaseHTTPRequestHandler):
                     "toolCount": len(TOOLS)},
                    200 if ok else 500)
 
+    def _search_status(self):
+        """联网搜索的运行态。**不回显 bochaKey**，只给「配没配」的布尔。
+
+        面板自检与真机验收的抓手：不真搜一次就能确认「引擎选对没、key 读到没、
+        缓存有多满、上一次走的是哪条路」。
+        """
+        cfg = {
+            "engine": str(search_cfg("engine", "auto") or "auto"),
+            "bochaKey_set": bool(str(search_cfg("bochaKey", "") or "").strip()),
+            "resultCount": search_cfg("resultCount", 8),
+            "snippetChars": search_cfg("snippetChars", 500),
+            "request_timeout": search_cfg("request_timeout", 20),
+            "cacheTtlMin": search_cfg("cacheTtlMin", 30),
+        }
+        last = dict(SEARCH_LAST) if SEARCH_LAST else None
+        if last and last.get("at"):
+            last["atText"] = time.strftime("%Y-%m-%d %H:%M:%S",
+                                           time.localtime(last["at"]))
+        self._json({
+            "config": cfg,
+            "engine": search_engine(),              # 实际生效的链路：bocha / fetch
+            "fetchBackends": list(NET_SEARCH_BACKENDS),
+            "cache": {"count": search_cache_count(), "max": SEARCH_CACHE_MAX},
+            "fallbackTimeout": SEARCH_FALLBACK_TIMEOUT,
+            "last": last,
+        })
+
     def _vision_status(self):
         """独立视觉模型的运行态。**不回显 api_key**，只给「配没配」的布尔。
 
@@ -10865,6 +11257,24 @@ class Handler(BaseHTTPRequestHandler):
             })
         except Exception as e:
             self._json({"ok": False, "reason": f"{type(e).__name__}: {e}"}, 200)
+
+    def _handle_search_test(self, body):
+        """POST /search/test：当场搜一次，把结果原文与错误一起回显。
+
+        入参 {"query": "...", "count": N}；不传 query 就用一个探针词。
+        ⚠ 这条路径**会真的发请求**（博查要花额度），所以只由用户在设置页点
+          「测试搜索」时才走，不放进任何自动流程。
+        """
+        b = body if isinstance(body, dict) else {}
+        query = str(b.get("query") or "").strip()[:100] or "昔涟"
+        n = int(_clamp(b.get("count"), 1, NET_MAX_RESULTS, NET_DEFAULT_RESULTS))
+        outcome, text = _h_web_search({"query": query, "max_results": n})
+        self._json({
+            "ok": outcome == OUTCOME_SUCCESS,
+            "query": query,
+            "engine": search_engine(),
+            "result": text[:4000],
+        }, 200)
 
     def _handle_vision_test(self, body):
         """POST /vision/test：当场跑一次转述，把结果与错误原文一起回显。

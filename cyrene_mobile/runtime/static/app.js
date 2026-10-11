@@ -1361,6 +1361,7 @@ var SETTINGS_TABS = [
   { key: 'appearance', label: '外观' },
   { key: 'model',      label: '模型' },
   { key: 'vision',     label: '视觉' },
+  { key: 'search',     label: '搜索' },
   { key: 'mode',       label: '模式' },
   { key: 'reasoning',  label: '思考' },
   { key: 'tools',      label: '工具' },
@@ -1962,6 +1963,154 @@ PANELS.model = function (host, S) {
       .then(function () { renderSettingsPanel(); });
   }, 'btn--ghost'));
   host.lastChild.style.margin = '12px 14px 0';
+};
+
+/* ================= 搜索（联网搜索引擎）=================
+   这一页管的是「她上网搜东西时走哪条路」。
+   对齐桌面端 Cyrene-Agent 的 web-search-tool：填了博查 key 就走结构化 API，
+   没填 / 失败就落回抓取 bing / duckduckgo 的结果页。
+   当前走的是哪条路必须在这页上看得见 —— 不然用户分不清 key 到底生效没有。 */
+PANELS.search = function (host, S) {
+  var s = S.search || {};
+
+  var st = card();
+  var box = document.createElement('div');
+  box.className = 'vision-route';
+  st.appendChild(box);
+  host.appendChild(section('当前状态', '服务端按这个结论决定 web_search 怎么搜', st));
+
+  function paintStatus() {
+    box.textContent = '读取中…';
+    fetch('/search/status', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var viaApi = d.engine === 'bocha';
+        box.innerHTML = '';
+        var big = document.createElement('div');
+        big.className = 'vision-route__mode' + (viaApi ? ' is-ok' : '');
+        big.textContent = viaApi ? '博查 API' : '网页抓取';
+        var sub = document.createElement('div');
+        sub.className = 'vision-route__why';
+        sub.textContent = viaApi
+          ? ('有 key，走博查的结构化接口；它失败会自动落回网页抓取（超时 ' +
+             (d.fallbackTimeout || 8) + ' 秒封顶）。')
+          : '没配 key，或引擎设成了「只用网页抓取」。';
+        box.appendChild(big); box.appendChild(sub);
+
+        var meta = document.createElement('div');
+        meta.className = 'vision-route__meta';
+        var items = [
+          '博查 Key：' + ((d.config && d.config.bochaKey_set) ? '已配置' : '未配置'),
+          '结果缓存：' + ((d.cache && d.cache.count) || 0) + ' / ' +
+            ((d.cache && d.cache.max) || 0) + ' 条',
+          '抓取后端：' + (((d.fetchBackends || []).join(' / ')) || '—')
+        ];
+        if (d.last) {
+          items.push(d.last.ok
+            ? ('上次搜索：成功' + (d.last.count != null ? ' · ' + d.last.count + ' 条' : '') +
+               (d.last.atText ? ' · ' + d.last.atText : ''))
+            : ('上次搜索：失败 · ' + (d.last.error || '')));
+        }
+        items.forEach(function (x) {
+          var li = document.createElement('div');
+          li.textContent = x;
+          meta.appendChild(li);
+        });
+        box.appendChild(meta);
+      })
+      .catch(function () { box.textContent = '读不到状态（服务可能正在重启）'; });
+  }
+  paintStatus();
+
+  /* 引擎与 key */
+  var c = card();
+
+  var sel = document.createElement('select');
+  sel.className = 'form-input';
+  [['auto', '自动：有 key 用博查，失败落抓取'],
+   ['bocha', '只用博查（失败就报错）'],
+   ['off', '只用网页抓取']].forEach(function (o) {
+    var opt = document.createElement('option');
+    opt.value = o[0]; opt.textContent = o[1];
+    if ((s.engine || 'auto') === o[0]) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  sel.addEventListener('change', function () {
+    saveSettings({ search: { engine: sel.value } }, true).then(paintStatus);
+  });
+  c.appendChild(row('搜索引擎', '默认的自动档：没填 key 时行为和以前完全一样', sel,
+    { stack: true }));
+
+  /* 博查 key 只写不回显：服务端只回 bochaKey_set 布尔 */
+  var kwrap = document.createElement('div'); kwrap.className = 'reveal-wrap';
+  var ki = document.createElement('input');
+  ki.className = 'form-input form-input--mono'; ki.type = 'password';
+  ki.placeholder = s.bochaKey_set ? '已配置（留空则不修改）' : '尚未配置';
+  ki.setAttribute('aria-label', '博查 API Key');
+  var kshow = btn('显示', function () {
+    ki.type = ki.type === 'password' ? 'text' : 'password';
+    kshow.textContent = ki.type === 'password' ? '显示' : '隐藏';
+  }, 'btn--sm');
+  kwrap.appendChild(ki); kwrap.appendChild(kshow);
+  c.appendChild(row('博查 API Key', 'api.bochaai.com 申请；不会回显已保存的值',
+    kwrap, { stack: true }));
+  ki.addEventListener('change', function () {
+    if (!ki.value.trim()) return;
+    saveSettings({ search: { bochaKey: ki.value.trim() } }, true)
+      .then(function () {
+        ki.value = '';
+        ki.placeholder = '已配置（留空则不修改）';
+        paintStatus();
+      });
+  });
+
+  c.appendChild(row('每次条数', '发给博查的 count；抓取那条路按它截断',
+    slider(1, 15, 1, s.resultCount != null ? s.resultCount : 8,
+      function (val) { saveSettings({ search: { resultCount: val } }); })),
+    { stack: true });
+  c.appendChild(row('摘要长度', '字符。博查返回的 summary 会截到这个长度',
+    slider(100, 1000, 50, s.snippetChars != null ? s.snippetChars : 500,
+      function (val) { saveSettings({ search: { snippetChars: val } }); })),
+    { stack: true });
+  c.appendChild(row('请求超时', '秒。博查这条路的单次上限',
+    slider(5, 60, 1, s.request_timeout != null ? s.request_timeout : 20,
+      function (val) { saveSettings({ search: { request_timeout: val } }); })),
+    { stack: true });
+  c.appendChild(row('结果缓存', '分钟。同一个关键词在有效期内不重复请求；0 = 不缓存',
+    slider(0, 240, 5, s.cacheTtlMin != null ? s.cacheTtlMin : 30,
+      function (val) { saveSettings({ search: { cacheTtlMin: val } }); })),
+    { stack: true });
+  host.appendChild(section('配置', null, c));
+
+  /* 自检：真搜一次看看通不通。会花额度，所以只在点按钮时跑 */
+  var c2 = card();
+  var out = document.createElement('div');
+  out.className = 'vision-testout';
+  out.textContent = '点下面的按钮会真发一次搜索请求（博查要花额度）。';
+  var actions = document.createElement('div');
+  actions.className = 'vision-actions';
+  var qi = textInput('', function () {}, { placeholder: '想搜什么（留空用「昔涟」）', label: '测试关键词' });
+  actions.appendChild(qi);
+  actions.appendChild(btn('测试搜索', function () {
+    out.textContent = '正在搜…';
+    apiPost('/search/test', { query: qi.value.trim() || '昔涟' })
+      .then(function (d) {
+        out.textContent = (d.ok
+          ? '✓ 通了（' + (d.engine === 'bocha' ? '博查 API' : '网页抓取') + '）\n\n'
+          : '✗ 没通\n\n') + (d.result || '');
+        paintStatus();
+      })
+      .catch(function () { out.textContent = '请求失败（服务可能正在重启）'; });
+  }));
+  actions.appendChild(btn('清空结果缓存', function () {
+    apiPost('/search/cache/clear').then(function (d) {
+      out.textContent = '已清掉 ' + (d.cleared || 0) + ' 条结果缓存。';
+      paintStatus();
+    });
+  }, 'btn--ghost'));
+  c2.appendChild(actions);
+  c2.appendChild(out);
+  host.appendChild(section('自检', '当场搜一次，把结果原文摊出来', c2));
 };
 
 /* ================= 视觉（独立视觉模型）=================
