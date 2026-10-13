@@ -59,6 +59,17 @@ CONFIG_FILE   = BASE_DIR / ".config.json"
 USAGE_FILE    = DATA_DIR / "usage.json"
 STATIC_DIR    = RUNTIME_DIR / "static"
 
+# ========== 同目录模块的 import 前置 ==========
+# ⚠ 本机自带的是**嵌入式发行版**（python/python312._pth 存在），那种发行版下
+#   脚本目录不进 sys.path —— 直接 `python runtime/cyrene_web.py` 跑时，
+#   后面的 `import cyrene_fs` 会报 No module named，而且服务**当场退出**
+#   （不是静默降级，是根本起不来）。
+#   所以「把运行时目录补进搜索路径」这件事必须放在**所有同目录 import 之前**。
+#   下文（文件工具转发层、搜索转发层、记忆模块）还有几处同样的 if，它们会因
+#   这里已经生效而自动跳过 —— 留着是为了让那几段单独被复制走时也能自洽。
+if str(RUNTIME_DIR) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_DIR))
+
 # ========== 一键更新（仓库根那个 update.sh） ==========
 # 仓库根：install.sh / update.sh 所在的那一层，比 cyrene_mobile 高一级。
 # 只拷了 cyrene_mobile/ 的部署可能没有这两个文件，调用处会检查并明说。
@@ -159,136 +170,47 @@ def render_index_html():
 
 
 # ========== 工具定义 ==========
-# ========== 文件工具实现层（阶段 2a）==========
-# 与 termux-api 工具的根本差异：这些工具不 fork 子进程，直接在服务进程内跑
-# Python。所以 run_tool 需要一个 `handler` 分支（见下方 TOOLS 注释与 run_tool）。
+# ---------- 文件工具组（已外置到 cyrene_fs.py）----------
+# 六个读写工具 + 路径守卫整块搬去了同目录的 cyrene_fs.py：常量、guard_path、
+# 扫描辅助、六个 handler，原先散在本文件三段（162–291 / 325–363 / 496–833）。
 #
-# handler 约定：handler(args) -> (outcome, result_text)
-#   outcome 取 OUTCOME_SUCCESS / OUTCOME_FAILURE / OUTCOME_UNKNOWN
-#   args 是**已按 params 类型归一**的 dict（int 还是 int，bool 还是 bool），
-#   与走命令行的 resolve_args（全转 str）不同，见 resolve_typed()。
+# 这里只留转发，而且是**转发面最大的一块** —— `guard_path` /`PathGuardError` /
+# `_fs_root` / `_rel` / `_human_size` 被下载、上传、技能目录、后台任务日志、
+# 工具派发这六处共用，绑回原名之后那些调用点一处都不用改。
 #
-# 路径守卫（对齐桌面端 Code 模式「绑定可信工作目录」）：
-#   · 只允许 FS_ROOT（默认 $HOME，可用 CYRENE_FS_ROOT 覆盖）之内
-#   · abspath 消 `..` 判一次，realpath 解符号链接再判一次 —— 两道都过才放行。
-#     只做 realpath 会让「root 自己是符号链接」时比较错位；只做 abspath 则
-#     挡不住 `ln -s /` 这类逃逸。
-#   · 写操作另有一份硬保护名单（配置/会话/运行时自身），越权直接拒。
+# ⚠ `_fs_protected` 的语义变了一点点：原来它直接读本文件的 CONFIG_FILE /
+#   SESSIONS_FILE / USAGE_FILE / __file__，现在由宿主经 `protected_files` 注入。
+#   注入缺失时它返回空集 —— 也就是**写保护会静默失效**。所以启动自检里专门
+#   盯了这一项（见内核启动段）。
+import cyrene_fs as _fs                                      # noqa: E402
 
-FS_ROOT_DEFAULT = Path.home()
+FS_ROOT_DEFAULT = _fs.FS_ROOT_DEFAULT
+FS_SKIP_DIRS = _fs.FS_SKIP_DIRS
+FS_SKIP_SUFFIXES = _fs.FS_SKIP_SUFFIXES
+FS_MAX_WALK = _fs.FS_MAX_WALK
+FS_GLOB_LIMIT = _fs.FS_GLOB_LIMIT
+FS_GREP_LIMIT = _fs.FS_GREP_LIMIT
+FS_READ_DEFAULT_LINES = _fs.FS_READ_DEFAULT_LINES
+FS_READ_MAX_LINES = _fs.FS_READ_MAX_LINES
+FS_MAX_FILE_BYTES = _fs.FS_MAX_FILE_BYTES
+FS_WRITE_MAX_BYTES = _fs.FS_WRITE_MAX_BYTES
+FS_LIST_LIMIT = _fs.FS_LIST_LIMIT
 
+PathGuardError = _fs.PathGuardError
+guard_path = _fs.guard_path
+_fs_root = _fs._fs_root
+_rel = _fs._rel
+_human_size = _fs._human_size
+# 写入保护判定：外置后真身在 cyrene_fs，宿主这边补一个转发名 —— 第三刀那会儿
+# 漏了它，于是 _verify_filetools.py 的 B 段（真跑六个工具）取不到这个名字。
+_fs_protected = _fs._fs_protected
 
-def _fs_root():
-    """允许访问的根目录。每次调用现算，方便单元测试改环境变量或改模块全局。"""
-    raw = os.environ.get("CYRENE_FS_ROOT")
-    try:
-        return Path(raw).resolve() if raw else Path(FS_ROOT_DEFAULT).resolve()
-    except (OSError, ValueError):
-        return Path(FS_ROOT_DEFAULT).resolve()
-
-
-# 写入硬保护名单：服务自身的命脉文件。读不受限，写一律拒。
-# 改运行时代码必须走部署流程（deploy_web_v8.py + _clean_restart.py），
-# 让模型直接 write_file 覆盖正在运行的 .py 等于把服务往死里改。
-def _fs_protected():
-    out = set()
-    for p in (CONFIG_FILE, SESSIONS_FILE, USAGE_FILE):
-        try:
-            out.add(Path(p).resolve())
-        except (OSError, ValueError):
-            pass
-    try:
-        out.add(Path(__file__).resolve())
-    except (OSError, ValueError, NameError):
-        pass
-    return out
-
-
-# 扫描类工具的性能护栏：手机 CPU 弱，$HOME 下可能有几千个文件。
-FS_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
-                ".mypy_cache", ".pytest_cache", ".tox", "site-packages"}
-# 扫描类工具跳过的文件名。write_file/edit_file 每次改文件都会留 .bak，
-# 写入过程还会短暂存在 .tmpXXXX —— 让 grep 同时命中原文和备份，
-# 模型看到的匹配数会翻倍，纯属噪音。要查备份就直接 read_file 那个 .bak。
-FS_SKIP_SUFFIXES = (".bak", ".tmp", ".swp", ".orig", ".rej")
-
-
-def _skip_file(name):
-    """扫描时是否跳过这个文件名（备份/临时/残留）。"""
-    low = name.lower()
-    if low.endswith(FS_SKIP_SUFFIXES):
-        return True
-    # 本工具自己写的临时文件形如 foo.txt.tmp1a2b3c4d
-    if ".tmp" in low:
-        return True
-    return name.endswith("~")
-
-
-FS_MAX_WALK = 20000        # 单次 glob/grep 最多遍历多少个条目
-FS_GLOB_LIMIT = 100        # glob_files 返回上限
-FS_GREP_LIMIT = 250        # grep_files 匹配行上限
-FS_READ_DEFAULT_LINES = 2000
-FS_READ_MAX_LINES = 20000
-FS_MAX_FILE_BYTES = 4 * 1024 * 1024     # 读取上限 4 MiB，防 OOM
-FS_WRITE_MAX_BYTES = 8 * 1024 * 1024    # 写入上限 8 MiB
-FS_LIST_LIMIT = 500        # list_dir 返回上限
-
-
-class PathGuardError(Exception):
-    """路径越界或不可写。消息直接回给模型，所以要说清为什么被拒。"""
-
-
-def guard_path(raw, want="any", protect_write=False):
-    """把模型给的路径解析成受控的绝对 Path；越界或违规抛 PathGuardError。
-
-    want: "any" 不校验存在性 / "file" 必须是已存在文件 / "dir" 必须是已存在目录
-    protect_write: True 时额外过写入保护名单
-    """
-    if not isinstance(raw, str) or not raw.strip():
-        raise PathGuardError("(路径为空。请给出文件路径，相对路径按根目录解析)")
-    raw = raw.strip().replace("\x00", "")
-    root = _fs_root()
-
-    # ~ 展开只认根目录自己，别的用户家目录不给碰
-    if raw == "~":
-        cand = root
-    elif raw.startswith("~/") or raw.startswith("~" + os.sep):
-        cand = root / raw[2:]
-    else:
-        p = Path(raw)
-        cand = p if p.is_absolute() else (root / p)
-
-    # 第一道：abspath 消掉 .. 后必须仍在 root 内
-    try:
-        ap = Path(os.path.abspath(str(cand)))
-    except (OSError, ValueError) as e:
-        raise PathGuardError(f"(路径无法解析: {e})")
-    if ap != root and root not in ap.parents:
-        raise PathGuardError(
-            f"(路径越界：只允许访问 {root} 之内的文件，拒绝 {ap})")
-
-    # 第二道：解开符号链接后再判一次，防 `ln -s /` 逃逸
-    try:
-        rp = Path(os.path.realpath(str(ap)))
-    except (OSError, ValueError) as e:
-        raise PathGuardError(f"(路径无法解析: {e})")
-    real_root = Path(os.path.realpath(str(root)))
-    if rp != real_root and real_root not in rp.parents:
-        raise PathGuardError(
-            f"(路径经符号链接指向 {root} 之外，已拒绝: {rp})")
-
-    if protect_write and rp in _fs_protected():
-        raise PathGuardError(
-            f"(该文件受写入保护，不允许通过工具修改: {rp.name}。"
-            f"服务配置与会话数据只能在设置面板里改)")
-
-    if want == "file":
-        if not ap.is_file():
-            raise PathGuardError(f"(文件不存在或不是普通文件: {ap})")
-    elif want == "dir":
-        if not ap.is_dir():
-            raise PathGuardError(f"(目录不存在: {ap})")
-    return ap
+_h_read_file = _fs._h_read_file
+_h_write_file = _fs._h_write_file
+_h_edit_file = _fs._h_edit_file
+_h_glob_files = _fs._h_glob_files
+_h_grep_files = _fs._h_grep_files
+_h_list_dir = _fs._h_list_dir
 
 
 def _int_arg(v, default, lo, hi):
@@ -322,102 +244,72 @@ def _decode_bytes(data):
         return data.decode("utf-8", errors="replace"), "（含非 UTF-8 字节，已用替代字符显示）"
 
 
-def _scan_base(root_raw):
-    """解析扫描起点目录（glob/grep 用）。缺省 = FS_ROOT。"""
-    if not root_raw or not str(root_raw).strip():
-        return _fs_root()
-    return guard_path(root_raw, want="dir")
+# ---------- 视觉子系统（已外置到 cyrene_vision.py）----------
+# 让「昔涟」真的能看见图的那一套，整块搬去了同目录的 cyrene_vision.py：
+#   多模态表示层  判断一条消息里有没有图、剥图省 token、把图拼进上下文
+#   图片路由      resolve_image_route 决定走 direct / caption / reject
+#   描述缓存      VISION_CAPTION_CACHE_MAX 条内存 TTL 缓存
+#   协议层        VisionClient 直连视觉端点、认格式、解宽高、caption_image
+#   两个工具      read_image（本地图）/ read_image_url（公网图）
+#   配置归一      VISION_RANGES / normalize_vision / vision_cfg / vision_ready
+# 原先它们散在本文件六段（244–296 / 866–948 / 950–1060 / 1062–1143 /
+# 1146–1509 / 3240–3318），中间夹着附件上传、记忆函数、网络 handler。
+#
+# 这里只留转发，按用处分四类：
+#   工具侧  两个 handler / VISION_TOOL_IDS / vision_tools_allowed
+#   请求侧  messages_have_images / strip_images / media_to_text
+#           （LLMClient 发图前后、agent loop、插件 userQuery 都用）
+#   路由侧  resolve_image_route / IMAGE_ROUTE_* / IMAGE_REJECT_REASON /
+#           build_vision_content / caption_image / normalize_vision
+#   状态侧  VISION_LAST 与四个缓存函数（Handler 里 /vision/* 三入口用）
+#
+# ⚠ VISION_LAST 转发的是**引用**：cyrene_vision 里 caption_image 就地更新它，
+#   Handler 读到的永远是最新内容。（若哪天那边改成整体重新赋值，这里就得换成
+#   访问器 —— 那正是「模块级可变跨模块」的经典坑。）
+import cyrene_vision as _vision                              # noqa: E402
 
+VISION_RANGES = _vision.VISION_RANGES
+VISION_TOOL_IDS = _vision.VISION_TOOL_IDS
+VISION_CAPTION_CACHE_MAX = _vision.VISION_CAPTION_CACHE_MAX
+VISION_LAST = _vision.VISION_LAST
+VISION_ERR_CONFIG = _vision.VISION_ERR_CONFIG
+VISION_ERR_NETWORK = _vision.VISION_ERR_NETWORK
+VISION_ERR_TOO_BIG = _vision.VISION_ERR_TOO_BIG
+VISION_ERR_FORMAT = _vision.VISION_ERR_FORMAT
+VISION_DEFAULT_PROMPT = _vision.VISION_DEFAULT_PROMPT
+IMAGE_ROUTE_DIRECT = _vision.IMAGE_ROUTE_DIRECT
+IMAGE_ROUTE_CAPTION = _vision.IMAGE_ROUTE_CAPTION
+IMAGE_ROUTE_REJECT = _vision.IMAGE_ROUTE_REJECT
+IMAGE_REJECT_REASON = _vision.IMAGE_REJECT_REASON
 
-def _walk_files(base):
-    """生成 base 下的文件 Path，跳过噪音目录与备份文件，带总条目上限防卡死。"""
-    seen = 0
-    for dirpath, dirnames, filenames in os.walk(str(base)):
-        dirnames[:] = [d for d in dirnames if d not in FS_SKIP_DIRS]
-        for fn in filenames:
-            if _skip_file(fn):
-                continue
-            seen += 1
-            if seen > FS_MAX_WALK:
-                return
-            yield Path(dirpath) / fn
+normalize_vision = _vision.normalize_vision
+vision_cfg = _vision.vision_cfg
+vision_ready = _vision.vision_ready
+vision_tools_allowed = _vision.vision_tools_allowed
+multimodal_enabled = _vision.multimodal_enabled
+resolve_image_route = _vision.resolve_image_route
+resolve_caption_vision_config = _vision.resolve_caption_vision_config
+vision_cache_get = _vision.vision_cache_get
+vision_cache_put = _vision.vision_cache_put
+vision_cache_clear = _vision.vision_cache_clear
+vision_cache_count = _vision.vision_cache_count
+content_has_image = _vision.content_has_image
+messages_have_images = _vision.messages_have_images
+media_to_text = _vision.media_to_text
+strip_images = _vision.strip_images
+image_item = _vision.image_item
+read_injectable = _vision.read_injectable
+build_vision_content = _vision.build_vision_content
+vision_endpoint_url = _vision.vision_endpoint_url
+sniff_image_type = _vision.sniff_image_type
+image_dimensions = _vision.image_dimensions
+read_image_bounded = _vision.read_image_bounded
+vision_max_bytes = _vision.vision_max_bytes
+caption_image = _vision.caption_image
+VisionClient = _vision.VisionClient
 
-
-def _rel(p, base):
-    try:
-        return str(Path(p).relative_to(base)).replace(os.sep, "/")
-    except (ValueError, OSError):
-        return str(p)
-
-
-def _human_size(n):
-    """字节数转人类可读。手机屏幕窄，保持 5 字以内。"""
-    try:
-        n = float(n)
-    except (TypeError, ValueError):
-        return "?"
-    for unit in ("B", "K", "M", "G", "T"):
-        if n < 1024 or unit == "T":
-            return f"{int(n)}B" if unit == "B" else f"{n:.1f}{unit}"
-        n /= 1024.0
-    return f"{n:.1f}T"
-
-
-# ---------- 六个 handler ----------
-
-def _h_read_image(a):
-    """read_image：把本地图片交给独立视觉模型，返回文字描述。
-
-    与 read_file 的分工（对齐桌面端那套）：
-      read_file  → 文本文件
-      read_image → 本地图片，让「她」看见内容
-      read_image_url → 公网图片，本机不下载
-
-    这里只做参数校验 + 路径守卫 + 调用协议层；图片怎么编码、请求怎么拼，
-    全在 caption_image 里，本函数不碰 image_url 格式。
-    """
-    ok, conf = resolve_caption_vision_config()
-    if not ok:
-        # 配置不齐是「可预期」的失败，不是异常：返回可读原因，
-        # 她会照着如实告诉用户（对应工具描述里那句「未配置时会返回错误」）。
-        return OUTCOME_FAILURE, str(conf)
-
-    try:
-        p = guard_path(a.get("path"), want="file")
-    except PathGuardError as e:
-        return OUTCOME_FAILURE, str(e)
-
-    question = (a.get("question") or "").strip()[:500]
-    text = caption_image({"path": p}, question, cfg=(ok, conf))
-    if isinstance(text, str) and text.startswith("[错误"):
-        return OUTCOME_FAILURE, text
-
-    head = f"图片: {_rel(p, _fs_root())}"
-    return OUTCOME_SUCCESS, head + "\n" + text
-
-
-def _h_read_image_url(a):
-    """read_image_url：把公网图片 URL 交给独立视觉模型，返回文字描述。
-
-    URL 原样直传给厂商，本机不下载、不转 base64 —— 省流量省内存，
-    也让「看一眼网上的图」不必先落一份副本（要副本另有 download_file）。
-    """
-    url = (a.get("url") or "").strip()
-    if not url:
-        return OUTCOME_FAILURE, "(缺少 url)"
-    if not re.match(r"^https?://", url, re.I):
-        return OUTCOME_FAILURE, ("(url 必须以 http:// 或 https:// 开头。"
-                                 "本机路径请用 read_image)")
-
-    ok, conf = resolve_caption_vision_config()
-    if not ok:
-        return OUTCOME_FAILURE, str(conf)
-
-    question = (a.get("question") or "").strip()[:500]
-    text = caption_image({"url": url}, question, cfg=(ok, conf))
-    if isinstance(text, str) and text.startswith("[错误"):
-        return OUTCOME_FAILURE, text
-    return OUTCOME_SUCCESS, text
+_h_read_image = _vision._h_read_image
+_h_read_image_url = _vision._h_read_image_url
 
 
 def _memory_rerank(query, cands, limit=4):
@@ -493,859 +385,146 @@ def _h_recall_memory(a):
     return OUTCOME_SUCCESS, "\n".join(lines)
 
 
-def _h_read_file(a):
-    """read_file：按行分段读文本文件，带行号。"""
-    try:
-        p = guard_path(a.get("path"), want="file")
-    except PathGuardError as e:
-        return OUTCOME_FAILURE, str(e)
-
-    try:
-        size = p.stat().st_size
-    except OSError as e:
-        return OUTCOME_FAILURE, f"(读不到文件信息: {e})"
-    if size > FS_MAX_FILE_BYTES:
-        return OUTCOME_FAILURE, (
-            f"(文件 {size} 字节，超过读取上限 {FS_MAX_FILE_BYTES} 字节，"
-            f"请改用 grep_files 定位后再按 offset/limit 分段读)")
-
-    try:
-        data = p.read_bytes()
-    except OSError as e:
-        return OUTCOME_FAILURE, f"(读取失败: {e})"
-    if b"\x00" in data[:8192]:
-        return OUTCOME_FAILURE, (
-            f"(这是二进制文件（{_human_size(size)}），不能当文本读)")
-
-    text, enc_note = _decode_bytes(data)
-    lines = text.split("\n")
-    total = len(lines)
-    if lines and lines[-1] == "":
-        total -= 1          # 末尾换行不算一行
-        lines = lines[:-1]
-
-    offset = _int_arg(a.get("offset"), 0, 0, 10 ** 9)
-    limit = _int_arg(a.get("limit"), FS_READ_DEFAULT_LINES, 1, FS_READ_MAX_LINES)
-    if offset >= max(total, 1) and total > 0:
-        return OUTCOME_FAILURE, (
-            f"(offset={offset} 超出文件末尾。该文件共 {total} 行)")
-
-    chunk = lines[offset:offset + limit]
-    width = len(str(offset + len(chunk))) if chunk else 1
-    body = "\n".join(f"{offset + i + 1:>{width}} | {ln}" for i, ln in enumerate(chunk))
-
-    head = f"文件: {_rel(p, _fs_root())}  共 {total} 行 / {_human_size(size)}"
-    if offset or len(chunk) < total:
-        head += f"  · 本次显示第 {offset + 1}-{offset + len(chunk)} 行"
-    notes = [head]
-    if enc_note:
-        notes.append(enc_note)
-    if offset + len(chunk) < total:
-        notes.append(f"（还有 {total - offset - len(chunk)} 行未显示，"
-                     f"需要就传 offset={offset + len(chunk)} 继续读）")
-    notes.append("（左侧数字是行号，仅供定位。edit_file 的 old_string 要用文件原文，"
-                 "不要把行号一起复制进去）")
-    return OUTCOME_SUCCESS, "\n".join(notes) + "\n" + body
-
-
-def _h_write_file(a):
-    """write_file：整文件覆写。已存在则先备份 .bak，落盘走临时文件 + os.replace。"""
-    try:
-        p = guard_path(a.get("path"), want="any", protect_write=True)
-    except PathGuardError as e:
-        return OUTCOME_FAILURE, str(e)
-
-    content = a.get("content")
-    if content is None:
-        return OUTCOME_FAILURE, "(缺少 content 参数)"
-    if not isinstance(content, str):
-        content = json.dumps(content, ensure_ascii=False, indent=2)
-
-    raw = content.encode("utf-8")
-    if len(raw) > FS_WRITE_MAX_BYTES:
-        return OUTCOME_FAILURE, (
-            f"(内容 {len(raw)} 字节，超过写入上限 {FS_WRITE_MAX_BYTES} 字节，请分批写)")
-
-    existed = p.exists()
-    if existed and p.is_dir():
-        return OUTCOME_FAILURE, f"(目标是个目录，不能当文件写: {p})"
-
-    bak_note = ""
-    # 临时名必须唯一：dispatch_tools 并行跑，两个线程同时写同一文件时
-    # 用 pid 会撞名，导致一方 replace 掉另一方写了一半的内容。
-    tmp = Path(str(p) + f".tmp{uuid.uuid4().hex[:8]}")
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        if existed:
-            # 写前备份：只留最近一份，避免 .bak 无限堆积
-            shutil.copy2(str(p), str(p) + ".bak")
-            bak_note = f"，原文件已备份为 {p.name}.bak"
-        tmp.write_bytes(raw)
-        os.replace(str(tmp), str(p))       # 原子替换，中途崩不会留半截文件
-    except OSError as e:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
-        return OUTCOME_FAILURE, f"(写入失败: {e})"
-
-    nlines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
-    return OUTCOME_SUCCESS, (
-        f"已写入 {_rel(p, _fs_root())}（{len(raw)} 字节，{nlines} 行{bak_note}）")
-
-
-def _h_edit_file(a):
-    """edit_file：精确字符串替换。匹配数不等于预期就报错，绝不猜。"""
-    try:
-        p = guard_path(a.get("path"), want="file", protect_write=True)
-    except PathGuardError as e:
-        return OUTCOME_FAILURE, str(e)
-
-    old = a.get("old_string")
-    new = a.get("new_string")
-    if not isinstance(old, str) or old == "":
-        return OUTCOME_FAILURE, "(old_string 为空。要整文件覆写请用 write_file)"
-    if not isinstance(new, str):
-        return OUTCOME_FAILURE, "(new_string 缺失或类型不对)"
-    if old == new:
-        return OUTCOME_FAILURE, "(old_string 与 new_string 相同，无需修改)"
-
-    try:
-        data = p.read_bytes()
-    except OSError as e:
-        return OUTCOME_FAILURE, f"(读取失败: {e})"
-    if len(data) > FS_MAX_FILE_BYTES:
-        return OUTCOME_FAILURE, (
-            f"(文件 {len(data)} 字节过大，超过 {FS_MAX_FILE_BYTES} 字节上限，"
-            f"请改用 write_file 分段重写)")
-    if b"\x00" in data[:8192]:
-        return OUTCOME_FAILURE, "(二进制文件，不能做文本替换)"
-
-    text, _ = _decode_bytes(data)
-    n = text.count(old)
-    replace_all = _bool_arg(a.get("replace_all"), False)
-
-    if n == 0:
-        hint = ""
-        # 最常见的原因是空白/缩进对不上，给个可操作提示而不是干巴巴报错
-        probe = old.strip()
-        if probe and probe in text:
-            hint = "（提示：去掉首尾空白后能匹配到，说明你给的 old_string 缩进或换行与文件不一致，请先 read_file 核对原文）"
-        return OUTCOME_FAILURE, f"(在文件里找不到 old_string，未做任何修改{hint})"
-    if n > 1 and not replace_all:
-        return OUTCOME_FAILURE, (
-            f"(old_string 在文件里出现 {n} 次，无法确定改哪一处，未做任何修改。"
-            f"请把上下文加长到唯一，或显式传 replace_all=true 全部替换)")
-
-    result = text.replace(old, new) if replace_all else text.replace(old, new, 1)
-    raw = result.encode("utf-8")
-    tmp = Path(str(p) + f".tmp{uuid.uuid4().hex[:8]}")   # 并行安全，同 write_file
-    try:
-        shutil.copy2(str(p), str(p) + ".bak")
-        tmp.write_bytes(raw)
-        os.replace(str(tmp), str(p))
-    except OSError as e:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
-        return OUTCOME_FAILURE, f"(写入失败: {e})"
-
-    return OUTCOME_SUCCESS, (
-        f"已替换 {n if replace_all else 1} 处 → {_rel(p, _fs_root())}"
-        f"（原文件备份为 {p.name}.bak）")
-
-
-def _h_glob_files(a):
-    """glob_files：按通配模式找文件，返回相对路径列表。"""
-    pattern = a.get("pattern")
-    if not isinstance(pattern, str) or not pattern.strip():
-        return OUTCOME_FAILURE, "(缺少 pattern，例如 **/*.py 或 *.md)"
-    pattern = pattern.strip()
-    try:
-        base = _scan_base(a.get("root"))
-    except PathGuardError as e:
-        return OUTCOME_FAILURE, str(e)
-
-    hits = []
-    truncated = False
-    for f in _walk_files(base):
-        rel = _rel(f, base)
-        name = f.name
-        # 支持三种写法：纯文件名模式 / 带目录的模式 / ** 递归模式
-        if (fnmatch.fnmatch(name, pattern)
-                or fnmatch.fnmatch(rel, pattern)
-                or ("/" not in pattern and fnmatch.fnmatch(rel, "*/" + pattern))):
-            hits.append(rel)
-            if len(hits) >= FS_GLOB_LIMIT:
-                truncated = True
-                break
-
-    if not hits:
-        return OUTCOME_SUCCESS, f"(在 {_rel(base, _fs_root()) or '.'} 下没有匹配 {pattern} 的文件)"
-    hits.sort()
-    head = f"匹配 {pattern}：{len(hits)} 个文件" + ("（已到上限，可能还有更多）" if truncated else "")
-    return OUTCOME_SUCCESS, head + "\n" + "\n".join(hits)
-
-
-def _h_grep_files(a):
-    """grep_files：正则搜文件内容，带行号与可选上下文。"""
-    pattern = a.get("pattern")
-    if not isinstance(pattern, str) or not pattern.strip():
-        return OUTCOME_FAILURE, "(缺少 pattern)"
-    try:
-        rx = re.compile(pattern)
-    except re.error as e:
-        return OUTCOME_FAILURE, f"(正则表达式不合法: {e})"
-
-    try:
-        base = _scan_base(a.get("root"))
-    except PathGuardError as e:
-        return OUTCOME_FAILURE, str(e)
-
-    fileglob = (a.get("glob") or "").strip() if isinstance(a.get("glob"), str) else ""
-    ctx = _int_arg(a.get("context"), 0, 0, 10)
-    only_names = _bool_arg(a.get("files_with_matches"), False)
-
-    out = []
-    nmatch = 0        # 真正匹配上的行数（不含 context 行）
-    nline = 0         # 输出行数（含 context 行），受 FS_GREP_LIMIT 约束
-    nfile = 0
-    truncated = False
-    for f in _walk_files(base):
-        rel = _rel(f, base)
-        if fileglob and not (fnmatch.fnmatch(f.name, fileglob)
-                             or fnmatch.fnmatch(rel, fileglob)):
-            continue
-        try:
-            if f.stat().st_size > FS_MAX_FILE_BYTES:
-                continue
-            data = f.read_bytes()
-        except OSError:
-            continue
-        if b"\x00" in data[:8192]:
-            continue                      # 跳过二进制
-        text, _ = _decode_bytes(data)
-        lines = text.split("\n")
-        idxs = [i for i, ln in enumerate(lines) if rx.search(ln)]
-        if not idxs:
-            continue
-        nfile += 1
-        nmatch += len(idxs)
-        if only_names:
-            out.append(f"{rel}（{len(idxs)} 处）")
-            nline += 1
-            if nline >= FS_GREP_LIMIT:
-                truncated = True
-                break
-            continue
-
-        shown = set()
-        hitset = set(idxs)
-        groups = []
-        for i in idxs:
-            lo, hi = max(0, i - ctx), min(len(lines), i + ctx + 1)
-            if groups and lo <= groups[-1][1]:
-                groups[-1] = (groups[-1][0], max(groups[-1][1], hi))
-            else:
-                groups.append((lo, hi))
-        for lo, hi in groups:
-            for j in range(lo, hi):
-                if j in shown:
-                    continue
-                shown.add(j)
-                mark = ":" if j in hitset else "-"
-                out.append(f"{rel}{mark}{j + 1}{mark} {lines[j]}")
-                nline += 1
-                if nline >= FS_GREP_LIMIT:
-                    truncated = True
-                    break
-            if truncated:
-                break
-            if ctx:
-                out.append("--")
-        if truncated:
-            break
-
-    if not out:
-        return OUTCOME_SUCCESS, f"(在 {_rel(base, _fs_root()) or '.'} 下没有匹配 /{pattern}/ 的内容)"
-    head = (f"匹配 /{pattern}/：{nmatch} 处，分布在 {nfile} 个文件"
-            + (f"（已到 {FS_GREP_LIMIT} 行输出上限，结果被截断，请缩小 root 或加 glob 过滤）"
-               if truncated else ""))
-    return OUTCOME_SUCCESS, head + "\n" + "\n".join(out)
-
-
-def _h_list_dir(a):
-    """list_dir：列目录内容，目录在前、文件在后，带大小。"""
-    try:
-        p = guard_path(a.get("path"), want="dir") if str(a.get("path") or "").strip() \
-            else _fs_root()
-    except PathGuardError as e:
-        return OUTCOME_FAILURE, str(e)
-
-    try:
-        entries = sorted(os.scandir(str(p)), key=lambda e: (not e.is_dir(), e.name.lower()))
-    except OSError as e:
-        return OUTCOME_FAILURE, f"(列目录失败: {e})"
-
-    dirs, files = [], []
-    for e in entries[:FS_LIST_LIMIT]:
-        try:
-            if e.is_dir():
-                dirs.append(f"{e.name}/")
-            else:
-                files.append(f"{e.name}  ({_human_size(e.stat().st_size)})")
-        except OSError:
-            files.append(f"{e.name}  (?)")
-
-    total = len(entries)
-    lines = dirs + files
-    if total > FS_LIST_LIMIT:
-        lines.append(f"…（还有 {total - FS_LIST_LIMIT} 项未列出）")
-    head = (f"目录: {_rel(p, _fs_root()) or '.'}  ·  "
-            f"{len(dirs)} 个子目录 / {len(files)} 个文件"
-            + ("（已截断）" if total > FS_LIST_LIMIT else ""))
-    if not lines:
-        return OUTCOME_SUCCESS, head + "\n(空目录)"
-    return OUTCOME_SUCCESS, head + "\n" + "\n".join(lines)
-
-
-# ========== 网络工具实现层（阶段 2b）==========
-# 与文件工具同属 handler 型：进程内直接跑 Python，不 fork 子进程，因此
-# 不受 termux-api 广播熔断器牵连、无孤儿进程。但网络调用有文件工具没有的
-# 两个风险，必须在这里自己兜住：
-#   ① 挂死。handler 在 run_agent_loop 里**同步**执行，没有 run_tool 给命令行
-#      工具套的 stepTimeout 子进程超时。所以 urllib 的 timeout 是防挂死的唯一
-#      屏障，每个网络请求都必须显式带（见 _net_timeout / _net_open）。
-#   ② SSRF / 本地文件泄露。urllib.request.urlopen 认 file://、ftp:// 等协议，
-#      `urlopen("file:///etc/passwd")` 会真的读出本地文件 —— 那 guard_path 就
-#      白做了。所以 _net_open 只放行 http/https，其余协议一律拒。
+# ---------- TTS 子系统（已外置到 cyrene_tts.py）----------
+# 「让昔涟出声」的那两条嗓子整块搬去了同目录的 cyrene_tts.py：引擎分派
+# （system / minimax / custom）、气口增强、音频缓存、两个对外函数。
 #
-# 三个工具都是**只读网络**（fetch/search 不落副作用，download 只往 downloads
-# 目录写新文件），但 risk 统一标 "network"：让前端能按类过滤，也让 loop 的
-# halted 判定把它们排除在「幂等 safe」之外（网络失败返回 FAILURE 而非 UNKNOWN，
-# 因为读操作可安全重试；只有超时才可能是 UNKNOWN）。
-NET_UA = ("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
-          "(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36")
-NET_FETCH_MAX_BYTES = 8 * 1024 * 1024      # fetch_url 单次抓取上限 8 MiB，防 OOM
-NET_DOWNLOAD_MAX_BYTES = 64 * 1024 * 1024  # download_file 上限 64 MiB（对齐桌面端）
-NET_DEFAULT_RESULTS = 6                     # web_search 默认返回条数
-NET_MAX_RESULTS = 15                        # web_search 上限
-DOWNLOAD_DIRNAME = "downloads"              # 相对 FS_ROOT 的下载目录名
-
-# 搜索引擎降级链。探测（_probe_search.py，2026-10-07）四家全 200：
-# bing/cn.bing 结果结构最干净（真实 URL + snippet），ddg-html snippet 命中质量
-# 最好，baidu 给的是 /link?url= 跳转链（URL 不干净）故不入首选。任一后端
-# 抓取或解析出 0 条就自动降级到下一个，全挂才报错。
-NET_SEARCH_BACKENDS = ("bing", "cn.bing", "ddg")
-
-
-class NetError(Exception):
-    """网络请求失败。消息直接回给模型，所以要说清是哪一步、什么原因。"""
-
-
-def _net_timeout():
-    """网络请求超时（秒）。取 agent stepTimeout，夹到 [5,60]。
-
-    handler 型工具在 loop 里同步跑、没有子进程级超时兜底，urllib 的 timeout
-    是防挂死的唯一屏障，必须有。夹上限是因为 stepTimeout 可到 120s，而整条
-    loop 的 totalTimeout 默认才 180s —— 一个网络请求不该独吞掉大半预算。
-    """
-    try:
-        base = int(agent_cfg("stepTimeout") or 30)
-    except (TypeError, ValueError):
-        base = 30
-    return max(5, min(60, base))
-
-
-def _pick_charset(content_type, head):
-    """从 Content-Type 头或 HTML meta 里猜字符集，猜不出返回 None。"""
-    m = re.search(r"charset=([\w\-]+)", content_type or "", re.I)
-    if m:
-        return m.group(1).strip("\"' ")
-    m = re.search(rb"charset=[\"']?([\w\-]+)", head[:4096], re.I)
-    if m:
-        try:
-            return m.group(1).decode("ascii", "ignore")
-        except Exception:
-            return None
-    return None
-
-
-def _decode_body(body, content_type):
-    """bytes → (text, note)。按 header/meta 的 charset 优先，退 utf-8，再退 replace。"""
-    cs = _pick_charset(content_type, body)
-    if cs:
-        try:
-            return body.decode(cs), ""
-        except (UnicodeDecodeError, LookupError):
-            pass
-    try:
-        return body.decode("utf-8"), ""
-    except UnicodeDecodeError:
-        return body.decode("utf-8", errors="replace"), "（含非 UTF-8 字节，已用替代字符显示）"
-
-
-def _net_open(url, max_bytes, timeout=None):
-    """打开一个 http(s) URL，返回 (status, headers_dict, body_bytes, truncated)。
-
-    - 只放行 http/https，其余协议（file/ftp/…）直接拒，防本地文件泄露。
-    - 读到 max_bytes 就停并置 truncated=True，不整包吞进内存。
-    - 4xx/5xx 抛 NetError（带状态码），网络异常抛 NetError（带原因）。
-    """
-    if not isinstance(url, str) or not url.strip():
-        raise NetError("(URL 为空)")
-    url = url.strip()
-    scheme = urlparse(url).scheme.lower()
-    if scheme not in ("http", "https"):
-        raise NetError(f"(只支持 http/https 网址，拒绝 {scheme or '(无协议)'}:// —— "
-                       f"file/ftp 等协议可能读取本地文件)")
-    timeout = timeout or _net_timeout()
-    req = urllib.request.Request(url, headers={
-        "User-Agent": NET_UA,
-        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            status = r.getcode()
-            headers = {k.lower(): v for k, v in (r.headers.items() if r.headers else [])}
-            body = r.read(max_bytes + 1)
-    except urllib.error.HTTPError as e:
-        raise NetError(f"(HTTP {e.code} 错误：{e.reason})")
-    except urllib.error.URLError as e:
-        raise NetError(f"(连不上目标：{getattr(e, 'reason', e)})")
-    except Exception as e:
-        raise NetError(f"(请求失败：{type(e).__name__}: {e})")
-    truncated = len(body) > max_bytes
-    if truncated:
-        body = body[:max_bytes]
-    return status, headers, body, truncated
-
-
-class _HTMLToMarkdown(_HTMLParser):
-    """把 HTML 转成结构近似的 Markdown 纯文本（stdlib HTMLParser，不引三方库）。
-
-    - script/style/noscript/head/svg/template 里的内容整段丢弃
-    - h1~h6 → #~######；p/div/li/blockquote → 块级换行；li 前缀 "- "；br → 换行
-    - <a href> → [文字](href)；pre/code 内容原样保留
-    - convert_charrefs=True 让 &amp; 之类自动还原，无需再 unescape
-    目标是「可读、带链接、去掉导航噪音」，不追求像素级还原排版。
-    """
-    # ⚠ head 不在 _SKIP 里：<title> 就在 head 内，跳过 head 会连 title 一起丢。
-    #    head 里其余标签要么是无文本的 void 元素（meta/link/base），要么
-    #    script/style/noscript 已各自在下面被跳过，所以不 skip head 也不会漏噪音。
-    _SKIP = {"script", "style", "noscript", "svg", "template"}
-    _HEADING = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
-    _BLOCK = {"p", "div", "section", "article", "header", "footer", "main",
-              "aside", "ul", "ol", "table", "tr", "blockquote", "figure",
-              "figcaption", "hr", "pre"}
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.out = []
-        self.title = ""
-        self._skip = 0          # >0 表示正处在要丢弃的子树里
-        self._in_title = False
-        self._href = None       # 当前 <a> 的 href
-        self._link_buf = []     # 当前 <a> 的文字
-
-    def _emit(self, s):
-        if self._skip:
-            return
-        if self._in_title:
-            self.title += s
-        elif self._href is not None:
-            self._link_buf.append(s)
-        else:
-            self.out.append(s)
-
-    def _newline(self, n=2):
-        if self._skip:
-            return
-        self.out.append("\n" * n)
-
-    def handle_starttag(self, tag, attrs):
-        if tag in self._SKIP:
-            self._skip += 1
-            return
-        if self._skip:
-            return
-        ad = dict(attrs)
-        if tag == "title":
-            self._in_title = True
-        elif tag in self._HEADING:
-            self._newline(2)
-            self._emit("#" * self._HEADING[tag] + " ")
-        elif tag == "li":
-            self._newline(1)
-            self._emit("- ")
-        elif tag == "br":
-            self._newline(1)
-        elif tag == "a":
-            href = ad.get("href")
-            self._href = href if (href and href.startswith("http")) else ""
-            self._link_buf = []
-        elif tag in self._BLOCK:
-            self._newline(2)
-
-    def handle_endtag(self, tag):
-        if tag in self._SKIP:
-            self._skip = max(0, self._skip - 1)
-            return
-        if self._skip:
-            return
-        if tag == "title":
-            self._in_title = False
-        elif tag == "a" and self._href is not None:
-            text = "".join(self._link_buf).strip()
-            href = self._href
-            self._href = None
-            self._link_buf = []
-            if text and href:
-                self._emit(f"[{text}]({href})")
-            elif text:
-                self._emit(text)
-        elif tag in self._HEADING or tag in self._BLOCK:
-            self._newline(2)
-
-    def handle_data(self, data):
-        if data:
-            self._emit(data)
-
-    def text(self):
-        raw = "".join(self.out)
-        # 逐行去尾空格，3+ 连续空行压成 1 个空行，整体 strip
-        lines = [ln.rstrip() for ln in raw.split("\n")]
-        cleaned, blank = [], 0
-        for ln in lines:
-            if ln.strip():
-                cleaned.append(ln)
-                blank = 0
-            else:
-                blank += 1
-                if blank <= 1:
-                    cleaned.append("")
-        return self.title.strip(), "\n".join(cleaned).strip()
-
-
-def _html_to_markdown(body, content_type):
-    """HTML bytes → (title, markdown_text)。解析失败退回纯文本抽字。"""
-    text, _ = _decode_body(body, content_type)
-    try:
-        p = _HTMLToMarkdown()
-        p.feed(text)
-        title, md = p.text()
-        if md.strip():
-            return title, md
-    except Exception:
-        pass
-    # 兜底：HTMLParser 崩了或没抽到内容，退化成「去标签 + 还原实体」
-    stripped = re.sub(r"(?is)<(script|style|noscript|svg|head)\b.*?</\1>", " ", text)
-    stripped = re.sub(r"(?s)<[^>]+>", " ", stripped)
-    stripped = _html_mod.unescape(stripped)
-    stripped = re.sub(r"[ \t]+", " ", stripped)
-    stripped = re.sub(r"\n\s*\n\s*\n+", "\n\n", stripped)
-    return "", stripped.strip()
-
-
-# ---------- 结构化搜索后端（博查 / Tavily）----------
-# 桌面端那份的要点照搬：engine 由设置注入、POST 一小段 JSON、Bearer key、
-# 结果统一成 {title,url,snippet,source}、snippet 截断、30 分钟 TTL 缓存。
-# 手机端两点差别：
-#   ① 只用 urllib + json（零第三方依赖）；
-#   ② API 通道失败要能落回下面那套 HTML 抓取，所以每个 client 只负责
-#      「拿到就返回」，「什么时候该降级」留在 _h_web_search 里决定。
-# 两条 API 通道共用超时、响应上限与结果缓存 —— 差别只在端点、请求体、响应字段。
-BOCHA_SEARCH_URL = "https://api.bochaai.com/v1/web-search"
-TAVILY_SEARCH_URL = "https://api.tavily.com/search"
-SEARCH_CACHE_MAX = 64                        # 内存条数上限（与视觉缓存同款考虑）
-SEARCH_RESULT_MAX_BYTES = 2 * 1024 * 1024    # 搜索响应读取上限，防 OOM
-SEARCH_FALLBACK_TIMEOUT = 8                  # API 失败后落回抓取时的超时封顶（秒）
-
-_search_cache = {}                   # key -> (ts, items)；dict 保序，天然 FIFO 淘汰
-_search_cache_lock = threading.Lock()
-
-# 上一次搜索的结果，供 /search/status 与设置页自检显示（**不含 key 明文**）
-SEARCH_LAST = {}
-
-
-def _search_cache_ttl():
-    """当前生效的结果缓存 TTL（秒）。0 = 不缓存（用户把 cacheTtlMin 拉到 0）。"""
-    try:
-        return max(0, int(search_cfg("cacheTtlMin", 30) or 0)) * 60
-    except (TypeError, ValueError):
-        return 30 * 60
-
-
-def search_cache_get(key):
-    """读结果缓存。命中返回 items，否则 None。
-
-    与视觉缓存同款：TTL 按**读取时**的当前配置判，用户在面板上调了立刻生效。
-    """
-    if not key:
-        return None
-    ttl = _search_cache_ttl()
-    if ttl <= 0:
-        return None
-    now = time.time()
-    with _search_cache_lock:
-        item = _search_cache.get(key)
-        if item is None:
-            return None
-        ts, items = item
-        if now - ts > ttl:
-            _search_cache.pop(key, None)
-            return None
-        return items
-
-
-def search_cache_put(key, items):
-    """写结果缓存。只缓存成功结果 —— 错误缓存下来等于把一次网络抖动固化半小时。"""
-    if not key or not items:
-        return
-    with _search_cache_lock:
-        while len(_search_cache) >= SEARCH_CACHE_MAX:
-            try:
-                _search_cache.popitem(last=False)
-            except KeyError:
-                break
-        _search_cache[key] = (time.time(), list(items))
-
-
-def search_cache_clear():
-    """清空结果缓存，返回清掉的条数。"""
-    with _search_cache_lock:
-        n = len(_search_cache)
-        _search_cache.clear()
-        return n
-
-
-def search_cache_count():
-    with _search_cache_lock:
-        return len(_search_cache)
-
-
-def _net_post_json(url, payload, headers, max_bytes, timeout):
-    """POST 一段 JSON 并把响应按 JSON 解回来，返回 dict。
-
-    为什么另写一个而不给 _net_open 加参数：_net_open 是 GET-only 的读通道
-    （fetch_url 那条工具全靠它），把 POST / 自定义头揉进去会让那条路径多出一堆
-    分支；搜索这边只需要「发一小段 JSON、收一小段 JSON」，独立成函数更清楚。
-    错误口径与 _net_open 一致：一律抛 NetError，调用方只管降级。
-    """
-    if not isinstance(url, str) or not url.strip():
-        raise NetError("(URL 为空)")
-    url = url.strip()
-    if urlparse(url).scheme.lower() not in ("http", "https"):
-        raise NetError("(只支持 http/https 网址)")
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    hdrs = {"User-Agent": NET_UA, "Content-Type": "application/json",
-            "Accept": "application/json"}
-    for k, v in (headers or {}).items():
-        hdrs[str(k)] = str(v)
-    req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read(max_bytes + 1)
-    except urllib.error.HTTPError as e:
-        # 401/403（key 不对）最常见，把状态码原样带出来，用户能自己判断
-        raise NetError(f"(HTTP {e.code} 错误：{e.reason})")
-    except urllib.error.URLError as e:
-        raise NetError(f"(连不上目标：{getattr(e, 'reason', e)})")
-    except Exception as e:
-        raise NetError(f"(请求失败：{type(e).__name__}: {e})")
-    if len(raw) > max_bytes:
-        raise NetError("(响应过大，已放弃)")
-    try:
-        data = json.loads(raw.decode("utf-8", "replace"))
-    except (ValueError, UnicodeDecodeError):
-        raise NetError("(响应不是合法 JSON)")
-    if not isinstance(data, dict):
-        raise NetError("(响应结构不认识)")
-    return data
-
-
-def _bocha_items(data, snippet_chars):
-    """把博查响应映射成统一的 [(title, url, snippet, source)]。
-
-    两种形态都收：文档里的 data.webPages.value，以及直接把 webPages 放在根上的
-    写法（不同版本/网关都见过，收宽一点不会错）。
-    """
-    pages = None
-    if isinstance(data.get("data"), dict):
-        pages = data["data"].get("webPages")
-    if not isinstance(pages, dict):
-        pages = data.get("webPages")
-    values = pages.get("value") if isinstance(pages, dict) else None
-    items = []
-    for r in (values or []):
-        if not isinstance(r, dict):
-            continue
-        title = str(r.get("name") or r.get("title") or "").strip()
-        url = str(r.get("url") or "").strip()
-        snippet = re.sub(r"\s+", " ", str(r.get("summary") or r.get("snippet") or "")).strip()
-        if len(snippet) > snippet_chars:
-            snippet = snippet[:snippet_chars] + "…"
-        source = str(r.get("siteName") or "").strip()
-        if url.startswith("http"):
-            items.append((title, url, snippet, source))
-    return items
-
-
-def bocha_search(query, count, timeout):
-    """调博查 /v1/web-search。返回 [(title,url,snippet,source)]；失败抛 NetError。"""
-    key = str(search_cfg("bochaKey", "") or "").strip()
-    if not key:
-        raise NetError("(没配博查 key)")
-    snippet_chars = int(search_cfg("snippetChars", 500) or 500)
-    data = _net_post_json(
-        BOCHA_SEARCH_URL,
-        {"query": query, "count": count, "summary": True},
-        {"Authorization": "Bearer " + key},
-        SEARCH_RESULT_MAX_BYTES, timeout)
-    return _bocha_items(data, snippet_chars)
-
-
-def _tavily_items(data, snippet_chars):
-    """把 Tavily 响应映射成统一的 [(title, url, snippet, source)]。
-
-    官方形态是根上的 results[]（每项 title/url/content/score/raw_content）；
-    网关包装过的写法见过 data.results，收宽一点不会错（与 _bocha_items 同款思路）。
-    Tavily 不返回站点名，source 用 URL 的 host —— 总比空串有用，也和博查那条路
-    「有来源就填」的语义一致（抓取那条路拿不到站点名，仍是空串）。
-    """
-    results = None
-    if isinstance(data.get("data"), dict):
-        results = data["data"].get("results")
-    if not isinstance(results, list):
-        results = data.get("results")
-    items = []
-    for r in (results or []):
-        if not isinstance(r, dict):
-            continue
-        title = str(r.get("title") or r.get("name") or "").strip()
-        url = str(r.get("url") or "").strip()
-        snippet = re.sub(r"\s+", " ",
-                         str(r.get("content") or r.get("snippet") or "")).strip()
-        if len(snippet) > snippet_chars:
-            snippet = snippet[:snippet_chars] + "…"
-        source = ""
-        try:
-            source = urlparse(url).netloc
-        except Exception:
-            source = ""
-        if url.startswith("http"):
-            items.append((title, url, snippet, source))
-    return items
-
-
-def tavily_search(query, count, timeout):
-    """调 Tavily /search。返回 [(title,url,snippet,source)]；失败抛 NetError。
-
-    search_depth 固定 basic：advanced 更慢也更吃额度，而调用方（模型）拿到的是
-    同样的 标题/链接/摘要 三元组，这里不划算。
-    """
-    key = str(search_cfg("tavilyKey", "") or "").strip()
-    if not key:
-        raise NetError("(没配 Tavily key)")
-    snippet_chars = int(search_cfg("snippetChars", 500) or 500)
-    data = _net_post_json(
-        TAVILY_SEARCH_URL,
-        {"query": query, "max_results": count, "search_depth": "basic",
-         "include_answer": False},
-        {"Authorization": "Bearer " + key},
-        SEARCH_RESULT_MAX_BYTES, timeout)
-    return _tavily_items(data, snippet_chars)
-
-
-# ---------- web_search 后端解析 ----------
-
-def _search_parse_bing(html_text):
-    """Bing：结果块 <li class="b_algo"> 内 <h2><a href>title</a> + <p>snippet。"""
-    items = []
-    for blk in re.findall(r'(?s)<li class="b_algo".*?</li>', html_text):
-        m = re.search(r'(?s)<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', blk)
-        if not m:
-            continue
-        url = _html_mod.unescape(m.group(1)).strip()
-        title = _html_mod.unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip()
-        sn = re.search(r"(?s)<p[^>]*>(.*?)</p>", blk)
-        snippet = _html_mod.unescape(re.sub(r"<[^>]+>", "", sn.group(1))).strip() if sn else ""
-        if url.startswith("http") and title:
-            items.append((title, url, snippet))
-    return items
-
-
-def _search_parse_ddg(html_text):
-    """DuckDuckGo HTML 版：<a class="result__a" href>title</a> + result__snippet。"""
-    items = []
-    links = re.findall(r'(?s)<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-                       html_text)
-    snips = re.findall(r'(?s)class="result__snippet"[^>]*>(.*?)</a>', html_text)
-    for i, (url, title) in enumerate(links):
-        title = _html_mod.unescape(re.sub(r"<[^>]+>", "", title)).strip()
-        snippet = (_html_mod.unescape(re.sub(r"<[^>]+>", "", snips[i])).strip()
-                   if i < len(snips) else "")
-        url = _html_mod.unescape(url).strip()
-        # DDG 常给 /l/?uddg=<encoded> 跳转包裹，解出真实 URL
-        if "/l/?" in url or url.startswith("//duckduckgo.com/l/"):
-            m = re.search(r"uddg=([^&]+)", url)
-            if m:
-                url = urllib.parse.unquote(m.group(1))
-        if url.startswith("http") and title:
-            items.append((title, url, snippet))
-    return items
-
-
-# 后端名 → (URL 模板, 解析函数)。{q} 由已 quote 的查询串替换。
-_NET_SEARCH_SOURCES = {
-    "bing":    ("https://www.bing.com/search?q={q}&setlang=zh-CN", _search_parse_bing),
-    "cn.bing": ("https://cn.bing.com/search?q={q}&setlang=zh-CN", _search_parse_bing),
-    "ddg":     ("https://html.duckduckgo.com/html/?q={q}", _search_parse_ddg),
-}
-
-
-def _clean_filename(name):
-    """把模型/URL 给的文件名洗成安全的单层 basename：去路径分隔、去 ..、去控制符。"""
-    name = (name or "").replace("\x00", "").strip()
-    # 只取最后一段，防 a/b 或 a\\b 落到子目录
-    name = name.replace("\\", "/").rsplit("/", 1)[-1]
-    name = re.sub(r"[\r\n\t]", "", name).strip().strip(".")
-    # 去掉危险前缀，避免覆盖 .config.json 之类
-    return name[:120]
-
-
-def _guess_ext_from_ctype(ctype):
-    """从 Content-Type 猜扩展名，猜不出返回空串。"""
-    ctype = (ctype or "").split(";")[0].strip().lower()
-    table = {
-        "text/html": ".html", "text/plain": ".txt", "text/css": ".css",
-        "text/csv": ".csv", "application/json": ".json",
-        "application/javascript": ".js", "text/javascript": ".js",
-        "application/xml": ".xml", "text/xml": ".xml",
-        "application/pdf": ".pdf", "image/png": ".png", "image/jpeg": ".jpg",
-        "image/gif": ".gif", "image/webp": ".webp", "image/svg+xml": ".svg",
-        "application/zip": ".zip", "application/gzip": ".gz",
-        "application/x-tar": ".tar", "audio/mpeg": ".mp3", "video/mp4": ".mp4",
-        "application/octet-stream": "",
-    }
-    return table.get(ctype, "")
-
-
-def _download_dir():
-    """下载目录（FS_ROOT/downloads），不存在则创建。经 guard_path 保证在根内。"""
-    root = _fs_root()
-    d = guard_path(DOWNLOAD_DIRNAME, want="any")   # 相对 FS_ROOT 解析
-    try:
-        d.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        raise PathGuardError(f"(下载目录创建失败: {e})")
-    # 万一 root 本身不可写，mkdir 会抛，上面已接住
-    _ = root
-    return d
+# 宿主只留三处调用点（/tts、/tts/stop、main() 的 finally）和下面这层转发。
+# 名字逐个接回来，是为了那三处一行都不用改。
+#
+# ⚠ 搬出去时顺手合并了一个双定义：源文件里 tts_stop 被写了两次，后者把带
+#   引擎分派的那份覆盖掉，于是 minimax / custom 播放时「停止」是失效的。
+#   现在只剩一份、且按引擎分派 —— 详见 cyrene_tts.py 的文件头。
+#
+# sys.path 的前置在同目录模块 import 段已经做过（见文件顶），这里直接 import。
+import cyrene_tts as _tts                                    # noqa: E402
+
+enhance_minimax_text = _tts.enhance_minimax_text
+tts_engine = _tts.tts_engine
+tts_speak = _tts.tts_speak
+tts_stop = _tts.tts_stop
+
+
+# ---------- Agent 元工具层（已外置到 cyrene_meta.py）----------
+# 「只操作 Agent 自身状态」的那批工具（工作笔记 / 提问 / 技能按需加载）外加
+# 一整套命令执行（shell + shell_job），整块搬去了同目录的 cyrene_meta.py。
+#
+# 宿主这边只留转发名 —— TOOL_HANDLERS 表、run_tool 的排他批处理、以及工具
+# schema 里那几句文案（引用 META_TODO_MAX / ASK_MAX_QUESTIONS /
+# SHELL_TIMEOUT_MS_RANGE）都按老名字取，一行不用改。
+#
+# ⚠ 会话访问器 `_session_get` / `_session_set_todos` **没搬**：它们是会话层的，
+#   宿主自己也有两处在用，所以留在下面（见挖洞处），经 sessions 服务注入给模块。
+#
+# ⚠ `SHELL_JOBS` 登记簿随模块整块走了：段外没有任何引用，不必做成跨模块共享状态。
+#
+# sys.path 的前置在同目录模块 import 段已经做过（见文件顶），这里直接 import。
+import cyrene_meta as _meta                                  # noqa: E402
+
+META_TODO_MAX = _meta.META_TODO_MAX
+ASK_MAX_QUESTIONS = _meta.ASK_MAX_QUESTIONS
+SHELL_TIMEOUT_MS_RANGE = _meta.SHELL_TIMEOUT_MS_RANGE
+EXCLUSIVE_TOOLS = _meta.EXCLUSIVE_TOOLS
+
+normalize_todos = _meta.normalize_todos
+_normalize_ask = _meta._normalize_ask
+
+_h_update_todo = _meta._h_update_todo
+_h_ask_user = _meta._h_ask_user
+_h_invoke_skill = _meta._h_invoke_skill
+_h_read_skill_reference = _meta._h_read_skill_reference
+_h_shell = _meta._h_shell
+_h_shell_job = _meta._h_shell_job
+
+
+# ---------- 网络工具层（已外置到 cyrene_net.py）----------
+# 三个联网工具的通道与解析整块搬去了同目录的 cyrene_net.py：
+#   `_net_open`（统一出口：超时/UA/体积上限/截断标记）、`NetError`、
+#   `_pick_charset` / `_decode_body`（认 charset）、`_HTMLToMarkdown` /
+#   `_html_to_markdown`（HTML 转文本，带去标签兜底）、下载三个辅助
+#   （`_clean_filename` / `_guess_ext_from_ctype` / `_download_dir`），
+#   以及 `fetch_url` / `download_file` 两个 handler。
+#
+# 宿主这边两件事没变：
+#   ① 内核 `net` 服务垫的实现就是它们 —— 下面这层转发名直接垫进去，装配段一行不改
+#   ② TOOL_HANDLERS 认的 "_h_fetch_url" / "_h_download_file" 两个名字
+#
+# ⚠ 紧跟在后面的是 `_session_get` / `_session_set_todos`（第六刀留在宿主的会话访问器），
+#   它们不属于这一块。
+#
+# sys.path 的前置在同目录模块 import 段已经做过（见文件顶），这里直接 import。
+import cyrene_net as _net                                    # noqa: E402
+# ⚠ 会话状态层的 import 必须放在**这里**（文件前部）：它的接线块在文件后部
+#   （会话管理那一段），而 `_boot_kernel()` 在前部就要用 `_sess.PLUGIN` 挂插件 ——
+#   把 import 留在后部会 NameError。第八刀就踩过这一下。
+import cyrene_session as _sess                               # noqa: E402
+
+NET_UA = _net.NET_UA
+NET_FETCH_MAX_BYTES = _net.NET_FETCH_MAX_BYTES
+NET_DOWNLOAD_MAX_BYTES = _net.NET_DOWNLOAD_MAX_BYTES
+NET_DEFAULT_RESULTS = _net.NET_DEFAULT_RESULTS
+NET_MAX_RESULTS = _net.NET_MAX_RESULTS
+NET_SEARCH_BACKENDS = _net.NET_SEARCH_BACKENDS
+DOWNLOAD_DIRNAME = _net.DOWNLOAD_DIRNAME
+
+NetError = _net.NetError
+_net_timeout = _net._net_timeout
+_pick_charset = _net._pick_charset
+_decode_body = _net._decode_body
+_net_open = _net._net_open
+_HTMLToMarkdown = _net._HTMLToMarkdown
+_html_to_markdown = _net._html_to_markdown
+_clean_filename = _net._clean_filename
+_guess_ext_from_ctype = _net._guess_ext_from_ctype
+_download_dir = _net._download_dir
+
+_h_fetch_url = _net._h_fetch_url
+_h_download_file = _net._h_download_file
+
+
+# ---------- 搜索子系统（已外置到 cyrene_search.py）----------
+# 联网搜索整块搬去了同目录的 cyrene_search.py：结果缓存、博查 / Tavily 两个
+# API 客户端、Bing / DDG 的 HTML 抓取与解析、降级链、配置归一 —— 原先这些散在
+# 本文件三处（这里 / 工具 handler 段 / 配置段），彼此隔着上千行，现在合成一份，
+# 能整块挂上、整块摘下。
+#
+# 这里只留转发：把 cyrene_search 的公开符号绑回**原名**，于是
+# normalize_settings、路由分支、_public_settings 脱敏、以及 TOOLS 表里那个
+# "_h_web_search" 字符串对应的处理函数 —— 所有既有调用点一处都不用改。
+#
+# ⚠ sys.path 必须显式补：本机自带的是嵌入式 Python（python/python312._pth 在），
+#   那种发行版下脚本目录不进 sys.path，直接 import 会报 No module named ——
+#   而且服务照样起得来，只是搜索整块失效，一声不响。记忆模块那段踩过同一个坑。
+if str(RUNTIME_DIR) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_DIR))
+
+import cyrene_search as _search                                 # noqa: E402
+
+BOCHA_SEARCH_URL = _search.BOCHA_SEARCH_URL
+TAVILY_SEARCH_URL = _search.TAVILY_SEARCH_URL
+SEARCH_CACHE_MAX = _search.SEARCH_CACHE_MAX
+SEARCH_RESULT_MAX_BYTES = _search.SEARCH_RESULT_MAX_BYTES
+SEARCH_FALLBACK_TIMEOUT = _search.SEARCH_FALLBACK_TIMEOUT
+SEARCH_RANGES = _search.SEARCH_RANGES
+SEARCH_ENGINES = _search.SEARCH_ENGINES
+# SEARCH_LAST 必须是**同一个 dict 对象**：路由读它、搜索写它，转发的是引用
+SEARCH_LAST = _search.SEARCH_LAST
+
+search_cache_get = _search.search_cache_get
+search_cache_put = _search.search_cache_put
+search_cache_clear = _search.search_cache_clear
+search_cache_count = _search.search_cache_count
+bocha_search = _search.bocha_search
+tavily_search = _search.tavily_search
+normalize_search = _search.normalize_search
+search_cfg = _search.search_cfg
+search_engine = _search.search_engine
+
+# 下划线开头的内部名字也照原样绑回来：TOOL_HANDLERS 认的是 "_h_web_search"
+# 这个字符串对应的变量名，为搬家去改表不划算。
+_h_web_search = _search.handle_web_search
+_fetch_search_fallback = _search.fetch_search_fallback
+_search_engine_pinned = _search._search_engine_pinned
 
 
 # ========== 聊天附件上传 ==========
@@ -1518,980 +697,12 @@ def resolve_attachments(raw):
     return atts, dropped
 
 
-# ---------- 多模态（图片进上下文） ----------
-# 只在**首轮**把带附件的那条 user 消息换成 content 数组：work 上下文每次
-# LLM 调用都整份重发，若一直留着图片，maxTurns=4 就是 4 次带图，白烧 token。
-def content_has_image(content):
-    if not isinstance(content, list):
-        return False
-    return any(isinstance(p, dict) and p.get("type") == "image_url"
-               for p in content)
-
-
-def messages_have_images(messages):
-    return any(isinstance(m, dict) and content_has_image(m.get("content"))
-               for m in messages)
-
-
-def media_to_text(content):
-    """把多模态 content 数组压回纯文本（丢图片，只留 text 部分）。"""
-    if not isinstance(content, list):
-        return content if isinstance(content, str) else str(content or "")
-    parts = []
-    for p in content:
-        if isinstance(p, dict) and p.get("type") == "text":
-            parts.append(str(p.get("text") or ""))
-    return "\n".join(x for x in parts if x)
-
-
-def strip_images(messages):
-    """把消息里的多模态图片剥掉，只留文本。端点不收图时的退路。"""
-    out = []
-    for m in messages:
-        if isinstance(m, dict) and content_has_image(m.get("content")):
-            nm = dict(m)
-            nm["content"] = media_to_text(m.get("content"))
-            out.append(nm)
-        else:
-            out.append(m)
-    return out
-
-
-def image_item(a, raw):
-    """一张图片 → OpenAI 兼容的 image_url 片段（data URI 内联）。"""
-    b64 = base64.b64encode(raw).decode("ascii")
-    mime = a.get("mime") or "image/png"
-    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
-
-
-def read_injectable(p):
-    """读一张准备注入上下文的图。返回 (bytes, 是否因过大/读不到被跳过)。
-
-    上限用 FS_MAX_FILE_BYTES（4 MiB）：base64 后是 5.3 MiB，再乘历史轮次会
-    把请求体推得很大。手机端没有图像库可以缩图，超限就只落盘不进上下文。
-    """
-    try:
-        if p.stat().st_size > VISION_MAX_BYTES:
-            return None, True
-        raw = p.read_bytes()
-    except OSError:
-        return None, True
-    if not raw:
-        return None, True
-    return raw, False
-
-
-def build_vision_content(text, atts):
-    """文本 + 可注入图片 → OpenAI 兼容的多模态 content 数组。
-
-    返回 (content, skipped)：skipped 是不进上下文的图片名（过大或读不到）。
-    调用方要在文本里说明这些图的情况，免得用户以为她「看见了」。
-    """
-    content = [{"type": "text", "text": text}]
-    skipped = []
-    for a in atts:
-        if not a.get("isImage"):
-            continue
-        p = resolve_upload(a["id"])
-        if p is None:
-            skipped.append(a["name"]); continue
-        raw, too_big = read_injectable(p)
-        if too_big or raw is None:
-            skipped.append(a["name"]); continue
-        content.append(image_item(a, raw))
-    return content, skipped
-
-
-# ========== 图片路由（对齐桌面端 Cyrene-Agent 的 image-router） ==========
-# 桌面端那份的设计声明，这里照抄口径：
-#   「所有图片入口（附件 / 工具 / 频道 / 动态）先问这里，不允许各自判断。」
-#   「三种结果，不允许模糊状态。」
-#
-# 为什么手机端也需要这一层：本机主通道是那台中转站，实测收不了图。若各处自己
-# 判断（附件那边看 VISION_SUPPORTED、工具那边看配置），就会出现「同一个配置下
-# 附件说看不见、工具说看得见」这种自相矛盾的状态。收口到一处，结论只有三种。
-IMAGE_ROUTE_DIRECT = "direct"     # 主模型自己看图（base64 直传）
-IMAGE_ROUTE_CAPTION = "caption"   # 交给独立视觉模型转述成文字
-IMAGE_ROUTE_REJECT = "reject"     # 当前配置看不了图，带面向用户的说明
-
-# reject 的文案。对齐桌面端措辞，但把入口名换成本机的「设置 → 视觉」。
-IMAGE_REJECT_REASON = (
-    "当前主模型不是多模态，且未配置独立视觉模型。"
-    "请在「设置 → 视觉」中配置视觉端点，或把主模型换成多模态的。"
-)
-
-
-def multimodal_enabled():
-    """主模型是否按多模态走。三态语义见 DEFAULT_SETTINGS["model"]["multimodal"]。
-
-    auto 的判据是 VISION_SUPPORTED：本文件原有的探测结论。
-      None = 还没试过（默认按能收图处理，让第一次请求去证伪）
-      True = 端点收下了图
-      False = 已确认不收（实测 502 那条路径）
-    之所以 auto 认 False 为「非多模态」，是因为那份探测是**实测**结论，
-    比起用户的猜测或配置声明，实测更该被信任。
-    """
-    try:
-        mm = SETTINGS.get("model", {}).get("multimodal", "auto")
-    except (NameError, AttributeError):
-        mm = "auto"
-    if mm == "on":
-        return True
-    if mm == "off":
-        return False
-    # auto 的两段判据：
-    #   ① 已有实测结论（True/False）→ 一律以实测为准，这是最可信的来源；
-    #   ② 还没探测过（None）时，若用户已把独立视觉端点配齐，就把图交给它。
-    # 为什么要加 ②：不加的话 None 会被当成「主模型能收图」，直接判 direct，
-    # 主模型收不了图时用户看到的是一次 502/554，而他明明配好了视觉通道却
-    # 一次都没被用上（实测 2026-10-10：配置齐、/vision/status 显示
-    # route=direct、面板测试返回的 model 是主模型而非视觉端点）。
-    # 用户专门配了视觉端点，本来就是想让它看图，这里让它优先是符合意图的。
-    if VISION_SUPPORTED is None and vision_ready():
-        return False
-    return VISION_SUPPORTED is not False
-
-
-def resolve_image_route(source="attachment", multimodal=None):
-    """统一的图片路由判定。返回 dict：{"mode", "config"?, "reason"?}。
-
-    判定顺序严格对齐桌面端 resolveImageRoute：
-      ① 主模型多模态          → direct
-      ② 独立视觉三项齐 + 开关 → caption
-      ③ 都不满足              → reject + 面向用户的 reason
-
-    source 目前只用于未来扩展与日志（桌面端有 attachment/tool/channel/moments
-    四种来源），手机端当前都是同一条判据；保留参数是为了调用点读起来有意义，
-    也免得以后细分来源时要改所有调用签名。
-
-    multimodal 参数供测试注入（None = 用真实判定），生产调用不传。
-    """
-    if multimodal is None:
-        mm_on = multimodal_enabled()
-    else:
-        mm_on = bool(multimodal)
-    if mm_on:
-        return {"mode": IMAGE_ROUTE_DIRECT}
-
-    if vision_ready():
-        return {
-            "mode": IMAGE_ROUTE_CAPTION,
-            "config": {
-                "api_base": str(vision_cfg("api_base", "") or "").strip(),
-                "api_key": str(vision_cfg("api_key", "") or ""),
-                "model": str(vision_cfg("model", "") or "").strip(),
-            },
-        }
-
-    return {"mode": IMAGE_ROUTE_REJECT, "reason": IMAGE_REJECT_REASON}
-
-
-def resolve_caption_vision_config():
-    """转述用的视觉配置：成功给 (True, config)，失败给 (False, 面向用户的错误)。
-
-    对齐桌面端 resolveCaptionVisionConfig。它比 resolve_image_route 少一种结果：
-    direct 在那边会「回落到主模型自己看图」，但**工具**场景下这条路走不通 ——
-    read_image 的职责就是把图变成文字给她看，主模型能自己看图时这个工具本就
-    不该被调用（工具描述里写了「不要用于」）。所以这里 direct 也返回
-    ok=True + 主模型配置，让调用方照常发一次请求；真被误调也就是多花一次调用，
-    不会出错。
-
-    返回 config 一律是三个字段齐的 dict（api_base / api_key / model）。
-    """
-    route = resolve_image_route("tool")
-    mode = route.get("mode")
-    if mode == IMAGE_ROUTE_CAPTION:
-        return True, route["config"]
-    if mode == IMAGE_ROUTE_REJECT:
-        return False, route.get("reason") or IMAGE_REJECT_REASON
-    # direct：主模型自己能看图，用主模型配置发（现状行为保留）
-    try:
-        m = SETTINGS.get("model", {})
-    except (NameError, AttributeError):
-        m = {}
-    return True, {"api_base": str(m.get("api_base", "") or "").strip(),
-                  "api_key": str(m.get("api_key", "") or ""),
-                  "model": str(m.get("model", "") or "").strip()}
-
-
-# ========== 视觉描述缓存（对齐桌面端 TtlResultCache） ==========
-# 桌面端那份的注释把要害写清楚了，这里照搬口径：
-#   「每次调用都是真金白银的视觉模型请求。模型对同一张图反复看（"再看下那个图…"）
-#     时直接复用 30 分钟内的描述。key 必须带 userQuery：同一个图不同问题的描述不同。」
-#
-# 与桌面端唯一的差别：手机端**只用内存**，不落盘。
-# 桌面端也是纯内存 TTL 缓存，但手机还有一条额外理由 —— 磁盘已用 916G/943G（98%），
-# 任何「顺手写一份到磁盘」的设计都是给自己挖坑。内存方案同时解决体积与磁盘两件事。
-VISION_CAPTION_CACHE_MAX = 64        # 条数上限：手机内存有限，别无限攒
-
-_vision_cache = {}                   # key -> (ts, text)；dict 保序，天然可做 FIFO 淘汰
-_vision_cache_lock = threading.Lock()
-
-# 上一次调用的结果，供 /vision/status 与面板自检显示（不含 key、不含图片内容）
-VISION_LAST = {}
-
-
-def _vision_cache_ttl():
-    """当前生效的缓存 TTL（秒）。0 = 不缓存（用户把 cacheTtlMin 拉到 0）。"""
-    try:
-        return max(0, int(vision_cfg("cacheTtlMin", 30) or 0)) * 60
-    except (TypeError, ValueError):
-        return 30 * 60
-
-
-def vision_cache_get(key):
-    """读缓存。命中返回 (ts, text)，否则 None。
-
-    TTL 是**读取时**按当前配置判的，不是写入时定死的 —— 这样用户在面板上
-    把 30 分钟改成 5 分钟能立刻生效，不需要重启服务或重建缓存。
-    """
-    if not key:
-        return None
-    ttl = _vision_cache_ttl()
-    if ttl <= 0:
-        return None
-    now = time.time()
-    with _vision_cache_lock:
-        item = _vision_cache.get(key)
-        if item is None:
-            return None
-        ts, text = item
-        if now - ts > ttl:
-            # 顺手清掉过期项。不清也不影响正确性，但会让淘汰顺序变脏。
-            _vision_cache.pop(key, None)
-            return None
-        return ts, text
-
-
-def vision_cache_put(key, text):
-    """写缓存。
-
-    ⚠ 调用方必须先确认这是**成功**的描述。桌面端那条判据在这里同样成立：
-    错误描述不缓存，下次重试（否则一次网络抖动会被固化 30 分钟）。
-    这个判断收在调用方而不是这里，是为了让「要不要缓存」这个决定看得见。
-    """
-    if not key or not text:
-        return
-    with _vision_cache_lock:
-        # 满了先淘汰最旧的。popitem(last=False) 取的是最早插入的键，
-        # 因为 dict 保序且我们从不原地更新已有键的顺序 —— 被命中的键不重排，
-        # 所以这是 FIFO 而不是严格 LRU。对「同一张图看几次」的用法足够，
-        # 而且比维护 LRU 链表少一半代码和一半出错机会。
-        while len(_vision_cache) >= VISION_CAPTION_CACHE_MAX:
-            try:
-                _vision_cache.popitem(last=False)
-            except KeyError:
-                break
-        _vision_cache[key] = (time.time(), text)
-
-
-def vision_cache_clear():
-    """清空缓存。返回清掉的条数。"""
-    with _vision_cache_lock:
-        n = len(_vision_cache)
-        _vision_cache.clear()
-        return n
-
-
-def vision_cache_count():
-    with _vision_cache_lock:
-        return len(_vision_cache)
-
-
-# ========== 独立视觉协议层（对齐桌面端 vision-captioner） ==========
-# 桌面端工具文件里写明的分工，这里照搬：
-#   「协议构造全部委托 vision-captioner（唯一多模态协议层），
-#     工具文件只做参数校验 + 视觉配置检查 + 调用，不碰 image_url 格式细节。」
-# 手机端同样把协议收在这几个函数里，工具 handler 不自己拼 payload。
-#
-# 错误前缀是约定的一部分：调用方靠 "[错误" 前缀判断成功与否（缓存层就吃这条），
-# 前缀本身也直接面向模型 —— 她会照着「[错误·配置] …」如实告诉用户看不了。
-VISION_ERR_CONFIG = "[错误·配置]"
-VISION_ERR_NETWORK = "[错误·网络]"
-VISION_ERR_TOO_BIG = "[错误·超限]"
-VISION_ERR_FORMAT = "[错误·格式]"
-
-# 没给 question 时的默认指令。写成「如实描述」而不是「分析」：她的用途是
-# 「看见这张图然后说话」，不是出一份图像分析报告。
-VISION_DEFAULT_PROMPT = (
-    "请描述这张图片的内容：主要对象、场景、可见的文字，以及整体氛围。"
-    "如实描述你看到的，看不清的地方就说看不清，不要猜测。"
-)
-
-
-def vision_endpoint_url(base):
-    """把用户填的 api_base 规范化成真正要打的 /chat/completions 地址。
-
-    为什么需要这一层：设置面板那一栏叫「接口地址」，用户很自然会直接粘一条
-    完整端点（`https://host/v1/chat/completions`）。天真拼接会得到
-    `…/v1/chat/completions/chat/completions`，网关回的往往是 404 / 554 这类
-    看起来像「限流」或「未找到」的码，排查时会一路往网络和密钥上找。
-
-    实测（2026-10-10，本机中转站 + 一个能收图的视觉模型）：
-      · 原样打完整端点   → 200（带图也答对）
-      · 拼接后（旧行为） → 404 Not Found
-      · 从 /v1 补端点    → 200
-
-    三种输入都收：
-      https://host/v1                    → 补 /chat/completions
-      https://host/v1/chat/completions   → 原样
-      https://host/v1/chat/completions/  → 去尾斜杠后原样
-    """
-    b = str(base or "").strip().rstrip("/")
-    if not b:
-        return ""
-    if b.endswith("/chat/completions"):
-        return b
-    return b + "/chat/completions"
-
-# 魔数 → (mime, 规范扩展名)。判真实类型用，见下面 sniff_image_type 的说明。
-_IMAGE_MAGIC = (
-    (b"\x89PNG\r\n\x1a\n", "image/png", "png"),
-    (b"\xff\xd8\xff", "image/jpeg", "jpg"),
-    (b"GIF87a", "image/gif", "gif"),
-    (b"GIF89a", "image/gif", "gif"),
-    (b"BM", "image/bmp", "bmp"),
-)
-
-
-def sniff_image_type(data):
-    """读文件头判真实图片类型。返回 (mime, ext)，认不出返回 None。
-
-    为什么按魔数而不是按扩展名：借 dsh read_image 的那条设计 ——
-    「扩展名是声明，魔数与像素校验才是权威」。手机端这份更该这么做，因为
-    交接文档里记着实测坑：`builtin-20.gif` / `34.png` / `38.gif` 三张图
-    文件头其实是 RIFF/WEBP，扩展名骗人。当时靠手工改名修好了，但那属于
-    「人肉兜底」；此处的校验就是为了让同类问题在运行时自己暴露出来，
-    而不是等到浏览器渲染不出来。
-    """
-    if not data or len(data) < 12:
-        return None
-    for magic, mime, ext in _IMAGE_MAGIC:
-        if data.startswith(magic):
-            return mime, ext
-    # WebP：RIFF....WEBP（前 4 字节 RIFF，8-12 字节 WEBP）
-    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp", "webp"
-    return None
-
-
-def image_dimensions(data, mime):
-    """尽力解析图片像素尺寸。认不出返回 None。
-
-    为什么值得写这几行：返回元数据里的宽高能让她判断「这是不是一张缩略图 /
-    是不是长截图」，也让「图太大看不清」这种结论有依据。手机端没有 PIL，
-    所以只解析各格式的头部字段 —— 不做完整解码，解析失败一律回 None，
-    绝不因为一个尺寸字段让整次转述失败。
-    """
-    try:
-        if mime == "image/png":
-            # IHDR 紧跟在 8 字节签名 + 4 字节长度 + 4 字节类型之后
-            if len(data) >= 24 and data[12:16] == b"IHDR":
-                return (int.from_bytes(data[16:20], "big"),
-                        int.from_bytes(data[20:24], "big"))
-        elif mime == "image/gif":
-            if len(data) >= 10:
-                return (int.from_bytes(data[6:8], "little"),
-                        int.from_bytes(data[8:10], "little"))
-        elif mime == "image/bmp":
-            if len(data) >= 26:
-                return (int.from_bytes(data[18:22], "little"),
-                        int.from_bytes(data[22:26], "little"))
-        elif mime == "image/webp":
-            # VP8X：24 位宽高减一，各占 3 字节
-            if len(data) >= 30 and data[12:16] == b"VP8X":
-                w = int.from_bytes(data[24:27], "little") + 1
-                h = int.from_bytes(data[27:30], "little") + 1
-                return (w, h)
-            # VP8L：14 位宽高打包在一个小端 32 位里
-            if len(data) >= 25 and data[12:16] == b"VP8L":
-                bits = int.from_bytes(data[21:25], "little")
-                return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
-            # VP8（有损）：宽高在帧头里，偏移较深，这里不做（回 None 更诚实）
-        elif mime == "image/jpeg":
-            return _jpeg_dimensions(data)
-    except Exception:
-        # 尺寸是锦上添花，任何一种解析意外都退回 None，不打断主流程
-        return None
-    return None
-
-
-def _jpeg_dimensions(data):
-    """扫 JPEG 的 SOF 段取宽高。SOF0/1/2/3/5/6/7/9/10/11/13/14/15 都带尺寸。"""
-    i = 2                                   # 跳过 SOI (FFD8)
-    n = len(data)
-    while i + 9 < n:
-        if data[i] != 0xFF:
-            i += 1
-            continue
-        marker = data[i + 1]
-        # 填充字节 FF 允许重复，跳过
-        if marker == 0xFF:
-            i += 1
-            continue
-        # 无参数的段：SOI/EOI/RSTn/TEM
-        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7 or marker == 0x01:
-            i += 2
-            continue
-        seg_len = int.from_bytes(data[i + 2:i + 4], "big")
-        if seg_len < 2:
-            return None
-        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
-            h = int.from_bytes(data[i + 5:i + 7], "big")
-            w = int.from_bytes(data[i + 7:i + 9], "big")
-            return (w, h)
-        i += 2 + seg_len
-    return None
-
-
-def read_image_bounded(path, max_bytes):
-    """有界读一张图片。返回 (bytes, None) 或 (None, 错误文本)。
-
-    借 dsh read_image 的两条实现细节：
-      ① stat 先短路 —— 明显超限的文件根本不去打开它，省一次 I/O，
-         也避免在 400MB 的文件上白读一遍。
-      ② 读了 limit+1 个字节来判超限 —— 防「stat 之后文件又长大了」这个
-         竞态。只看 stat 就放行的话，两行代码之外文件可能已经被写大。
-    """
-    try:
-        st = path.stat()
-    except OSError as e:
-        return None, f"{VISION_ERR_FORMAT} 读不到这个文件（{e.strerror or e}）"
-    if st.st_size > max_bytes:
-        return None, (f"{VISION_ERR_TOO_BIG} 图片 {_human_size(st.st_size)}，"
-                      f"超过上限 {_human_size(max_bytes)}")
-    try:
-        with open(path, "rb") as fh:
-            data = fh.read(max_bytes + 1)     # 多读一个字节，见 ②
-    except OSError as e:
-        return None, f"{VISION_ERR_FORMAT} 读取失败（{e.strerror or e}）"
-    if len(data) > max_bytes:
-        return None, (f"{VISION_ERR_TOO_BIG} 图片超过上限 "
-                      f"{_human_size(max_bytes)}")
-    if not data:
-        return None, f"{VISION_ERR_FORMAT} 文件是空的（0 字节）"
-    return data, None
-
-
-class VisionClient:
-    """独立视觉端点客户端。**刻意不复用 LLMClient**。
-
-    不复用的三个理由：
-      · 配置来源不同（vision 段 vs model 段），复用就得把两套配置搅在一起；
-      · 请求形态不同：视觉转述只发一条 user 消息、不带工具、不流式，
-        而 LLMClient 背着 reasoning / tools / 流式 / 工具调用累积这一整套；
-      · 失败语义不同：转述失败不该影响主对话，需要独立的短超时与错误前缀。
-    重合的只有「往 /chat/completions 发个 JSON」这十几行，不值得为此耦合。
-    """
-
-    def __init__(self, cfg):
-        # 走 vision_endpoint_url 而不是裸拼：用户把完整端点粘进「接口地址」是
-        # 常态，裸拼会让路径重复成 …/chat/completions/chat/completions。
-        self.url = vision_endpoint_url(cfg.get("api_base", ""))
-        self.key = cfg.get("api_key", "") or ""
-        self.model = str(cfg.get("model", "") or "")
-        # 超时用 vision 段的短值（默认 60），不跟随主模型的 120：
-        # 转述是附带动作，不该把整轮对话拖住。
-        try:
-            self.timeout = max(10, int(vision_cfg("request_timeout", 60) or 60))
-        except (TypeError, ValueError):
-            self.timeout = 60
-
-    def describe(self, image_part, question="", max_tokens=800):
-        """发一次转述请求。返回 (ok, text)——失败时 text 已带错误前缀。"""
-        if not self.url or not self.model:
-            return False, f"{VISION_ERR_CONFIG} 视觉端点没配全（需要 api_base + model）"
-        prompt = (question or "").strip() or VISION_DEFAULT_PROMPT
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                image_part,
-            ]}],
-            "max_tokens": int(max_tokens),
-            "temperature": 0.3,      # 转述要稳，不要发挥
-            # 刻意不带 tools / stream：视觉端点只需要回一段文字
-        }
-        url = self.url                 # 已在 __init__ 规范化，见 vision_endpoint_url
-        req = urllib.request.Request(
-            url, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json",
-                     "Authorization": f"Bearer {self.key}"})
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                status = r.getcode()
-                body = r.read()
-        except urllib.error.HTTPError as e:
-            try:
-                detail = e.read().decode(errors="replace")[:400]
-            except Exception:
-                detail = ""
-            return False, (f"{VISION_ERR_NETWORK} 视觉端点返回 HTTP {e.code}"
-                           + (f"：{detail}" if detail else ""))
-        except Exception as e:
-            return False, f"{VISION_ERR_NETWORK} 请求视觉端点失败（{e}）"
-        if status != 200:
-            return False, f"{VISION_ERR_NETWORK} 视觉端点返回 HTTP {status}"
-        try:
-            obj = json.loads(body.decode("utf-8", errors="replace"))
-        except Exception:
-            return False, f"{VISION_ERR_FORMAT} 视觉端点返回的不是 JSON"
-        choices = obj.get("choices") or []
-        if not choices:
-            return False, f"{VISION_ERR_FORMAT} 视觉端点没返回 choices"
-        msg = choices[0].get("message") or {}
-        text = msg.get("content")
-        if isinstance(text, list):
-            # 少数端点回 content 数组，拼成纯文本
-            text = "".join(str(p.get("text") or "")
-                           for p in text if isinstance(p, dict))
-        text = (text or "").strip()
-        if not text:
-            # 空回复是视觉端点的常见失败形态（图太大 / 被内容策略挡掉），
-            # 明说出来比返回空串好：空串会被当成「她什么都没看见」，
-            # 而这句话能让她知道该换个说法或换张图。
-            return False, f"{VISION_ERR_FORMAT} 视觉端点返回了空描述（图可能太大或不支持这种格式）"
-        return True, text
-
-
-def vision_max_bytes():
-    """本次允许进视觉通道的图片字节上限。
-
-    取 vision.maxMb 与 VISION_MAX_BYTES 的**较小值**：前者是用户偏好，
-    后者是这台设备上已经验证过的硬边界（4 MiB，与 base64 请求体大小挂钩），
-    用户把 maxMb 调到 16 也不该突破后者。
-    """
-    try:
-        mb = float(vision_cfg("maxMb", 4) or 4)
-    except (TypeError, ValueError):
-        mb = 4.0
-    return int(min(mb * 1024 * 1024, VISION_MAX_BYTES))
-
-
-def caption_image(source, question="", cfg=None):
-    """把一张图交给独立视觉模型转述成文字。**唯一的多模态协议层**。
-
-    source 两种形态（对齐桌面端 read_image / read_image_url 的分工）：
-      {"path": Path}  → 本地文件：有界读 → 魔数校验 → base64 data URI
-      {"url": str}    → 公网地址：原样直传，厂商服务器自己拉图，
-                        本机不下载、不转 base64（省流量省内存）
-
-    返回**永远是字符串**：成功是描述正文，失败是带 "[错误·xxx]" 前缀的说明。
-    这个「不抛异常、只回文本」的契约，是为了让工具 handler 与上传链路都能
-    直接把返回值塞进上下文 —— 出错时她也能如实告诉用户看不了，而不是
-    整轮对话因为一次转述失败而炸掉。
-
-    cfg 传入 (ok, config_or_error) 形态的解析结果；不传则自己解析。
-    """
-    global VISION_LAST
-    if cfg is None:
-        cfg = resolve_caption_vision_config()
-    ok, conf = cfg
-    if not ok:
-        VISION_LAST = {"ok": False, "at": time.time(), "error": str(conf)[:300]}
-        return str(conf)
-
-    max_bytes = vision_max_bytes()
-    local_hash = ""
-    meta = []
-
-    if isinstance(source, dict) and source.get("path") is not None:
-        path = Path(source["path"])
-        data, err = read_image_bounded(path, max_bytes)
-        if err:
-            VISION_LAST = {"ok": False, "at": time.time(), "error": err[:300]}
-            return err
-        sniffed = sniff_image_type(data)
-        if sniffed is None:
-            msg = (f"{VISION_ERR_FORMAT} 这不是能识别的图片格式"
-                   f"（只认 PNG / JPEG / WebP / GIF / BMP）")
-            VISION_LAST = {"ok": False, "at": time.time(), "error": msg[:300]}
-            return msg
-        mime, ext = sniffed
-        # 扩展名与真实类型不符时报出来 —— 对齐 dsh「不匹配时按改名修复提示
-        # 失败关闭，而不是被静默接受」的取舍。这里不阻断（图照样能转述），
-        # 但在返回文本里点一句，让「扩展名骗人」这类问题不再靠人肉发现。
-        claimed = path.suffix.lower().lstrip(".")
-        if claimed and claimed not in (ext, "jpeg" if ext == "jpg" else ext):
-            meta.append(f"（注意：扩展名是 .{claimed}，实际内容是 {ext}）")
-        dims = image_dimensions(data, mime)
-        if dims:
-            meta.append(f"{dims[0]}×{dims[1]}")
-        meta.append(_human_size(len(data)))
-        local_hash = hashlib.sha256(data).hexdigest()
-        b64 = base64.b64encode(data).decode("ascii")
-        image_part = {"type": "image_url",
-                      "image_url": {"url": f"data:{mime};base64,{b64}"}}
-
-    elif isinstance(source, dict) and source.get("url"):
-        url = str(source["url"]).strip()
-        if not re.match(r"^https?://", url, re.I):
-            msg = f"{VISION_ERR_FORMAT} url 必须以 http:// 或 https:// 开头"
-            VISION_LAST = {"ok": False, "at": time.time(), "error": msg[:300]}
-            return msg
-        # URL 直传：本机不下载。这也是桌面端 read_image_url 的做法。
-        image_part = {"type": "image_url", "image_url": {"url": url}}
-
-    else:
-        msg = f"{VISION_ERR_FORMAT} 缺少图片来源（path 或 url）"
-        VISION_LAST = {"ok": False, "at": time.time(), "error": msg[:300]}
-        return msg
-
-    # 缓存查：key 必须带 question —— 同一张图不同问题的描述不同。
-    # 本地图用内容哈希（比路径准：同一张图换个文件名仍是同一张），
-    # url 用地址本身，与桌面端一致。
-    cache_key = (local_hash or image_part["image_url"]["url"]) + "||" + (question or "")
-    hit = vision_cache_get(cache_key)
-    if hit:
-        ts, text = hit
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
-        mins = max(1, _vision_cache_ttl() // 60)
-        VISION_LAST = {"ok": True, "at": ts, "cached": True, "chars": len(text)}
-        return f"[缓存] 此描述生成于 {stamp}，{mins} 分钟内复用\n\n{text}"
-
-    client = VisionClient(conf)
-    ok2, text = client.describe(image_part, question)
-    if not ok2:
-        VISION_LAST = {"ok": False, "at": time.time(), "error": text[:300]}
-        return text
-    # 只有成功描述才写缓存（错误不缓存，下次重试）
-    vision_cache_put(cache_key, text)
-    VISION_LAST = {"ok": True, "at": time.time(), "cached": False, "chars": len(text)}
-    if meta:
-        # 元数据放在描述前面：她先知道「这是什么图、多大」，再读内容，
-        # 判断「图看不清」这类结论时才有依据。
-        return "· ".join(meta) + "\n\n" + text
-    return text
-
-
-# ---------- 三个 handler ----------
-
-# 三条结构化 API 通道的 client 与显示名。收成表是为了让 _h_web_search 里只剩
-# 一条分支 —— 以后加第三条通道只改这几张表 + search_engine()，不动主流程。
-# （这三张表在函数定义之后才出现在源码里，但模块级执行顺序保证拿得到函数对象。）
-_SEARCH_API_CLIENTS = {"bocha": bocha_search, "tavily": tavily_search}
-_SEARCH_API_LABELS = {"bocha": "博查 API", "tavily": "Tavily API"}
-_SEARCH_API_SHORT = {"bocha": "博查", "tavily": "Tavily"}
-
-
-def _search_engine_pinned():
-    """引擎是否被用户显式硬钉（只用博查 / 只用 Tavily）。
-
-    硬钉档失败要如实报错：他要的就是那家的结果，偷偷塞一份抓来的网页结果
-    给他反而是骗人。只有 auto 档才允许落回抓取。
-    """
-    return str(search_cfg("engine", "auto") or "auto").strip().lower() in ("bocha", "tavily")
-
-
-def _fetch_search_fallback(query, n, timeout):
-    """原来那套 HTML 抓取链（bing / cn.bing / ddg 轮流降级）。
-
-    返回 (backend, items, errors)：items 非空表示某个后端拿到了结果；全挂时
-    backend 为 None、items 为空、errors 里是每个后端失败的原因。
-    items 元素统一成 (title, url, snippet, source)，与博查那条路同形 ——
-    抓取拿不到站点名，source 一律空串。
-    """
-    q = urllib.parse.quote(query)
-    errors = []
-    for backend in NET_SEARCH_BACKENDS:
-        tmpl, parser = _NET_SEARCH_SOURCES[backend]
-        url = tmpl.replace("{q}", q)
-        try:
-            _status, _headers, body, _trunc = _net_open(
-                url, NET_FETCH_MAX_BYTES, timeout)
-        except NetError as e:
-            errors.append(f"{backend}: {e}")
-            continue
-        ctype = _headers.get("content-type", "")
-        text, _ = _decode_body(body, ctype)
-        try:
-            parsed = parser(text)
-        except Exception as e:
-            errors.append(f"{backend}: 解析失败 {type(e).__name__}")
-            continue
-        if not parsed:
-            errors.append(f"{backend}: 解析出 0 条（页面结构可能变了）")
-            continue
-        # 去重（按 URL）后截到 n 条
-        seen, uniq = set(), []
-        for title, uurl, snippet in parsed:
-            if uurl in seen:
-                continue
-            seen.add(uurl)
-            uniq.append((title, uurl, snippet, ""))
-            if len(uniq) >= n:
-                break
-        if uniq:
-            return backend, uniq, errors
-        errors.append(f"{backend}: 去重后没有可用结果")
-    return None, [], errors
-
-
-def _h_web_search(a):
-    """web_search：按设置选一条结构化 API（博查 / Tavily），失败再抓结果页。
-
-    降级链：**API（auto 档下博查优先，其次 Tavily）→ 网页抓取**。没配任何 key
-    时整条路径与改动前完全一致；engine 硬钉成 bocha / tavily 时失败就如实报错
-    —— 他要的是那一家的结果，塞一份抓来的网页结果给他反而是骗人。
-    """
-    query = (a.get("query") or "").strip()
-    if not query:
-        return OUTCOME_FAILURE, "(缺少 query)"
-    n = _int_arg(a.get("max_results"), NET_DEFAULT_RESULTS, 1, NET_MAX_RESULTS)
-    timeout = _net_timeout()
-
-    items, head, notes = [], "", []
-    provider = search_engine()
-    label = ""          # 只有走了 API 通道才有值，给下面拼错误文案用
-
-    if provider in _SEARCH_API_CLIENTS:
-        label = _SEARCH_API_LABELS.get(provider, provider)
-        ckey = "%s|%s|%d" % (provider, query, n)
-        cached = search_cache_get(ckey)
-        if cached is not None:
-            items = list(cached)
-            head = f"搜索「{query}」· {label}（缓存）· {len(items)} 条结果"
-            notes.append("同一关键词在缓存有效期内，未重复请求")
-        else:
-            try:
-                items = _SEARCH_API_CLIENTS[provider](
-                    query, n, int(search_cfg("request_timeout", 20) or 20))
-                search_cache_put(ckey, items)
-                head = f"搜索「{query}」· {label} · {len(items)} 条结果"
-                SEARCH_LAST.clear()
-                SEARCH_LAST.update({"ok": True, "at": time.time(),
-                                    "engine": provider, "count": len(items)})
-            except NetError as e:
-                err = str(e)
-                SEARCH_LAST.clear()
-                SEARCH_LAST.update({"ok": False, "at": time.time(),
-                                    "engine": provider, "error": err[:200]})
-                if _search_engine_pinned():
-                    short = _SEARCH_API_SHORT.get(provider, provider)
-                    return OUTCOME_FAILURE, (
-                        "(%s搜索失败：%s。当前搜索设置是「只用%s」，没给你换成网页抓取；"
-                        "想让它自动落回抓取就把引擎改成 auto)" % (short, err, short))
-                notes.append("%s失败，已落回网页抓取（%s）" % (label, err))
-                # 降级时把抓取超时压到 8 秒封顶：别让总等待变成两次超时相加
-                timeout = min(timeout, SEARCH_FALLBACK_TIMEOUT)
-
-    if not items:
-        backend, items, errors = _fetch_search_fallback(query, n, timeout)
-        if not items:
-            prefix = ("(%s与网页抓取都失败了。"
-                      % _SEARCH_API_SHORT.get(provider, provider)
-                      if notes else "(所有搜索后端都失败了。")
-            return OUTCOME_FAILURE, (prefix + " | ".join(errors) +
-                                     "。可稍后重试，或用 fetch_url 直接抓已知网址)")
-        head = f"搜索「{query}」· 后端 {backend} · {len(items)} 条结果"
-
-    lines = [head]
-    lines.extend(notes)
-    for i, it in enumerate(items, 1):
-        title, uurl, snippet = it[0], it[1], it[2]
-        source = it[3] if len(it) > 3 else ""
-        lines.append(f"{i}. {title}" + (f"（{source}）" if source else ""))
-        lines.append(f"   {uurl}")
-        if snippet:
-            sn = snippet if len(snippet) <= 200 else snippet[:200] + "…"
-            lines.append(f"   {sn}")
-    return OUTCOME_SUCCESS, "\n".join(lines)
-
-
-def _h_fetch_url(a):
-    """fetch_url：抓一个网页，HTML 转 Markdown 纯文本返回，超长截断标注。"""
-    url = (a.get("url") or "").strip()
-    if not url:
-        return OUTCOME_FAILURE, "(缺少 url)"
-    max_chars = _int_arg(a.get("max_chars"), 0, 0, 200000)  # 0=用 maxOutputChars
-    try:
-        status, headers, body, truncated = _net_open(url, NET_FETCH_MAX_BYTES)
-    except NetError as e:
-        return OUTCOME_FAILURE, str(e)
-
-    ctype = headers.get("content-type", "")
-    is_html = "html" in ctype.lower() or (not ctype and body[:512].lstrip()[:1] == b"<")
-
-    notes = [f"URL: {url}", f"HTTP {status} · {_human_size(len(body))}"
-             + (f" · {ctype}" if ctype else "")]
-    if truncated:
-        notes.append(f"（原始响应超过 {_human_size(NET_FETCH_MAX_BYTES)} 抓取上限，已截断）")
-
-    if is_html:
-        title, md = _html_to_markdown(body, ctype)
-        if title:
-            notes.insert(1, f"标题: {title}")
-        content = md or "(页面正文为空，可能是纯 JS 渲染或需要登录)"
-    else:
-        # 非 HTML（JSON/纯文本/CSS…）：直接解码返回
-        text, enc_note = _decode_body(body, ctype)
-        if enc_note:
-            notes.append(enc_note)
-        content = text
-
-    head = "\n".join(notes)
-    body_out = head + "\n\n" + content
-    # 二次截断到 max_chars（若模型指定了更小的预算）；最终 run_tool 还会过
-    # _truncate_output 到 maxOutputChars，这里先按 max_chars 收一道省 token。
-    if max_chars and len(body_out) > max_chars:
-        dropped = len(body_out) - max_chars
-        body_out = body_out[:max_chars] + f"\n…（按 max_chars 截断，丢弃 {dropped} 字）"
-    return OUTCOME_SUCCESS, body_out
-
-
-def _h_download_file(a):
-    """download_file：下载文件存到 FS_ROOT/downloads，返回落地路径。"""
-    url = (a.get("url") or "").strip()
-    if not url:
-        return OUTCOME_FAILURE, "(缺少 url)"
-
-    try:
-        status, headers, body, truncated = _net_open(url, NET_DOWNLOAD_MAX_BYTES)
-    except NetError as e:
-        return OUTCOME_FAILURE, str(e)
-    if truncated:
-        return OUTCOME_FAILURE, (
-            f"(文件超过下载上限 {_human_size(NET_DOWNLOAD_MAX_BYTES)}，已中止。"
-            f"请确认这是不是你要的完整文件)")
-
-    ctype = headers.get("content-type", "")
-    # 文件名优先级：模型显式 filename > Content-Disposition > URL basename > download+ext
-    fname = _clean_filename(a.get("filename"))
-    if not fname:
-        cd = headers.get("content-disposition", "")
-        m = re.search(r"filename\*?=(?:UTF-8'')?[\"']?([^\"';]+)", cd, re.I)
-        if m:
-            fname = _clean_filename(urllib.parse.unquote(m.group(1)))
-    if not fname:
-        base = _clean_filename(urlparse(url).path.rsplit("/", 1)[-1])
-        fname = base
-    if not fname:
-        fname = "download" + (_guess_ext_from_ctype(ctype) or ".bin")
-    # 若猜出的名字没有扩展名，而 content-type 能给出，补上
-    if "." not in fname:
-        ext = _guess_ext_from_ctype(ctype)
-        if ext:
-            fname += ext
-
-    try:
-        d = _download_dir()
-        target = guard_path(str(d / fname), want="any", protect_write=True)
-    except PathGuardError as e:
-        return OUTCOME_FAILURE, str(e)
-
-    # 原子落盘：先写唯一临时名，再 os.replace，避免并行下载半成品被读走
-    tmp = Path(str(target) + f".tmp{uuid.uuid4().hex[:8]}")
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_bytes(body)
-        os.replace(str(tmp), str(target))
-    except OSError as e:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
-        return OUTCOME_FAILURE, f"(写入失败: {e})"
-
-    return OUTCOME_SUCCESS, (
-        f"已下载 HTTP {status} → {_rel(target, _fs_root())}"
-        f"（{_human_size(len(body))}" + (f" · {ctype}" if ctype else "") + "）")
-
-
-# ========== Agent 元工具实现层（阶段 2c）==========
-# 元工具 = 不碰手机硬件/文件/网络，只操作 **Agent 自身状态** 的工具：
-#   update_todo           会话级工作笔记（落 session.todos，前端渲染进度）
-#   ask_user              向用户提问，**排他**：命中即终止本轮 loop
-#   invoke_skill          按需读 skills/{id}/SKILL.md 正文
-#   read_skill_reference  按需读 skills/{id}/references/*
-#   shell_job             查/停 run_in_background 起出的后台命令
-#
-# 与文件/网络 handler 的根本差异：update_todo 必须知道「当前是哪个会话」。
-# handler 签名是 handler(args)，没有会话上下文；而 dispatch_tools 用线程池并发
-# 跑工具 —— threading.local 在子线程里读不到主线程设的值，contextvars 同理
-# （ThreadPoolExecutor 不自动传播上下文）。
-# 解法：run_tool 收第三个可选参数 ctx，TOOLS 里标 needs_ctx=True 的 handler
-# 调用时传 handler(args, ctx)，其余仍传 handler(args)。已有 9 个 handler 一行不改。
-META_TODO_MAX = 40            # update_todo 单次最多多少条
-META_TODO_TEXT = 300          # 单条 content / activeForm 截断长度
-TODO_STATUSES = ("pending", "in_progress", "completed", "cancelled")
-ASK_MAX_QUESTIONS = 3         # 一次最多问几个问题（对齐桌面端 ask_user）
-ASK_MAX_OPTIONS = 12
-ASK_TEXT_LIMIT = 500          # 问题文本截断长度
-ASK_OPT_LIMIT = 200           # 选项文本截断长度
-
-# 排他工具：命中即结束本轮 loop，同轮其余调用一律合成 not_executed 闭合槽位。
-# 对齐桌面端「Ask 与其他工具互斥」：一边问用户一边偷偷把文件改了，
-# 用户答完才发现事情已经做完，提问就失去了意义。
-EXCLUSIVE_TOOLS = ("ask_user",)
-
-# ---------- 后台 shell 任务 ----------
-# 登记簿：jobId → {id, pid, pgid, cmd, log, startedAt, status, exitCode, bytes}
-# 只记 pid/pgid，不长期持有 Popen 句柄；stop 时按进程组 killpg —— 与 run_tool
-# 超时杀树同一套做法，否则 `sh -c` 死了它 fork 出来的孙子进程还在跑。
-SHELL_JOBS = {}
-SHELL_JOBS_LOCK = threading.Lock()
-SHELL_JOB_DIRNAME = "shell_jobs"        # 相对 FS_ROOT 的日志目录
-SHELL_JOB_TAIL = 8192                   # status 回读的尾部字节数
-SHELL_JOB_KEEP = 20                     # 登记簿最多留多少条（含已结束），超了丢最旧
-SHELL_JOB_MAX_SEC = 1800                # 后台任务最长 30 分钟，到点由 reaper 杀
-# per-call 超时覆盖区间（毫秒）。上限与 SHELL_JOB_MAX_SEC 对齐；
-# 下限 1s 防止模型传个 0 让命令刚 fork 就被杀。
-SHELL_TIMEOUT_MS_RANGE = (1000, 1800000)
-
-
-def normalize_todos(raw):
-    """把模型给的 todo 数组洗成合法结构。返回 (items, notes, error)。
-
-    error 非空表示整批拒绝（结构不对，落库了也是脏数据，让模型重来）。
-    notes 是「自动修正了什么」的说明 —— 能修正就修正而不是拒绝，todo 只是
-    工作笔记，格式偏差没必要打断任务；但修正必须明示，否则模型下一轮
-    会以为自己写的状态生效了。
-    """
-    if not isinstance(raw, list):
-        return [], [], "(todos 必须是数组，每项含 id/content/status)"
-    if len(raw) > META_TODO_MAX:
-        return [], [], f"(一次最多 {META_TODO_MAX} 条 todo，收到 {len(raw)} 条。请合并后再提交)"
-
-    items, notes = [], []
-    seen_ids = set()
-    running = None            # 当前唯一的 in_progress id
-    for i, it in enumerate(raw):
-        if not isinstance(it, dict):
-            return [], [], f"(第 {i + 1} 项不是对象，todo 必须是 {{id, content, status}} 形式)"
-        tid = str(it.get("id") or "").strip()
-        content = str(it.get("content") or "").strip()
-        status = str(it.get("status") or "").strip()
-        active = str(it.get("activeForm") or "").strip()
-
-        if not tid:
-            return [], [], "(有一项缺 id。id 用于跨轮次追踪同一条任务，必须给)"
-        if tid in seen_ids:
-            return [], [], f"(id 重复: {tid}。每条 todo 的 id 必须唯一)"
-        if not content:
-            return [], [], f"(第 {i + 1} 项（id={tid}）缺 content)"
-        if status not in TODO_STATUSES:
-            return [], [], (f"(id={tid} 的 status 非法: {status!r}。"
-                            f"只能是 {'/'.join(TODO_STATUSES)})")
-        seen_ids.add(tid)
-
-        # 同时只允许一个 in_progress：多个并存等于没有「当前在做哪一步」，
-        # 前端进度条也无从渲染。保留第一个，其余降回 pending 并告知。
-        if status == "in_progress":
-            if running is None:
-                running = tid
-            else:
-                status = "pending"
-                notes.append(f"id={tid} 的 in_progress 被降为 pending"
-                             f"（同一时刻只允许一条进行中，当前是 {running}）")
-
-        items.append({
-            "id": tid[:80],
-            "content": content[:META_TODO_TEXT],
-            "status": status,
-            "activeForm": active[:META_TODO_TEXT],
-        })
-    return items, notes, None
+# ---------- 会话访问器（**留在宿主**，第六刀没搬）----------
+# `_session_get` / `_session_set_todos` 是会话层的基础访问器：
+#   · 元工具层经 sessions 服务拿到它们（cyrene_meta.py 里的 DEPS.sessions_get）
+#   · 宿主自己也有两处在用 —— 取会话 mode（run_agent_loop 附近）与工具过滤
+# 所以它们**不跟着元工具走**，留在这儿。
+# 持锁时间只有一次 dict 读写 + 一次原子写，毫秒级；锁里绝不跑 LLM 或工具。
 
 
 def _session_get(sid):
@@ -2516,606 +727,6 @@ def _session_set_todos(sid, items):
             return False
         s["todos"] = items
         return save_sessions(SESSIONS)
-
-
-def _h_update_todo(a, ctx=None):
-    """update_todo：整表替换当前会话的工作笔记。
-
-    语义对齐桌面端 mutable working notebook：传进来的是**完整新表**，
-    不是增量。模型每轮把全量 todos 重写一遍，Runtime 负责校验与落盘。
-    """
-    sid = (ctx or {}).get("sid")
-    items, notes, err = normalize_todos(a.get("todos"))
-    if err:
-        return OUTCOME_FAILURE, err
-
-    s = _session_get(sid)
-    if s is None:
-        # 会话不在内存里（单元测试直接调 handler、或会话刚被删）。
-        # 不能静默成功 —— 模型会以为笔记存下来了，下一轮接着引用。
-        return OUTCOME_FAILURE, (
-            "(当前没有可用会话上下文，todo 未能保存。"
-            "这通常发生在脱离对话流程直接调用工具时)")
-
-    if not _session_set_todos(sid, items):
-        return OUTCOME_FAILURE, "(todo 写入会话失败：会话不存在或落盘失败)"
-
-    done = sum(1 for x in items if x["status"] == "completed")
-    cancel = sum(1 for x in items if x["status"] == "cancelled")
-    prog = sum(1 for x in items if x["status"] == "in_progress")
-    lines = [f"待办已更新：共 {len(items)} 条 · 完成 {done} · 进行中 {prog}"
-             f" · 取消 {cancel} · 待办 {len(items) - done - cancel - prog}"]
-    for x in items:
-        mark = {"pending": "[ ]", "in_progress": "[~]",
-                "completed": "[x]", "cancelled": "[-]"}[x["status"]]
-        lines.append(f"  {mark} {x['content']}")
-    if notes:
-        lines.append("已自动修正：" + "；".join(notes))
-    return OUTCOME_SUCCESS, "\n".join(lines)
-
-
-def _normalize_ask(questions):
-    """把模型给的问题数组洗成前端能直接渲染的结构。返回 (qs, notes, error)。"""
-    if not isinstance(questions, list) or not questions:
-        return [], [], "(questions 必须是非空数组)"
-    if len(questions) > ASK_MAX_QUESTIONS:
-        return [], [], (f"(一次最多问 {ASK_MAX_QUESTIONS} 个问题，收到 {len(questions)} 个。"
-                        f"请挑最关键的，或合并成一个问题)")
-
-    qs, notes = [], []
-    seen = set()
-    for i, q in enumerate(questions):
-        if not isinstance(q, dict):
-            return [], [], f"(第 {i + 1} 个问题不是对象)"
-        qid = str(q.get("id") or "").strip() or f"q{i + 1}"
-        if qid in seen:
-            qid = f"{qid}_{i + 1}"
-            notes.append(f"问题 id 重复，已改为 {qid}")
-        seen.add(qid)
-        text = str(q.get("question") or "").strip()
-        if not text:
-            return [], [], f"(第 {i + 1} 个问题缺 question 文本)"
-        qtype = str(q.get("type") or "").strip()
-        raw_opts = q.get("options")
-
-        if qtype == "text":
-            opts = None                     # 自由填写不需要选项
-        elif not isinstance(raw_opts, list) or not raw_opts:
-            if qtype in ("single_select", "multi_select"):
-                return [], [], (f"(问题 {qid} 声明为 {qtype} 但没给 options。"
-                                f"选择题必须带可选项)")
-            # 没声明类型又没选项 → 当自由填写处理，比报错打断更合理
-            qtype, opts = "text", None
-        else:
-            qtype = qtype if qtype in ("single_select", "multi_select") else "single_select"
-            opts = raw_opts[:ASK_MAX_OPTIONS]
-            if len(raw_opts) > ASK_MAX_OPTIONS:
-                notes.append(f"问题 {qid} 的选项超过 {ASK_MAX_OPTIONS} 个，已截断")
-
-        clean_opts = []
-        for o in (opts or []):
-            if isinstance(o, dict):
-                label = str(o.get("label") or o.get("value") or "").strip()
-                value = str(o.get("value") or o.get("label") or "").strip()
-                desc = str(o.get("description") or "").strip()
-            else:
-                label = value = str(o or "").strip()
-                desc = ""
-            if not label:
-                continue
-            clean_opts.append({"label": label[:ASK_OPT_LIMIT],
-                               "value": (value or label)[:ASK_OPT_LIMIT],
-                               "description": desc[:ASK_OPT_LIMIT]})
-        if opts and not clean_opts:
-            # 选项全是空串 → 退化成自由填写，别给用户渲染一排空按钮
-            qtype, clean_opts = "text", []
-
-        qs.append({"id": qid[:80], "question": text[:ASK_TEXT_LIMIT],
-                   "type": qtype, "options": clean_opts})
-    return qs, notes, None
-
-
-def _h_ask_user(a, ctx=None):
-    """ask_user：把问题交给用户。
-
-    这个 handler 本身只做校验与格式化 —— 真正的「终止本轮 loop」由
-    run_agent_loop 的排他分支负责（见 EXCLUSIVE_TOOLS）。职责分开，
-    否则 break 逻辑散在两处，单元测试也没法单独验 handler。
-    """
-    qs, notes, err = _normalize_ask(a.get("questions"))
-    if err:
-        return OUTCOME_FAILURE, err
-    kinds = {"single_select": "单选", "multi_select": "多选", "text": "自由填写"}
-    lines = ["（问题已提交给用户，本轮工具循环终止，等用户回答后再继续）"]
-    for q in qs:
-        lines.append(f"- [{kinds.get(q['type'], q['type'])}] {q['question']}")
-        for o in q["options"] or []:
-            lines.append(f"    · {o['label']}")
-    if notes:
-        lines.append("格式修正：" + "；".join(notes))
-    return OUTCOME_SUCCESS, "\n".join(lines)
-
-
-# ---------- 技能按需加载 ----------
-def _skills_root():
-    """技能根目录。每次现算，方便单元测试改模块全局。"""
-    return Path(SKILLS_DIR)
-
-
-def _guard_skill_path(rel, want="file"):
-    """技能目录专用路径守卫，入参是相对 SKILLS_DIR 的路径。
-
-    为什么不复用 guard_path：后者的 root 是 FS_ROOT，可被 CYRENE_FS_ROOT
-    改写。本机跑验证脚本时沙箱把 FS_ROOT 指到 tempfile 目录，技能目录立刻
-    整体「越界」，工具假失败。技能是只读资源，守卫职责只有两条：
-    必须落在 SKILLS_DIR 内、必须真是文件/目录。
-    """
-    root = _skills_root()
-    if not isinstance(rel, str) or not rel.strip():
-        raise PathGuardError("(路径为空)")
-    rel = rel.strip().replace("\x00", "")
-    p = Path(rel)
-    if p.is_absolute():
-        # 绝对路径一律剥成相对技能根，免得模型给个 /etc/passwd 绕过守卫
-        try:
-            p = p.relative_to(root)
-        except ValueError:
-            p = Path(p.name)
-    cand = root / p
-    try:
-        ap = Path(os.path.abspath(str(cand)))
-    except (OSError, ValueError) as e:
-        raise PathGuardError(f"(路径无法解析: {e})")
-    if ap != root and root not in ap.parents:
-        raise PathGuardError(f"(路径越界：只允许访问技能目录 {root} 之内，拒绝 {ap})")
-    try:
-        rp = Path(os.path.realpath(str(ap)))
-        real_root = Path(os.path.realpath(str(root)))
-    except (OSError, ValueError) as e:
-        raise PathGuardError(f"(路径无法解析: {e})")
-    if rp != real_root and real_root not in rp.parents:
-        raise PathGuardError(f"(路径经符号链接指向技能目录之外，已拒绝: {rp})")
-    if want == "file" and not ap.is_file():
-        raise PathGuardError(f"(文件不存在或不是普通文件: {ap})")
-    if want == "dir" and not ap.is_dir():
-        raise PathGuardError(f"(目录不存在: {ap})")
-    return ap
-
-
-def _find_skill_dir(skill_id):
-    """按 id 定位技能目录。返回 (Path|None, 错误串|None)。
-
-    目录名与 manifest.id 可能不一致（discover_skills 里 id 取自 manifest），
-    所以两条路都试：先按目录名，再扫一遍 manifest.id 匹配。
-    """
-    sid = str(skill_id or "").strip()
-    if not sid:
-        return None, "(缺少 skill_id)"
-    if "/" in sid or "\\" in sid or sid in (".", ".."):
-        return None, f"(skill_id 非法: {sid}。只接受技能 id，不接受路径)"
-    root = _skills_root()
-    direct = root / sid
-    if direct.is_dir():
-        return direct, None
-    for info in get_skills():
-        if info.get("id") == sid:
-            d = root / sid
-            if d.is_dir():
-                return d, None
-    known = [i["id"] for i in get_skills()]
-    return None, (f"(没有这个技能: {sid}。"
-                  + (f"当前可用：{', '.join(known)}" if known else "技能目录为空")
-                  + ")")
-
-
-def _list_skill_refs(d):
-    """列出技能 references/ 下的文件名（只列文件，不递归）。"""
-    rd = d / "references"
-    if not rd.is_dir():
-        return []
-    try:
-        return sorted(x.name for x in rd.iterdir() if x.is_file())
-    except OSError:
-        return []
-
-
-def _h_invoke_skill(a):
-    """invoke_skill：读技能正文（SKILL.md 去掉 front matter 的部分）。
-
-    对齐桌面端「技能正文不进上下文，需要时才 load」—— 手机上上下文预算更紧，
-    9 个技能全量注入会白烧几千 token，按需读才是正解。
-    """
-    d, err = _find_skill_dir(a.get("skill_id"))
-    if err:
-        return OUTCOME_FAILURE, err
-    sk = d / "SKILL.md"
-    refs = _list_skill_refs(d)
-    if not sk.is_file():
-        return OUTCOME_FAILURE, (
-            f"(技能 {d.name} 没有 SKILL.md"
-            + (f"，但有附件：{', '.join(refs)}" if refs else "") + ")")
-    try:
-        text = sk.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        return OUTCOME_FAILURE, f"(读取技能失败: {e})"
-
-    meta, body = parse_front_matter(text)
-    body = body.strip()
-    if not body:
-        return OUTCOME_FAILURE, f"(技能 {d.name} 的 SKILL.md 正文为空)"
-
-    head = [f"=== Skill: {meta.get('name') or d.name} ==="]
-    if meta.get("description"):
-        head.append(str(meta["description"]))
-    if meta.get("version"):
-        head.append(f"version: {meta['version']}")
-    head.append(f"正文 {len(body)} 字" + (f" · 附件 {len(refs)} 个" if refs else ""))
-    if refs:
-        head.append("可用附件（用 read_skill_reference 读）：" + ", ".join(refs))
-    out = "\n".join(head) + "\n\n" + body
-    max_chars = _int_arg(a.get("max_chars"), 0, 0, 200000)
-    if max_chars and len(out) > max_chars:
-        dropped = len(out) - max_chars
-        out = out[:max_chars] + f"\n…（按 max_chars 截断，丢弃 {dropped} 字）"
-    return OUTCOME_SUCCESS, out
-
-
-def _h_read_skill_reference(a):
-    """read_skill_reference：读技能 references/ 下的附件，按行返回带行号。"""
-    d, err = _find_skill_dir(a.get("skill_id"))
-    if err:
-        return OUTCOME_FAILURE, err
-    ref = str(a.get("ref") or "").strip()
-    if not ref:
-        refs = _list_skill_refs(d)
-        return OUTCOME_FAILURE, (
-            "(缺少 ref 文件名。"
-            + (f"该技能可用附件：{', '.join(refs)}" if refs else "该技能没有附件")
-            + ")")
-    try:
-        # 守卫按「技能目录名/references/ref」整体校验，ref 里的 ../ 被 abspath 拦下
-        p = _guard_skill_path(str(Path(d.name) / "references" / ref), want="file")
-    except PathGuardError as e:
-        return OUTCOME_FAILURE, str(e)
-    try:
-        size = p.stat().st_size
-        if size > FS_MAX_FILE_BYTES:
-            return OUTCOME_FAILURE, f"(附件太大 {size} 字节，上限 {FS_MAX_FILE_BYTES})"
-        data = p.read_bytes()
-    except OSError as e:
-        return OUTCOME_FAILURE, f"(读取失败: {e})"
-    if b"\x00" in data[:8192]:
-        return OUTCOME_FAILURE, "(这是二进制文件，不能当文本读)"
-
-    text, enc_note = _decode_bytes(data)
-    lines = text.split("\n")
-    total = len(lines)
-    # offset **不夹到 total**：夹了的话模型传 offset=999 会静默拿到最后一行，
-    # 它会以为读到了第 999 行附近的内容 —— 静默错位比报错危险得多。
-    # 与 _h_read_file 同一套语义（越界直接 failure，让模型改 offset 重读）。
-    offset = _int_arg(a.get("offset"), 1, 1, 10 ** 9)
-    limit = _int_arg(a.get("limit"), 400, 1, 20000)
-    if offset > total:
-        return OUTCOME_FAILURE, (
-            f"(offset={offset} 超出范围：附件共 {total} 行。"
-            f"要续读请用 offset<={total})")
-    chunk = lines[offset - 1: offset - 1 + limit]
-    if not chunk:
-        return OUTCOME_FAILURE, f"(offset={offset} 超出范围，文件共 {total} 行)"
-    width = len(str(offset - 1 + len(chunk)))
-    body = "\n".join(f"{offset + i:>{width}} | {ln}" for i, ln in enumerate(chunk))
-    left = total - (offset - 1 + len(chunk))
-    head = (f"附件: {d.name}/references/{p.name}  共 {total} 行"
-            f"  本次 {offset}-{offset + len(chunk) - 1}"
-            + (f"  （还有 {left} 行，可加大 offset 续读）" if left > 0 else "")
-            + (enc_note or ""))
-    return OUTCOME_SUCCESS, head + "\n" + body
-
-
-# ---------- 后台 shell 任务 ----------
-def _shell_job_dir():
-    """后台任务日志目录（FS_ROOT/shell_jobs），不存在则创建。"""
-    d = guard_path(SHELL_JOB_DIRNAME, want="any")
-    try:
-        d.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-    return d
-
-
-def _job_snapshot(j, tail=True):
-    """把 job 记录整成给模型看的 dict。tail=True 时带上日志尾部与累计字节数。"""
-    out = {
-        "job_id": j["id"], "cmd": j["cmd"], "status": j["status"],
-        "startedAt": j["startedAt"], "exitCode": j.get("exitCode"),
-        "logFile": str(j["log"]),
-    }
-    out["elapsedSec"] = int(time.time() - j["startedAt"])
-    try:
-        with open(j["log"], "rb") as f:
-            f.seek(0, os.SEEK_END)
-            sz = f.tell()
-            f.seek(max(0, sz - SHELL_JOB_TAIL))
-            raw = f.read()
-        txt, _ = _decode_bytes(raw)
-        out["totalBytes"] = sz
-        out["tail"] = txt
-        out["tailTruncated"] = sz > SHELL_JOB_TAIL
-    except OSError as e:
-        out["totalBytes"] = 0
-        out["tail"] = f"(读日志失败: {e})"
-        out["tailTruncated"] = False
-    return out
-
-
-def _job_kill(j):
-    """杀整个进程组并回收僵尸。绝不把异常抛给上层。
-
-    杀完必须回收（proc.wait / waitpid）：SIGKILL 后子进程会短暂变僵尸，
-    父进程不 wait 的话它一直占着进程表项，os.kill(pid,0) 仍报「活着」，
-    shell_job 的 stopped 状态就验不出来（真机 B153 抓到的）。
-    SIGKILL 已发，wait 会立刻返回，不会阻塞。
-    """
-    pgid, pid, proc = j.get("pgid"), j.get("pid"), j.get("proc")
-    killed = False
-    if os.name == "posix" and pgid:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-            killed = True
-        except (OSError, ProcessLookupError, ValueError):
-            pass
-    if not killed and pid:
-        try:
-            os.kill(pid, signal.SIGKILL if os.name == "posix" else signal.SIGTERM)
-            killed = True
-        except (OSError, ProcessLookupError, ValueError):
-            pass
-    # 收尸：有 Popen 句柄用 wait（内部 reap），否则退回 waitpid
-    if proc is not None:
-        try:
-            proc.wait(timeout=3)
-        except Exception:
-            pass
-    elif pid and os.name == "posix":
-        try:
-            os.waitpid(pid, 0)
-        except (OSError, ChildProcessError, ValueError):
-            pass
-    return killed
-
-
-def _job_reap(j):
-    """刷新 job 状态。必须在持 SHELL_JOBS_LOCK 时调用。
-
-    用 Popen.poll() 探活 —— 它内部是 waitpid(pid, WNOHANG)，既回收僵尸又拿退出码。
-    为什么不能用 os.kill(pid, 0)：后台子进程退出后若父进程不 wait，它就变僵尸，
-    而 kill(pid,0) 对僵尸**仍返回成功**（进程表项还在），于是状态永远卡在
-    running，shell_job status 彻底失效。这是真机 B153/B155 抓出来的 bug。
-    poll() 返回 None=还在跑；返回 int=已退出的退出码，顺手回收了僵尸。
-    """
-    if j["status"] != "running":
-        return j
-    proc = j.get("proc")
-    rc = None
-    if proc is not None:
-        try:
-            rc = proc.poll()
-        except (OSError, ValueError, subprocess.SubprocessError):
-            rc = None
-    else:
-        # 没有句柄（例如服务重启后从别处恢复的记录）：退回 kill(pid,0) 探活，
-        # 判不出僵尸，但至少不会因为拿不到 proc 就崩。
-        pid = j.get("pid")
-        alive = False
-        if pid:
-            try:
-                os.kill(pid, 0)
-                alive = True
-            except (OSError, ProcessLookupError, ValueError):
-                alive = False
-        if alive:
-            if time.time() - j["startedAt"] > SHELL_JOB_MAX_SEC:
-                _job_kill(j)
-                j["status"] = "timed_out"
-            return j
-        j["status"] = "exited"
-        return j
-
-    if rc is None:
-        # 仍在运行：超过最长时间才强杀（防后台任务无限跑）
-        if time.time() - j["startedAt"] > SHELL_JOB_MAX_SEC:
-            _job_kill(j)
-            j["status"] = "timed_out"
-        return j
-    # 已退出：记下退出码，状态给 exited（被 stop 显式改过的不动）
-    j["exitCode"] = rc
-    if j["status"] == "running":
-        j["status"] = "exited"
-    return j
-
-
-
-def _jobs_prune():
-    """登记簿瘦身：只留最近 SHELL_JOB_KEEP 条。必须在持锁时调用。"""
-    if len(SHELL_JOBS) <= SHELL_JOB_KEEP:
-        return
-    ordered = sorted(SHELL_JOBS.values(), key=lambda x: x["startedAt"])
-    for j in ordered[:len(SHELL_JOBS) - SHELL_JOB_KEEP]:
-        SHELL_JOBS.pop(j["id"], None)
-
-
-def _shell_timeout(a):
-    """本次 shell 调用的超时秒数。
-
-    timeout_ms>0 时用它（夹到 SHELL_TIMEOUT_MS_RANGE），否则回落 agent 的 stepTimeout。
-    给模型一个 per-call 覆盖口子：删大目录、编译这类「就是慢」的命令不该被
-    30s 默认值砍掉，而它也不该去改全局 stepTimeout（那会影响所有工具）。
-    """
-    ms = _int_arg(a.get("timeout_ms"), 0, 0, SHELL_TIMEOUT_MS_RANGE[1])
-    if ms > 0:
-        lo, hi = SHELL_TIMEOUT_MS_RANGE
-        return max(lo, min(hi, ms)) / 1000.0
-    return float(agent_cfg("stepTimeout"))
-
-
-def _shell_bg_log_path(jid):
-    """后台任务日志文件路径。目录不可用时回落系统临时目录，绝不因日志写不了就不跑命令。"""
-    try:
-        return _shell_job_dir() / f"{jid}.log"
-    except PathGuardError:
-        return Path(tempfile.gettempdir()) / f"cyrene_{jid}.log"
-
-
-def _h_shell(a):
-    """shell：执行一条命令。前台阻塞拿输出，或后台起任务立刻返回 jobId。
-
-    进程组隔离与 run_tool 的 cmd 分支同款（start_new_session + killpg）：
-    超时只 kill `sh -c` 那层的话，它 fork 出来的孙子进程会变孤儿继续跑，
-    上轮 termux-api 探测实测攒了 12 行残留。
-    """
-    cmd_str = str(a.get("cmd") or "").strip()
-    if not cmd_str:
-        return OUTCOME_FAILURE, "(缺少 cmd)"
-    bg = _bool_arg(a.get("run_in_background"), False)
-    jid = "job-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
-    log_path = _shell_bg_log_path(jid)
-
-    popen_kw = {}
-    if os.name == "posix":
-        popen_kw["start_new_session"] = True   # setsid，子进程自成一个进程组
-
-    # ---------- 后台模式 ----------
-    if bg:
-        try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            logf = open(log_path, "wb")
-        except OSError as e:
-            return OUTCOME_FAILURE, f"(后台日志文件打不开: {e})"
-        try:
-            p = subprocess.Popen(["sh", "-c", cmd_str], stdout=logf,
-                                 stderr=subprocess.STDOUT, **popen_kw)
-        except (OSError, ValueError) as e:
-            try:
-                logf.close()
-            except OSError:
-                pass
-            return OUTCOME_FAILURE, f"(后台任务启动失败: {type(e).__name__}: {e})"
-        # stdout/stderr 已重定向到文件，子进程不再持有这个句柄，父进程可以关。
-        # 不关就是每次后台调用漏一个 fd —— ThreadingHTTPServer 下攒够快就 EMFILE。
-        try:
-            logf.close()
-        except OSError:
-            pass
-        pgid = None
-        if os.name == "posix":
-            try:
-                pgid = os.getpgid(p.pid)
-            except (OSError, ProcessLookupError, ValueError):
-                pgid = p.pid
-        with SHELL_JOBS_LOCK:
-            SHELL_JOBS[jid] = {
-                "id": jid, "pid": p.pid, "pgid": pgid, "cmd": cmd_str[:500],
-                "log": log_path, "startedAt": time.time(),
-                "status": "running", "exitCode": None,
-                # 持有 Popen 句柄：_job_reap 用 poll() 回收僵尸并拿退出码，
-                # _job_kill 杀完用它 wait 收尸。stdout/stderr 已重定向到日志文件
-                # 并在父进程侧 close，这个对象本身不再占额外 fd。
-                "proc": p,
-            }
-            _jobs_prune()
-        return OUTCOME_SUCCESS, json.dumps({
-            "jobId": jid, "logFile": str(log_path), "pid": p.pid,
-            "note": "已在后台启动，本调用立即返回。"
-                    "用 shell_job(action=status) 查进度或 (action=stop) 终止；"
-                    "totalBytes 两次查询有增量说明任务真在跑",
-        }, ensure_ascii=False)
-
-    # ---------- 前台模式 ----------
-    timeout = _shell_timeout(a)
-    p = None
-    try:
-        p = subprocess.Popen(["sh", "-c", cmd_str], stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, text=True, **popen_kw)
-        try:
-            stdout, stderr = p.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            _shell_kill_tree(p)
-            try:
-                p.communicate(timeout=5)
-            except Exception:
-                pass
-            # unknown 而非 failure：命令可能已经部分生效，不能诱导模型重放
-            return OUTCOME_UNKNOWN, (
-                f"(执行超过 {timeout:.1f}s 被中止，已杀整个进程组；"
-                f"命令可能已部分生效，请勿盲目重试。"
-                f"长任务请改用 run_in_background=true)")
-        out = (stdout or "").strip()
-        err_out = (stderr or "").strip()
-        if p.returncode == 0:
-            return OUTCOME_SUCCESS, _truncate_output(out) if out else "(无输出)"
-        detail = out or err_out or "(无输出)"
-        if out and err_out:
-            detail = out + "\n[stderr] " + err_out
-        return OUTCOME_FAILURE, f"(退出码 {p.returncode}) {_truncate_output(detail)}"
-    except FileNotFoundError:
-        return OUTCOME_FAILURE, "(sh 不存在：这不是一个 POSIX shell 环境)"
-    except Exception as e:
-        if p is not None and p.poll() is None:
-            _shell_kill_tree(p)
-        return OUTCOME_FAILURE, f"(失败: {type(e).__name__}: {e})"
-
-
-def _shell_kill_tree(p):
-    """杀掉整个进程组。杀不掉也认了，但不能把异常抛到上层。"""
-    if os.name != "posix":
-        try:
-            p.kill()
-        except Exception:
-            pass
-        return
-    try:
-        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-    except Exception:
-        try:
-            p.kill()
-        except Exception:
-            pass
-
-
-def _h_shell_job(a):
-    """shell_job：查状态或终止一个后台任务。"""
-    action = str(a.get("action") or "status").strip().lower()
-    if action not in ("status", "stop"):
-        return OUTCOME_FAILURE, f"(action 只能是 status 或 stop，收到 {action!r})"
-    jid = str(a.get("job_id") or "").strip()
-    if not jid:
-        return OUTCOME_FAILURE, "(缺少 job_id。它是 run_in_background 返回的那个 id)"
-
-    with SHELL_JOBS_LOCK:
-        j = SHELL_JOBS.get(jid)
-        if j is None:
-            known = sorted(SHELL_JOBS.keys())
-            return OUTCOME_FAILURE, (
-                f"(没有这个后台任务: {jid}。"
-                + (f"当前登记在册：{', '.join(known)}" if known
-                   else "登记簿是空的——服务重启过，或任务从未创建") + ")")
-        _job_reap(j)
-        snap = _job_snapshot(j)
-        if action == "stop":
-            was_running = snap["status"] == "running"
-            if was_running:
-                _job_kill(j)
-                j["status"] = "stopped"
-                snap["status"] = "stopped"
-            _jobs_prune()
-            return OUTCOME_SUCCESS, json.dumps({
-                "action": "stop", "job": snap,
-                "note": ("（已按进程组终止，孙子进程一并清掉）" if was_running
-                         else f"（任务早已是 {snap['status']}，本次没杀任何东西）"),
-            }, ensure_ascii=False)
-        _jobs_prune()
-    return OUTCOME_SUCCESS, json.dumps({"action": "status", "job": snap},
-                                       ensure_ascii=False)
 
 
 # ========== 工具定义 ==========
@@ -4020,141 +1631,6 @@ def normalize_typography(v):
 # 视觉段各键的取值范围：(下限, 上限, 默认值)。
 # 单独抽成表，是为了让「默认值」只有一个来源 —— 下面的 normalize 与
 # DEFAULT_SETTINGS 都从这里取，避免两处各写一份、改一处忘一处。
-VISION_RANGES = {
-    "request_timeout": (10, 300, 60),
-    "maxMb": (1, 16, 4),
-    "cacheTtlMin": (0, 1440, 30),
-}
-
-
-def normalize_vision(raw):
-    """归一化独立视觉模型配置。
-
-    这个函数与 normalize_plugins 的差别：这里全是**偏好设置**，不是用户数据，
-    所以走白名单式的回落语义 —— 缺项回落默认值，非法值夹回合法范围。
-    （plugins 段的 registry / secrets 反过来，绝不能回落，回落就是清空。）
-    """
-    v = raw if isinstance(raw, dict) else {}
-    out = {
-        "enabled": _as_bool(v.get("enabled"), False),
-        "autoCaption": _as_bool(v.get("autoCaption"), False),
-        "toolEnabled": _as_bool(v.get("toolEnabled"), True),
-        # api_base 去掉尾斜杠：拼 "/chat/completions" 时少一次踩坑
-        # （与 model.api_base 同一套处理）。
-        "api_base": _as_str(v.get("api_base"), "").strip().rstrip("/")[:500],
-        # api_key 不做长度截断 —— 截断会悄悄废掉一个 key，
-        # 用户看到的是「鉴权失败」而不是「配置被截断了」。
-        # 与 plugin secrets 的处理口径一致。
-        "api_key": _as_str(v.get("api_key"), ""),
-        "model": _as_str(v.get("model"), "")[:200],
-    }
-    for k, (lo, hi, fb) in VISION_RANGES.items():
-        # 整数键：maxMb 允许小数（1.5 MB 这种），但三个里只有它可能带小数，
-        # 统一按 float 夹再按需取整更省心 —— 这里全部保留数值语义，
-        # 前端展示与比较都不受影响。
-        n = _clamp(v.get(k), lo, hi, fb)
-        out[k] = int(n) if k in ("request_timeout", "cacheTtlMin") else round(n, 2)
-    return out
-
-
-def vision_cfg(key, fb=None):
-    """读单个视觉配置项。SETTINGS 未加载时回落默认值（与 plugins_cfg 同构）。
-
-    为什么要这个包装而不是到处 SETTINGS.get("vision", {}).get(...)：
-    SETTINGS 是模块级全局，在 load_settings() 跑之前访问会 NameError。
-    视觉子系统可能被早期调用（比如工具注册、路由判定），这层保护是必要的。
-    """
-    try:
-        return SETTINGS.get("vision", {}).get(key, fb)
-    except (NameError, AttributeError):
-        return fb
-
-
-# search 段的数值区间 (lo, hi, fallback)，与 VISION_RANGES 同款：越界一律夹回。
-SEARCH_RANGES = {
-    "resultCount": (1, 15, 8),
-    "snippetChars": (100, 1000, 500),
-    "request_timeout": (5, 60, 20),
-    "cacheTtlMin": (0, 240, 30),
-}
-# 只认这四个值，其余一律回落 auto（前端下拉也只给这四个）。
-SEARCH_ENGINES = ("auto", "bocha", "tavily", "off")
-
-
-def normalize_search(raw):
-    """归一化联网搜索配置。白名单式：缺项回落默认值，非法值夹回合法范围。
-
-    与 normalize_vision 同一套语义（都是偏好设置，不是用户数据）。
-    """
-    s = raw if isinstance(raw, dict) else {}
-    eng = _as_str(s.get("engine"), "auto").strip().lower()
-    out = {
-        "engine": eng if eng in SEARCH_ENGINES else "auto",
-        # key 不做长度截断 —— 截断会悄悄废掉一个 key，用户看到的是「鉴权失败」
-        # 而不是「配置被截断了」（与 vision.api_key 同口径；两把 key 一致）。
-        "bochaKey": _as_str(s.get("bochaKey"), "").strip(),
-        "tavilyKey": _as_str(s.get("tavilyKey"), "").strip(),
-    }
-    for k, (lo, hi, fb) in SEARCH_RANGES.items():
-        out[k] = int(_clamp(s.get(k), lo, hi, fb))
-    return out
-
-
-def search_cfg(key, fb=None):
-    """读单个搜索配置项。SETTINGS 未加载时回落默认值（与 vision_cfg 同构）。"""
-    try:
-        return SETTINGS.get("search", {}).get(key, fb)
-    except (NameError, AttributeError):
-        return fb
-
-
-def search_engine():
-    """当前生效的搜索链路：'bocha' / 'tavily' / 'fetch'。只看配置齐不齐，不碰网络。"""
-    eng = str(search_cfg("engine", "auto") or "auto").strip().lower()
-    if eng == "off":
-        return "fetch"
-    if eng in _SEARCH_API_CLIENTS:
-        return eng
-    # auto：博查优先、其次 Tavily，谁配了 key 用谁；都没配就还是抓取 ——
-    # 不填 key 的用户行为与改动前完全一致。
-    if str(search_cfg("bochaKey", "") or "").strip():
-        return "bocha"
-    if str(search_cfg("tavilyKey", "") or "").strip():
-        return "tavily"
-    return "fetch"
-
-
-def vision_ready():
-    """视觉通道是否可用：开关开着 + 三个端点字段齐（对齐桌面端三项齐全判据）。
-
-    只在「配置齐不齐」这一层下结论，不碰任何网络。真正的可用性由第一次
-    调用去证伪 —— 首页判定只负责把「肯定不行」的情况挡在门外。
-    """
-    if not vision_cfg("enabled", False):
-        return False
-    base = str(vision_cfg("api_base", "") or "").strip()
-    key = str(vision_cfg("api_key", "") or "").strip()
-    model = str(vision_cfg("model", "") or "").strip()
-    return bool(base and key and model)
-
-
-# 视觉工具 id。单独拎出来，是因为「给不给这两个工具」的判定要同时作用于
-# 三处：系统提示的工具清单（enabled_tools）、请求里的 tools 数组
-# （enabled_tool_names）、以及 /tools 面板的展示。写死字面量迟早会漏一处。
-VISION_TOOL_IDS = ("read_image", "read_image_url")
-
-
-def vision_tools_allowed():
-    """要不要把视觉工具摆给她。
-
-    判据只有 vision.toolEnabled 这一条（默认 True），**不要求端点已配好** ——
-    这是刻意的：端点没定时她仍能看到这两个工具，调了会拿到「请在设置 → 视觉
-    里配置」的可读提示。这比「工具时有时无」好：用户刚打开面板时能看见工具，
-    才知道有这么个能力存在，也才会去配。
-    """
-    return bool(vision_cfg("toolEnabled", True))
-
-
 # ---------- 世界书 / 记忆 ----------
 # 记忆段各键的取值范围：(下限, 上限, 默认值)，与 VISION_RANGES 同构。
 MEMORY_RANGES = {
@@ -4468,8 +1944,10 @@ def memory_status():
         "l2Debug": {
             "l2Enabled": bool(memory_cfg("l2Enabled", False)),
             "roundCount": int(_L2_ROUND.get("n") or 0),
-            "judgeInterval": getattr(_L2_SCHED, "judge_interval", None),
-            "decayInterval": getattr(_L2_SCHED, "decay_interval", None),
+            # ⚠ `_L2_SCHED` 是惰性构造的单例（可变量绑定），转发值会读到 None，
+            #   所以走 cyrene_l2line 的读函数 l2_sched()。
+            "judgeInterval": getattr(l2_sched(), "judge_interval", None),
+            "decayInterval": getattr(l2_sched(), "decay_interval", None),
             "judgeStat": dict(_L2_JUDGE_STAT),
             "llmErrors": list(_L2_LLM_ERRORS)[-5:],
             "judgeErrors": list(getattr(_l2w, "JUDGE_ERRORS", []) or [])[-5:],
@@ -4480,550 +1958,40 @@ def memory_status():
     }
 
 
-# ========== 二期 L2 接线（P2-6 / P3）==========
-# 与上面的 worldbook 块同处一个文件，但模块导入放在这里：sys.path 已在文件头部补过，
-# 所以直接 import。两个模块任一拿不到就整体降级为 None —— 记忆是附加能力，坏了不能拖住对话。
-try:
-    import cyrene_l2store as _l2s
-    import cyrene_l2write as _l2w
-    import cyrene_l2maintain as _l2m        # P4：维护链路（resolver / 压缩 / 衰减 / 护栏）
-except Exception as _l2_err:                                # pragma: no cover
-    _l2s = None
-    _l2w = None
-    _l2m = None
-    print(f"⚠ L2 模块导入失败（二期记忆停用）: {_l2_err}")
-
-# L2 用独立的锁，不复用 STORE_LOCK —— 两者覆盖的数据不同，共用一把只会互相拖慢。
-# ⚠ 前台（_handle_send）与后台维护线程都会碰它，所以前台取锁必须带超时（见 l2_round）。
-_L2_LOCK = threading.Lock()
-_L2_SCHED = None            # MemoryScheduler | None
-_L2_ROUND = {"n": 0}        # 轮数缓存。选它而不另开一个 roundCount.json：
-                            # store 的 l1.roundCount 本就是这个字段（DEFAULT_L1 里就有），
-                            # 跟 memory.json 同生共死，少一个文件、少一个落盘点。
-_L2_CUR = {"store": None}   # 正在处理的 store；judge 回调从这里取
-_L2_JUDGE = {"obj": None}   # MemoryJudge 实例的懒加载容器
-
-
-def l2_store_path():
-    """L2 库路径：data/l2/memory.json；配了 l2StatePath 就用它（与一期 statePath 同构）。"""
-    # 配了 l2StatePath 就用它（与一期 statePath 同构）；留空回落 data/l2/memory.json。
-    # 这一条不只是给用户留口子 —— 冒烟脚本靠它把库指到临时目录，不碰项目数据。
-    p = str(memory_cfg("l2StatePath", "") or "").strip()
-    return Path(p) if p else (DATA_DIR / "l2" / "memory.json")
-
-
-# 维护链路的「最近失败原因」。为什么要单独留一份：
-#   judge 的错进的是 l2write.JUDGE_ERRORS（进程内），而 LLM 这一层的 error 原先
-#   被**静默吞掉** —— 结果就是「她什么都没记住，可哪儿都不报错」，只能靠猜。
-#   这两份再由 /memory/status 的 l2Debug 段露出来，一眼就能定位。
-_L2_LLM_ERRORS = []
-_L2_JUDGE_STAT = {"runs": 0, "turns": 0, "candidates": 0, "afterFilter": 0}
-# 模型最近一次吐了什么（截前 800 字）。「候选为 0」时，只有看原文才知道
-# 是模型真觉得没什么可记，还是输出格式不对被解析器丢了。
-_L2_LAST_LLM = {"len": 0, "text": ""}
-
-
-def _l2_note_llm_error(msg):
-    _L2_LLM_ERRORS.append(str(msg)[:200])
-    del _L2_LLM_ERRORS[:-10]                    # 只留最近 10 条
-
-
-def _l2_call_llm(messages):
-    """judge 用的 LLM 回调，签名对齐 LLMClient.chat()：返回 (content, reasoning, error)。
-
-    ⚠ 这里不重试、不抛异常：judge 失败就让这一轮不产出候选，下一轮还会再来。
-      超时沿用 SETTINGS.model.request_timeout 的同一套配置。
-    ⚠ 失败**必须记一笔**（`_L2_LLM_ERRORS`），否则上层看到的就是「无事发生」。
-    """
-    try:
-        content, _reasoning, error = LLMClient(SETTINGS).chat(messages)
-        if error:
-            _l2_note_llm_error("chat 返回 error：%s" % error)
-            return ""
-        if not (content or "").strip():
-            _l2_note_llm_error("chat 返回空正文（模型没吐内容）")
-        _L2_LAST_LLM["len"] = len(content or "")
-        _L2_LAST_LLM["text"] = (content or "")[:800]
-        return content or ""
-    except Exception as e:                                  # pragma: no cover
-        _l2_note_llm_error("调用异常：%r" % e)
-        print(f"⚠ L2 judge 调用 LLM 失败: {e}")
-        return ""
-
-
-def _l2_load_store():
-    """读 store 并修 schema：文件不存在 / 读坏了都返回一份全新的 store。"""
-    path = l2_store_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    raw = None
-    try:
-        if path.exists():
-            raw = _l2s.read_memory_file(str(path))
-    except Exception as e:
-        print(f"⚠ L2 库读取失败（按空库继续）: {e}")
-    return _l2s.repair_migrations(raw)
-
-
-def _l2_turns_from_session(sid, limit=8):
-    """从落盘的会话历史里取最近 limit 轮（user/assistant 成对）。
-
-    为什么要它：judge 要看的是「他俩最近聊了什么」，而会话历史是落盘的；
-    scheduler 内存里那份 `_recent_turns` 一重启就清零 —— 手机上服务常重启，
-    那会让 judge 手里只剩三五轮，甚至把很短的上下文当成全部来判。
-
-    ⚠ 落库的 user 内容是**注入世界书之前**的原文（见 _handle_send 里 entry_u 的位置），
-      所以这里取到的就是他真正说过的话。
-    ⚠ 只扫尾部（3 倍 limit 条）：会话可能上百条，没必要全遍历。
-    """
-    if not sid or int(limit) <= 0:
-        return []
-    try:
-        with STORE_LOCK:
-            s = SESSIONS.get(sid)
-            msgs = list((s or {}).get("messages") or [])
-    except Exception:
-        return []
-    pairs = []
-    pending = None
-    for m in msgs[-max(2, int(limit) * 3):]:
-        role = m.get("role")
-        if role == "user":
-            pending = str(m.get("content") or "")
-        elif role == "assistant" and pending is not None:
-            pairs.append({"userInput": pending,
-                          "assistantReply": str(m.get("content") or "")})
-            pending = None
-    return pairs[-int(limit):]
-
-
-def _l2_judge(turns, conversation_id):
-    """scheduler 调 judge 的入口：拿到本轮 store，抽取候选并落库。"""
-    store = _L2_CUR.get("store")
-    if store is None:
-        return
-    # 优先用落盘的会话历史（重启动不动都在）；拿不到才退回 scheduler 内存里那份。
-    # ⚠ 这里拿 STORE_LOCK 是安全的：加锁顺序只有「_L2_LOCK → STORE_LOCK」这一个方向，
-    #   主线程落库那条路只用 STORE_LOCK，不成环，不会死锁。
-    try:
-        _limit = int(getattr(_L2_SCHED, "context_turns", 8) or 8)
-    except Exception:
-        _limit = 8
-    from_session = _l2_turns_from_session(conversation_id, _limit)
-    if from_session:
-        turns = from_session
-    judge = _L2_JUDGE.get("obj")
-    if judge is None:
-        judge = _l2w.MemoryJudge(_l2_call_llm, policy_care=_l2w.load_policy_care())
-        _L2_JUDGE["obj"] = judge
-    result = judge.judge(turns, conversation_id)
-    raw_cands = result.get("candidates") or []
-    candidates = _l2w.post_filter_candidates(raw_cands)
-    _l2w.write_candidates(store, candidates, conversation_id)
-    # 统计落一份：判几轮、抽到几条、过滤后剩几条 —— 全 0 也能看出卡在哪一段
-    _L2_JUDGE_STAT["runs"] += 1
-    _L2_JUDGE_STAT["turns"] = len(turns or [])
-    _L2_JUDGE_STAT["candidates"] = len(raw_cands)
-    _L2_JUDGE_STAT["afterFilter"] = len(candidates)
-
-
-def _l2_ensure_scheduler():
-    """scheduler 的单例构造；节流值是 6/8/5/20/50，全部走配置。"""
-    global _L2_SCHED
-    if _L2_SCHED is None:
-        _L2_SCHED = _l2w.MemoryScheduler({
-            "judge_fn": _l2_judge,
-            # P4：三个维护钩子。调度器按 5 / 20 / 50 轮触发，全部跑在后台线程里。
-            "resolve_fn": _l2_resolve,
-            "compress_fn": _l2_compress,
-            "decay_fn": _l2_decay,
-            "get_round_count": lambda: int(_L2_ROUND.get("n") or 0),
-            "set_round_count": lambda n: _L2_ROUND.__setitem__("n", int(n)),
-            # 节流值走配置（P3-5）。0 = 关掉那一项；源码默认 6 / 50。
-            "judge_interval": int(memory_cfg("judgeInterval", 6) or 0),
-            "decay_interval": int(memory_cfg("decayInterval", 50) or 0),
-            # resolve / compress / decay 由 P4 接线；先留 None，scheduler 会自动跳过。
-        })
-    return _L2_SCHED
-
-
-# ---------- P3 召回与注入 ----------
-# L2 进 prompt 的文案：**源码没取到这一段** —— 桌面端拼 L2 注入的地方不在
-# `src/main/memory/` 里（P0 只拉了那个目录），所以下面是我们自定的措辞，
-# 沿用一期世界书的方括号风格。要改口吻就改这一处，别散到别处去。
-L2_INJECT_HEADER = "【关于他的记忆】"
-L2_INJECT_PREAMBLE = (
-    "以下是你记得的、关于他的事。它们来自过去的对话，可能已经过时或记岔了 ——"
-    "拿不准就自然地问一句，不要当成刚刚发生的事来说。"
-)
-
-# L0 画像里「该怎么称呼他」也得进上下文。
-# 为什么单拎出来：L0 是「关于他是谁」的核心画像，之前只显示在记忆面板上，
-# **从没进过 prompt** —— 用户在面板里改了称呼，她依然不会用；那句写死的
-# 「用户昵称：（可在设置中自定义）」也只是个占位，设置里根本没有这一项。
-# 这里只注入称呼这一个字段，别的 L0 字段一律不碰：注入面越小越不容易跟 L2 打架。
-L0_CALLING_KEYS = ("preferredName", "nickname")
-
-
-def l0_calling_note():
-    """从 L0 取「该怎么称呼他」，拼成一小句；取不到返回空串。
-
-    只读不写、永不上抛：记忆是附加能力，坏了也不能拖住这一轮对话。
-    """
-    if _l2s is None:
-        return ""
-    try:
-        store = _l2_load_store()
-        l0 = store.get("l0") if isinstance(store, dict) else None
-        if not isinstance(l0, dict):
-            return ""
-        name = ""
-        for k in L0_CALLING_KEYS:
-            name = str(l0.get(k) or "").strip()
-            if name:
-                break
-        if not name:
-            return ""
-        return "【关于他】称呼他「%s」。" % name[:30]
-    except Exception:
-        return ""
-
-# 前台召回与后台维护（judge 要调 LLM，慢）共用一把锁。前台只等这么久，
-# 拿不到就跳过本轮注入：记忆是附加能力，宁可这一轮不注入，也不能堵住回复。
-L2_RECALL_LOCK_TIMEOUT = 0.15
-
-
-def l2_available():
-    """L2 能不能工作：两个模块都导进来了 + memory.enabled + memory.l2Enabled。
-
-    ⚠ 二级开关的关系：`enabled` 是总闸（关掉整个记忆系统），`l2Enabled` 只关 L2。
-      两个都开才跑 —— 与 worldbook 那边的 `worldbookEnabled` 是同一种结构。
-    """
-    if _l2s is None or _l2w is None:
-        return False
-    if not memory_cfg("enabled", False):
-        return False
-    return bool(memory_cfg("l2Enabled", False))
-
-
-def build_l2_injection(active, max_chars=1200):
-    """把取到的 L2 拼成注入文本。
-
-    超限**按条截断**（与一期同款）：宁可少一条，也不把一句话的后半截塞进 prompt。
-    例外是第一条就超限 —— 那也截断它，否则长度设小了会一条都拿不到。
-    """
-    items = []
-    used = 0
-    limit = max(0, int(max_chars or 0))
-    for l2 in (active or []):
-        content = str((l2 or {}).get("content") or "").strip()
-        if not content:
-            continue
-        line = "- " + content
-        if limit and used + len(line) > limit:
-            if items:
-                break
-            line = line[:limit]
-        items.append(line)
-        used += len(line) + 1
-    if not items:
-        return ""
-    return L2_INJECT_HEADER + "\n" + L2_INJECT_PREAMBLE + "\n" + "\n".join(items)
-
-
-def l2_round(user_text):
-    """一轮的 L2 处理：词法召回 → DMAE 更新 → 落盘 → 返回可注入文本。
-
-    ⚠ 与 `_l2_after_turn`（后台线程，会调 LLM）共用 `_L2_LOCK`。这里的等待**带超时**：
-      后台正在 judge 时前台不等，直接跳过本轮注入（下一轮再来）。
-    ⚠ `model_text` 传空串：请求还没发出去，不知道她会怎么回。一期世界书那条链路
-      也是这么做的（memory_round 里 model_hit 恒 False）。拿她的回复再补一轮激活，
-      是 P4 维护链路的事。
-    ⚠ 全过程不抛异常：附加能力坏了也不能拖住对话（与一期同一条纪律）。
-    """
-    if not l2_available():
-        return ""
-    if not _L2_LOCK.acquire(timeout=L2_RECALL_LOCK_TIMEOUT):
-        return ""
-    try:
-        store = _l2_load_store()
-        l2_list = _l2s.get_all_l2(store)
-        if not l2_list:
-            return ""
-        text = str(user_text or "")
-        recalled = _l2s.recall_l2_ids(text, l2_list,
-                                      top_k=int(memory_cfg("l2TopK", 8) or 8))
-        mgr = _l2s.L2DmaeManager(store)
-        mgr.update_activation(l2_list, text, "", recalled)
-        active = mgr.get_active_l2_for_prompt(
-            l2_list, max_count=int(memory_cfg("l2InjectLimit", 4) or 4))
-        note = build_l2_injection(active, memory_cfg("l2MaxInjectChars", 1200))
-        try:
-            _l2s.write_memory_file(str(l2_store_path()), store)
-        except Exception as e:
-            print(f"⚠ L2 状态落盘失败（本轮照常注入）: {e}")
-        return note
-    except Exception as e:
-        print(f"⚠ L2 召回失败（已跳过注入）: {e}")
-        return ""
-    finally:
-        _L2_LOCK.release()
-
-
-# ---------- P5 面板数据 ----------
-# 面板一次拿全（状态 / L0 / L1 / L2 / 反思日志），前端不用拼好几个请求。
-# 形状照着「她的事要能被看见」定：L2 每条给出 weight + 三态 + 时间，
-# 反思日志给 type + 摘要 + 时间。
-def l2_panel_data(limit_logs=50):
-    """L2 库的只读快照。拿不到锁时如实返回 busy，不假装是空库。"""
-    empty = {"available": False, "busy": False, "items": [], "counts": {}, "logs": []}
-    if _l2s is None:
-        return empty
-    # ⚠ 后台维护（judge / resolver 都要调 LLM）可能正持有这把锁，
-    #   面板是只读展示，等不到就下次再看，绝不阻塞。
-    if not _L2_LOCK.acquire(timeout=L2_RECALL_LOCK_TIMEOUT):
-        busy = dict(empty)
-        busy["busy"] = True
-        return busy
-    try:
-        store = _l2_load_store()
-        states = {}
-        for s in (store.get("l2DmaeStates") or []):
-            if isinstance(s, dict):
-                states[s.get("l2Id")] = s
-        items = []
-        counts = {"active": 0, "aging": 0, "archived": 0, "total": 0}
-        for l2 in _l2s.get_all_l2(store):
-            st = states.get(l2.get("id")) or {}
-            status = str(l2.get("status") or "")
-            counts["total"] += 1
-            if status in counts:
-                counts[status] += 1
-            items.append({
-                "id": l2.get("id"),
-                "content": str(l2.get("content") or ""),
-                "weight": l2.get("weight"),
-                "status": status,
-                "activation": round(float(st.get("activation") or 0), 2),
-                "isPinned": bool(l2.get("isPinned")),
-                "recallCount": l2.get("recallCount"),
-                "createdAt": l2.get("createdAt"),
-            })
-        items.sort(key=lambda x: x.get("createdAt") or 0, reverse=True)
-        logs = []
-        for log in (_l2s.get_reflection_logs(store) or [])[-int(limit_logs):]:
-            if not isinstance(log, dict):
-                continue
-            logs.append({
-                "type": log.get("type"),
-                "summary": str(log.get("summary") or ""),
-                "details": str(log.get("details") or ""),
-                "createdAt": log.get("createdAt"),
-            })
-        logs.reverse()                      # 新的在前
-        return {"available": True, "busy": False, "items": items,
-                "counts": counts, "logs": logs}
-    except Exception as e:
-        print(f"⚠ L2 面板数据读取失败: {e}")
-        return empty
-    finally:
-        _L2_LOCK.release()
-
-
-def l2_forget(l2_id):
-    """删掉一条 L2（库里的条目 + 它的 DMAE 状态行），返回「是否真删到了」。
-
-    ⚠ 状态行不能留孤儿：条目没了还挂着一行 activation/silence，面板三态会数错，
-      以后同 id 复用还会串味。
-    ⚠ 抽成模块级函数（而不是埋在 HTTP handler 里）是为了能被离线冒烟直接调 ——
-      handler 只剩参数校验与响应。
-    """
-    if _l2s is None:
-        return False
-    if not _L2_LOCK.acquire(timeout=2.0):
-        raise TimeoutError("记忆库正忙")
-    try:
-        store = _l2_load_store()
-        if not _l2s.delete_l2(store, l2_id):
-            return False
-        states = store.get("l2DmaeStates")
-        if isinstance(states, list):
-            store["l2DmaeStates"] = [
-                s for s in states
-                if not (isinstance(s, dict) and s.get("l2Id") == l2_id)]
-        _l2s.write_memory_file(str(l2_store_path()), store)
-        return True
-    finally:
-        _L2_LOCK.release()
-
-
-# L0 / L1 允许手改的字段白名单（面板上那个「改」按钮走这里）。
-# ⚠ 为什么不放开整张表：里面还有 updatedAt / generatedAt / roundCount 这类由程序
-#   维护的字段，让它们被手改会把时间线和轮数弄乱。isPinned 单独放行（bool）。
-L0_EDITABLE = ("nickname", "preferredName", "occupation", "longTermInterests",
-               "language", "permanentNote", "isPinned")
-L1_EDITABLE = ("recentGoals", "recentPreferences", "currentProject")
-
-
-def memory_profile_update(patch):
-    """改 L0 画像 / L1 近况的字段（面板上的编辑）。
-
-    patch 形如 `{"l0": {"preferredName": "宝宝"}, "l1": {"recentGoals": "…"}}`。
-
-    ⚠ 白名单之外一律**忽略**（不报错也不写）：宁可少写，也不能让程序维护的字段
-      被手改坏。若一个都没命中，如实回「没有可改的字段」。
-    ⚠ 与所有写库操作一样持 `_L2_LOCK`（带超时）；手改也算一次画像变动，记一条
-      反思日志，这样「反思日志」里看得见「谁在什么时候改过什么」。
-    """
-    if _l2s is None:
-        return {"ok": False, "error": "记忆模块未加载"}
-    patch = patch if isinstance(patch, dict) else {}
-    l0 = patch.get("l0") if isinstance(patch.get("l0"), dict) else {}
-    l1 = patch.get("l1") if isinstance(patch.get("l1"), dict) else {}
-    if not _L2_LOCK.acquire(timeout=2.0):
-        return {"ok": False, "error": "记忆库正忙，稍后再试"}
-    try:
-        store = _l2_load_store()
-        applied = {"l0": [], "l1": []}
-        for k, v in l0.items():
-            if k not in L0_EDITABLE:
-                continue
-            if k == "isPinned":
-                _l2s.upsert_l0_field(store, k, bool(v))
-            else:
-                _l2s.upsert_l0_field(store, k, str(v if v is not None else "")[:2000])
-            applied["l0"].append(k)
-        for k, v in l1.items():
-            if k not in L1_EDITABLE:
-                continue
-            _l2s.replace_l1_field(store, k, str(v if v is not None else "")[:2000])
-            applied["l1"].append(k)
-        if not applied["l0"] and not applied["l1"]:
-            return {"ok": False, "error": "没有可改的字段（都在白名单之外）"}
-        _l2s.append_reflection_log(store, {
-            "type": "l0_update" if applied["l0"] else "l1_update",
-            "summary": "手动编辑：" + "、".join(
-                ["L0." + k for k in applied["l0"]] + ["L1." + k for k in applied["l1"]]),
-        })
-        _l2s.write_memory_file(str(l2_store_path()), store)
-        return {"ok": True, "applied": applied}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    finally:
-        _L2_LOCK.release()
-
-
-def memory_panel():
-    """GET /memory/panel：面板要的四块一次给全。
-
-    ⚠ 状态块复用一期的 memory_status()（世界书条目数与三态、策略摘要、开关都在里面）；
-      L2 与反思日志来自 l2_panel_data()。两者都不回显任何密钥。
-    ⚠ L0/L1 读的是同一个 store：没开 L2 时给默认空壳，面板不会因为空库报错。
-    """
-    st = memory_status()
-    l2 = l2_panel_data()
-    l0, l1 = {}, {}
-    if _l2s is not None:
-        try:
-            store = _l2_load_store()
-            l0 = dict(_l2s.create_default_l0())
-            l0.update(store.get("l0") or {})
-            l1 = dict(_l2s.DEFAULT_L1)
-            l1.update(store.get("l1") or {})
-        except Exception as e:
-            print(f"⚠ L0/L1 读取失败（面板按空画像显示）: {e}")
-    return {
-        "status": st,
-        "l0": l0,
-        "l1": l1,
-        "l2": l2["items"],
-        "counts": l2["counts"],
-        "reflectionLogs": l2["logs"],
-        "l2Available": l2["available"],
-        "l2Busy": l2["busy"],
-    }
-
-
-# ---------- P4 维护链路的三个回调 ----------
-# 它们由 MemoryScheduler 按节流点调用（默认 每 5 / 20 / 50 轮），跑在 `_l2_after_turn`
-# 的后台线程里 —— 那时 _L2_LOCK 已经持有、_L2_CUR["store"] 就是本轮 store。
-# ⚠ 这三个函数**不要自己取锁**：_L2_LOCK 是不可重入的 threading.Lock，再取一次会死锁。
-# ⚠ _l2m 导入失败时整段降级成 no-op：维护链路停用，但对话与召回照常。
-
-
-def _l2_maint_store():
-    """取本轮正在处理的 store；拿不到就返回 None（说明不在维护上下文里）。"""
-    if _l2m is None or _l2s is None:
-        return None
-    return _L2_CUR.get("store")
-
-
-def _l2_resolve(_count):
-    """每 5 轮：处理冲突队列，LLM 判定两条记忆的关系并落库。"""
-    store = _l2_maint_store()
-    if store is None:
-        return
-    try:
-        # ⚠ 每次最多处理 3 条：resolve 是「一条冲突一次 LLM」。用模块默认的 20，
-        #   队列满时会在这个后台线程里串行打 20 次，持着 _L2_LOCK 几十秒到几分钟 ——
-        #   那期间前台 l2_round 全部超时跳过，表现为「她突然记不起事」。
-        #   剩下的留到下一个 5 轮，反正队列不会跑。
-        _l2m.MemoryResolver(_l2_call_llm).resolve_once(store, limit=3)
-    except Exception as e:
-        print(f"⚠ L2 冲突裁决失败: {e}")
-
-
-def _l2_compress(_count):
-    """每 20 轮：相似 L2 合并 + 画像反思（L0/L1 更新）。"""
-    store = _l2_maint_store()
-    if store is None:
-        return
-    try:
-        _l2m.MemoryCompressor(_l2_call_llm).compress_once(store)
-    except Exception as e:
-        print(f"⚠ L2 压缩失败: {e}")
-
-
-def _l2_decay(_count):
-    """每 50 轮：权重衰减一轮，随后跑一次体积护栏。
-
-    ⚠ 顺序不能反：先衰减把冷条目降下去，护栏再按 weight 归档才挑得准。
-    ⚠ 护栏上限用 maintain 模块的默认值（L2_MAX_ENTRIES = 300，手机端自定）。
-    """
-    store = _l2_maint_store()
-    if store is None:
-        return
-    try:
-        _l2m.run_decay(store)
-        _l2m.enforce_l2_limit(store)
-    except Exception as e:
-        print(f"⚠ L2 衰减失败: {e}")
-
-
-def _l2_after_turn(user_text, assistant_text, sid):
-    """一轮结束后登记进 scheduler，命中节流点才调 LLM。**跑在后台线程，不阻塞回复。**
-
-    只在总闸与 L2 开关都开着时才做事；任一关着就直接 return，行为与改动前一致。
-    全程持 _L2_LOCK（与 STORE_LOCK 分开），做完把 store 的 l1.roundCount 落盘。
-    """
-    # ⚠ 判据用 l2_available()（总闸 + L2 开关 + 模块都在），不是只判总闸：
-    #   只开总闸、不开 L2 时，后台照样会跑 judge —— 每次都调 LLM、写 L2 库，
-    #   而注入侧又不注入，等于白花额度、还留下一份面板上看不见的数据。
-    if not l2_available():
-        return
-    try:
-        with _L2_LOCK:
-            store = _l2_load_store()
-            _L2_ROUND["n"] = int((store.get("l1") or {}).get("roundCount") or 0)
-            _L2_CUR["store"] = store
-            try:
-                _l2_ensure_scheduler().after_turn(
-                    str(user_text or ""), str(assistant_text or ""), str(sid or ""))
-            finally:
-                _L2_CUR["store"] = None
-            store["l1"]["roundCount"] = int(_L2_ROUND.get("n") or 0)
-            _l2s.write_memory_file(str(l2_store_path()), store)
-    except Exception as e:
-        print(f"⚠ L2 后台维护失败: {e}")
+# ---------- 二期 L2 接线（已外置到 cyrene_l2line.py）----------
+# 把三个 L2 子系统（store / write / maintain）接进对话流程的那一层胶水整块搬去了
+# 同目录的 cyrene_l2line.py：judge 链、召回与注入、面板与遗忘、P4 维护回调，
+# 外加给 `/memory/status` 排错口用的那几份状态。
+#
+# 宿主这边转发的是**同一个对象** —— 下面这些在宿主里全是读操作
+# （`_L2_ROUND.get("n")` / `dict(_L2_JUDGE_STAT)` / `list(_L2_LLM_ERRORS)[-5:]`），
+# 所以共享引用不会脱钩。
+#
+# ⚠ 唯一例外是 scheduler 单例：`_L2_SCHED` 是可变量绑定（懒构造 + global 赋值），
+#   值转发只会拿到赋初值那一刻的 None —— 所以拿到的是读函数 `l2_sched()`。
+#
+# ⚠ `_l2s` / `_l2w` / `_l2m` 这三个子系统模块现在由 cyrene_l2line 自己 import
+#   （它们不依赖宿主），宿主这里转发回来，是因为 `/memory/status` 还要读
+#   `_l2w.JUDGE_ERRORS` / `_l2m.ERRORS`。模块拿不到时它们是 None，
+#   那边的 `getattr(..., [])` 照旧兜得住。
+import cyrene_l2line as _l2line                              # noqa: E402
+
+_L2_ROUND = _l2line._L2_ROUND
+_L2_JUDGE_STAT = _l2line._L2_JUDGE_STAT
+_L2_LLM_ERRORS = _l2line._L2_LLM_ERRORS
+_L2_LAST_LLM = _l2line._L2_LAST_LLM
+l2_sched = _l2line.l2_sched
+
+l0_calling_note = _l2line.l0_calling_note
+l2_round = _l2line.l2_round
+l2_forget = _l2line.l2_forget
+memory_panel = _l2line.memory_panel
+memory_profile_update = _l2line.memory_profile_update
+_l2_after_turn = _l2line._l2_after_turn
+
+_l2s = _l2line._l2s
+_l2w = _l2line._l2w
+_l2m = _l2line._l2m
 
 
 def normalize_settings(raw):
@@ -5979,8 +2947,213 @@ class LLMClient:
 #                这一态不会留下任何副作用，可以安全重试。
 OUTCOME_SUCCESS = "success"
 OUTCOME_FAILURE = "failure"
+# ⚠ 下面两态原本定义在文件靠后（内核启动之后）。第六刀把它们上移到这里：
+#   起内核时要把 outcome_unknown 垫进 tools 服务，那时下面还没执行到。
 OUTCOME_UNKNOWN = "unknown"
 OUTCOME_NOT_EXECUTED = "not_executed"
+
+
+# ---------- 内核：把宿主能力做成服务，交给外置子系统 ----------
+# 这里是「插件化」真正通电的一步。cyrene_core 提供 Context 容器与服务查找，
+# 子系统**声明自己需要哪几个服务**、依赖齐了由内核调它的 setup —— 宿主不再
+# 逐个 bind_deps。搜索是第一个真实消费者。
+#
+# 三个服务按能力划分（对齐 cordis 的 ctx.<key> 风格）：
+#   net     网络通道：GET 读通道 / 响应解码 / 错误类型 / 请求参数
+#   tools   工具层通用件：参数取整 / 工具结果常量 / 结果条数上下限
+#   config  配置读取
+#
+# 为什么落在这个位置：它是「被注入的符号全都定义完」之后最早的稳定点 ——
+# 网络层在 800 行一带、配置在 5000 行一带，而 OUTCOME_* 刚好就在这里。
+# 再往前放会 NameError。
+#
+# 降级：内核起不来就退回直接注入。搜索是附加能力，不能让内核的问题把它整块
+# 带走；但**要在启动日志里说清楚**，不能悄没声地降级。
+import types as _types
+
+_KERNEL = None
+
+
+def _protected_files():
+    """宿主的命脉文件：配置 / 会话 / 用量 / 运行时自身。写操作一律拒。
+
+    这份名单原本写死在文件工具组的 `_fs_protected` 里；那组搬去 cyrene_fs 之后，
+    「哪些算命脉」这个判断留在宿主这边（只有它知道自己的配置与运行时在哪），
+    经 fs 服务送过去。少了它，`_fs_protected` 会返回空集 —— 写保护会**静默失效**。
+    """
+    return (CONFIG_FILE, SESSIONS_FILE, USAGE_FILE, Path(__file__))
+
+
+def kernel_summary():
+    """一行内核摘要，给启动日志与 /health 用。内核没起来时返回 None。"""
+    if _KERNEL is None:
+        return None
+    try:
+        return _KERNEL.summary()
+    except Exception:
+        return None
+
+
+def _boot_kernel():
+    """建内核 → 垫三个服务 → 挂搜索插件 → 启动。
+
+    任何一步不成事都返回 None，由调用方退回直接注入。内核里 setup 抛错会被
+    隔离成 failed（不会拖垮服务），所以这里还要回头确认插件真的起来了。
+    """
+    global _KERNEL
+    try:
+        import cyrene_core as _core
+    except Exception as e:
+        print(f"⚠ 内核加载失败，搜索退回直接注入：{e}")
+        return None
+
+    def _log(level, msg):
+        # info 级的装配过程不必刷屏，出问题的那几级才打出来
+        if level != "info":
+            print(f"[内核] {msg}")
+
+    rt = _core.Runtime(log_sink=_log, name="cyrene-web")
+
+    rt.provide("net", _types.SimpleNamespace(
+        error=NetError,
+        open=_net_open,
+        decode_body=_decode_body,
+        fetch_max=NET_FETCH_MAX_BYTES,
+        ua=NET_UA,
+        timeout=_net_timeout,
+    ))
+    rt.provide("tools", _types.SimpleNamespace(
+        int_arg=_int_arg,
+        bool_arg=_bool_arg,
+        decode_bytes=_decode_bytes,
+        outcome_success=OUTCOME_SUCCESS,
+        outcome_failure=OUTCOME_FAILURE,
+        default_results=NET_DEFAULT_RESULTS,
+        max_results=NET_MAX_RESULTS,
+        # 单张图上限给的是**取值函数**：视觉那边读它时现取，于是测试直接改写
+        # VISION_MAX_BYTES 就能生效，不必去捅子系统内部
+        max_file_bytes=lambda: VISION_MAX_BYTES,
+        # 配置归一的三个通用件（视觉的 normalize_vision 要用）
+        as_bool=_as_bool,
+        as_str=_as_str,
+        clamp=_clamp,
+        # 视觉端点「收不收图」的进程级探测结果：由宿主持有（LLMClient 撞 502 时写它），
+        # 子系统经取值函数实时读 —— 这样就不必跨模块共享一个可变全局了
+        support_probe=lambda: VISION_SUPPORTED,
+        # 元工具层要用的三件（第六刀）。⚠ truncate_output 的真身定义在下面
+        # （_boot_kernel 调用之后），所以包一层延迟调用再垫进来。
+        truncate_output=lambda text, limit=None: _truncate_output(text, limit),
+        agent_cfg=agent_cfg,
+        outcome_unknown=OUTCOME_UNKNOWN,
+        # 会话状态层要用（第八刀）：默认模式 + 模式归一 + 会话库路径 + 数据目录
+        settings=lambda: SETTINGS,
+        default_mode=lambda: DEFAULT_MODE,
+        normalize_mode=normalize_mode,
+        sessions_file=lambda: SESSIONS_FILE,
+        data_dir=lambda: DATA_DIR,
+        # L2 记忆接线要用（第九刀）
+        llm_client=LLMClient,
+        memory_cfg=memory_cfg,
+        memory_status=memory_status,
+    ))
+    # 配置服务给的是**取值函数**：SETTINGS 若被整体替换，读到的仍是最新那份
+    rt.provide("config", lambda: SETTINGS)
+    # data 服务同理给取值函数：TTS 拿它当音频缓存的根（data/tts/），
+    # DATA_DIR 换了它也读得到新的那份。
+    rt.provide("data", lambda: DATA_DIR)
+    # sessions 服务（第六刀）：元工具层要写 session.todos，但它**不该知道**
+    # STORE_LOCK / save_sessions 这些细节 —— 所以只给它两个动作，锁与落盘留在宿主。
+    rt.provide("sessions", _types.SimpleNamespace(
+        get=_session_get,
+        set_todos=_session_set_todos,
+        # ⚠ 用**取值函数**而不是直接取宿主转发名：宿主那两行
+        #   `SESSIONS = _sess.SESSIONS` 落在文件中部（会话管理段），比内核启动晚；
+        #   写死会在 _boot_kernel 里 NameError。直指模块则没有时序问题。
+        raw_sessions=lambda: _sess.SESSIONS,
+        raw_lock=lambda: _sess.STORE_LOCK,
+    ))
+    # skills 服务（第六刀）：技能目录 / 技能清单 / front matter 解析。
+    rt.provide("skills", _types.SimpleNamespace(
+        root=lambda: SKILLS_DIR,
+        list=get_skills,
+        parse=parse_front_matter,
+    ))
+    # fs 服务：文件子系统需要「哪些文件不许写」这份名单，而那是宿主的判断。
+    # guard_path / root / path_guard_error / rel 一并摆进来 —— 视觉已经用上了，
+    # 下载那几个将来搬出去也能直接取。
+    rt.provide("fs", _types.SimpleNamespace(
+        protected_files=_protected_files,
+        guard_path=guard_path,
+        root=_fs_root,
+        path_guard_error=PathGuardError,
+        rel=_rel,
+        # 视觉要用的两个：相对大小显示（在 cyrene_fs 里）与附件 id → 路径（附件子系统）
+        human_size=_human_size,
+        resolve_upload=resolve_upload,
+    ))
+
+    rt.use(_search.PLUGIN)
+    rt.use(_fs.PLUGIN)
+    rt.use(_vision.PLUGIN)
+    rt.use(_tts.PLUGIN)
+    rt.use(_meta.PLUGIN)
+    rt.use(_net.PLUGIN)
+    rt.use(_sess.PLUGIN)
+    rt.use(_l2line.PLUGIN)
+    started = rt.start()
+    missing = [p for p in ("search", "fs", "vision", "tts", "meta", "net",
+                           "session", "l2line") if p not in started]
+    if missing:
+        detail = [p for p in rt.status()["plugins"] if p["id"] in missing]
+        print(f"⚠ 有插件没起来（{'、'.join(missing)}），退回直接注入：{detail}")
+        return None
+
+    _KERNEL = rt
+    print(f"✓ {rt.summary()}")
+    return rt
+
+
+if _boot_kernel() is None:
+    # 内核这条路没走通：退回老路，两个子系统照样能用
+    _search.bind_deps(
+        net_error=NetError,
+        net_open=_net_open,
+        decode_body=_decode_body,
+        net_fetch_max=NET_FETCH_MAX_BYTES,
+        net_ua=NET_UA,
+        net_timeout=_net_timeout,
+        int_arg=_int_arg,
+        outcome_success=OUTCOME_SUCCESS,
+        outcome_failure=OUTCOME_FAILURE,
+        default_results=NET_DEFAULT_RESULTS,
+        max_results=NET_MAX_RESULTS,
+        settings=lambda: SETTINGS,
+    )
+    _fs.bind_deps(
+        protected_files=_protected_files,
+        outcome_success=OUTCOME_SUCCESS,
+        outcome_failure=OUTCOME_FAILURE,
+        int_arg=_int_arg,
+        bool_arg=_bool_arg,
+        decode_bytes=_decode_bytes,
+    )
+    _vision.bind_deps(
+        settings=lambda: SETTINGS,
+        outcome_success=OUTCOME_SUCCESS,
+        outcome_failure=OUTCOME_FAILURE,
+        guard_path=guard_path,
+        path_guard_error=PathGuardError,
+        rel=_rel,
+        fs_root=_fs_root,
+        max_file_bytes=lambda: VISION_MAX_BYTES,
+        as_bool=_as_bool,
+        as_str=_as_str,
+        clamp=_clamp,
+        support_probe=lambda: VISION_SUPPORTED,
+        human_size=_human_size,
+        resolve_upload=resolve_upload,
+    )
+
 
 # ---------- termux-api 广播熔断器 ----------
 # 实测结论（_probe_poison.py）：termux-* 工具都靠 `am broadcast` 把请求发给
@@ -8927,620 +6100,49 @@ def dispatch_exclusive(calls, max_parallel=None, ctx=None):
                      "result": results[hit_idx]}
 
 
-# ========== TTS ==========
-# 两条嗓子：
-#   system  —— termux-tts-speak，手机自带的，离线、免费、阻塞式播完才返回
-#   minimax —— 云端合成，音色跟桌面端一致（要填自己的 API Key）
-# 桌面端那条走的是 WebSocket；这里用它的 HTTP 版 v1/t2a_v2，
-# 纯 urllib 就能调，省得为了 TTS 再引一个 websocket 依赖。
-# 合成好的 mp3 按 (引擎+文本) 缓存一份，同一句话不重复花钱。
-TTS_PROC = None
-TTS_LOCK = threading.Lock()
+# ---------- 会话状态层（已外置到 cyrene_session.py）----------
+# 「服务在内存里存着什么、怎么落盘、怎么推给浏览器、怎么被叫停」整块搬去了同目录的
+# cyrene_session.py：会话存储（SESSIONS + 原子落盘）、互斥与中断（INFLIGHT / ABORT）、
+# 两条事件流（按会话的 STREAM_SUBS + 整页的 UI_SUBS）、运行态（LAST_RUN）。
+#
+# 宿主这边转发的是**同一个对象**。下面这些容器在宿主里全是原地操作
+# （`SESSIONS[sid] = s` / `INFLIGHT.pop(...)` / `LAST_RUN.update(...)`），
+# 所以共享引用不会脱钩 —— 这一点跟前几刀的 SHELL_JOBS 是同一个道理。
+# `import cyrene_session as _sess` 在**文件前部**（跟别的同目录模块 import 一起）——
+# 因为 _boot_kernel() 在前部就要用它挂插件。这里只做名字转发。
 
-MINIMAX_T2A_URL = "https://api.minimaxi.com/v1/t2a_v2"
+SESSIONS = _sess.SESSIONS
+STORE_LOCK = _sess.STORE_LOCK
+INFLIGHT = _sess.INFLIGHT
+ABORT = _sess.ABORT
+LAST_RUN = _sess.LAST_RUN
+LAST_RUN_LOCK = _sess.LAST_RUN_LOCK
+STREAM_MAX_SECONDS = _sess.STREAM_MAX_SECONDS
+UI_MAX_SECONDS = _sess.UI_MAX_SECONDS
 
-# ---- 气口增强：规则照桌面端 minimax-vocal-enhancer.js 搬的 ----
-# 往文本里补 (laughs)/(emm)/(sighs)/(breath) 这类标记，让语气有停顿。
-MAX_VOCAL_TAGS = 2
-MINIMAX_VOCAL_TAGS = (
-    "(laughs)", "(chuckle)", "(coughs)", "(clear-throat)", "(groans)",
-    "(breath)", "(pant)", "(inhale)", "(exhale)", "(gasps)", "(sniffs)",
-    "(sighs)", "(snorts)", "(burps)", "(lip-smacking)", "(humming)",
-    "(hissing)", "(emm)", "(sneezes)",
-)
-# (正则, 气口, 插在词前还是词后, 这段最多几个, 是否只在句末触发)
-MINIMAX_VOCAL_RULES = (
-    (re.compile(r"(?<![（(])哈{2,}(?![）)])"), "(laughs)", "after", 1, False),
-    (re.compile(r"(?<![（(])嘿{2,}(?![）)])"), "(chuckle)", "after", 1, False),
-    (re.compile(r"(?<![（(])嗯[~….]{0,3}(?![）)])"), "(emm)", "before", 1, False),
-    (re.compile(r"(?<![a-zA-Z（(])emm+m*[.…]*", re.I), "(emm)", "before", 1, False),
-    (re.compile(r"(?<![（(])啊(?![）)])"), "(gasps)", "before", 1, False),
-    (re.compile(r"(?<![（(])唉(?![）)])"), "(sighs)", "before", 1, False),
-    (re.compile(r"(?<![（(])哎(?![）)])"), "(sighs)", "before", 1, False),
-    (re.compile(r"(?:请看下面的代码块|代码如下|见下表|如下所示|如下表所示)[:：]?\s*$"),
-     "(breath)", "after", 1, True),
-    (re.compile(r"[.…]{2,}\s*$"), "(sighs)", "after", 1, True),
-)
+LEGACY_ERROR_PREFIXES = _sess.LEGACY_ERROR_PREFIXES
+_new_session = _sess._new_session
+migrate_error_messages = _sess.migrate_error_messages
+load_sessions = _sess.load_sessions
+save_sessions = _sess.save_sessions
 
+ui_subscribe = _sess.ui_subscribe
+ui_unsubscribe = _sess.ui_unsubscribe
+ui_bump_rev = _sess.ui_bump_rev
+# ⚠ `UI_REV` 是**整数**：转发值只会拿到赋值那一刻的快照，之后模块里 `+= 1` 这里看不见。
+#   所以拿到的是读函数，宿主那处（/ui/skins 的 "rev"）改成 `ui_rev()`。
+ui_rev = _sess.ui_rev
+stream_subscribe = _sess.stream_subscribe
+stream_unsubscribe = _sess.stream_unsubscribe
+stream_publish = _sess.stream_publish
+is_aborted = _sess.is_aborted
+clear_abort = _sess.clear_abort
+request_abort = _sess.request_abort
+sessions_summary = _sess.sessions_summary
 
-def _has_vocal_tag_near(text, index, direction):
-    """前后 20 个字里已经有气口标记，就别再叠一个。"""
-    seg = text[max(0, index - 20):index] if direction == "before" else text[index:index + 20]
-    return any(tag in seg for tag in MINIMAX_VOCAL_TAGS)
-
-
-def enhance_minimax_text(text, enabled=True):
-    """给文本补气口标记。整段最多补 MAX_VOCAL_TAGS 个。"""
-    if not enabled or not text:
-        return text
-    out = text
-    total = 0
-    for rx, tag, pos, per, tail_only in MINIMAX_VOCAL_RULES:
-        if total >= MAX_VOCAL_TAGS:
-            break
-        if tail_only and not rx.search(out):
-            continue
-        applied, start = 0, 0
-        while applied < per and total < MAX_VOCAL_TAGS:
-            m = rx.search(out, start)
-            if not m:
-                break
-            idx = m.start() if pos == "before" else m.end()
-            if _has_vocal_tag_near(out, idx, pos):
-                start = m.start() + max(1, m.end() - m.start())
-                continue
-            out = out[:idx] + tag + out[idx:]
-            applied += 1
-            total += 1
-            start = idx + len(tag)
-    return out
-
-
-def tts_engine():
-    """现在用哪条嗓子。"""
-    eng = str((SETTINGS.get("tts") or {}).get("engine") or "system").strip().lower()
-    if eng in ("minimax", "custom"):
-        return eng
-    return "system"
-
-
-def _tts_cache_path(tag, text, ext="mp3"):
-    h = hashlib.sha1((tag + "\0" + text).encode("utf-8")).hexdigest()[:20]
-    d = DATA_DIR / "tts"
-    try:
-        d.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-    return d / (h + "." + ext)
-
-
-def _minimax_synth(text, cfg):
-    """调 MiniMax 合成一段 mp3。返回 (bytes, 错误原因)，成功时错误为空串。"""
-    key = str(cfg.get("minimaxKey") or "").strip()
-    if not key:
-        return None, "还没填 MiniMax 的 API Key（设置 → 语音）"
-    voice = str(cfg.get("minimaxVoiceId") or "").strip()
-    if not voice:
-        return None, "还没填音色 ID（设置 → 语音）"
-    payload = {
-        "model": str(cfg.get("minimaxModel") or "").strip() or "speech-2.8-hd",
-        "text": enhance_minimax_text(
-            text, bool(cfg.get("minimaxVocalEnhance", True))),
-        "stream": False,
-        "voice_setting": {
-            "voice_id": voice,
-            "speed": float(cfg.get("minimaxSpeed") or 1.0),
-            "vol": float(cfg.get("minimaxVolume") or 1.0),
-            # pitch 必须是整数，传 0.0 这种浮点会被 API 顶回来（2013）
-            "pitch": int(round(float(cfg.get("minimaxPitch") or 0))),
-            "english_normalization": False,
-        },
-        "audio_setting": {"sample_rate": 32000, "bitrate": 128000,
-                          "format": "mp3", "channel": 1},
-    }
-    req = urllib.request.Request(
-        MINIMAX_T2A_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": "Bearer " + key,
-                 "Content-Type": "application/json"},
-        method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode("utf-8", "replace")[:200]
-        except Exception:
-            pass
-        return None, "MiniMax 返回 %s：%s" % (e.code, body)
-    except Exception as e:
-        return None, "连不上 MiniMax：%s" % e
-    base = data.get("base_resp") or {}
-    code = base.get("status_code")
-    if code not in (0, None):
-        return None, "MiniMax 报错 %s：%s" % (code, base.get("status_msg") or "")
-    hex_audio = (data.get("data") or {}).get("audio") or ""
-    if not hex_audio:
-        return None, "MiniMax 没返回音频（这段话可能被内容策略挡了）"
-    try:
-        return bytes.fromhex(hex_audio), ""
-    except ValueError:
-        return None, "返回的音频不是合法 hex"
-
-
-def _play_audio_file(path):
-    """用 termux-media-player 放一个音频文件。它是后台播的，不等播完。"""
-    try:
-        subprocess.run(["termux-media-player", "stop"],
-                       capture_output=True, timeout=5)
-    except Exception:
-        pass
-    try:
-        p = subprocess.run(["termux-media-player", "play", str(path)],
-                           capture_output=True, timeout=20)
-    except FileNotFoundError:
-        return False, "termux-media-player 不存在（要装 Termux:API）"
-    except Exception as e:
-        return False, str(e)
-    if p.returncode != 0:
-        detail = (p.stderr or b"").decode("utf-8", "replace").strip()[:200]
-        return False, detail or ("exit %d" % p.returncode)
-    return True, "ok"
-
-
-def _tts_speak_minimax(text, cfg):
-    # 语速、音量也进 key —— 不然调了语速而句子没变，命中的还是旧那版音频
-    tag = "minimax:%s:%s:%s:%s:%s:%s" % (
-        cfg.get("minimaxVoiceId") or "", cfg.get("minimaxModel") or "",
-        cfg.get("minimaxSpeed") or 1.0, cfg.get("minimaxVolume") or 1.0,
-        cfg.get("minimaxPitch") or 0, bool(cfg.get("minimaxVocalEnhance", True)))
-    cache = _tts_cache_path(tag, text)
-    try:
-        if cache.is_file() and cache.stat().st_size > 0:
-            return _play_audio_file(cache)
-    except OSError:
-        pass
-    audio, err = _minimax_synth(text, cfg)
-    if audio is None:
-        return False, err
-    try:
-        cache.write_bytes(audio)
-    except OSError:
-        pass
-    return _play_audio_file(cache)
-
-
-def _custom_synth(text, cfg):
-    """调自定义云端接口。返回 (音频字节, 扩展名, 错误原因)。
-
-    约定跟桌面端 custom-cloud-engine 一致：
-      POST <接口地址>   Content-Type: application/json
-      Key 非空时带 Authorization: Bearer <key>
-      body: {text, voiceId?, speed, volume, format}
-      响应：直接给音频字节，或者 application/json 里给 audioBase64。
-    """
-    url = str(cfg.get("customEndpointUrl") or "").strip()
-    if not url:
-        return None, "", "还没填自定义云端的接口地址（设置 → 语音）"
-    fmt = "wav" if str(cfg.get("customFormat") or "").strip().lower() == "wav" else "mp3"
-    timeout = _clamp(cfg.get("customTimeoutMs"), 5, 300, 30)
-    body = {
-        "text": text,
-        "speed": float(cfg.get("customSpeed") or 1.0),
-        "volume": float(cfg.get("customVolume") or 1.0),
-        "format": fmt,
-    }
-    voice = str(cfg.get("customVoiceId") or "").strip()
-    if voice:
-        body["voiceId"] = voice
-    headers = {"Content-Type": "application/json"}
-    key = str(cfg.get("customApiKey") or "").strip()
-    if key:
-        headers["Authorization"] = "Bearer " + key
-    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
-                                 headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            ctype = (r.headers.get("Content-Type") or "").lower()
-            raw = r.read()
-    except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode("utf-8", "replace")[:200]
-        except Exception:
-            pass
-        return None, "", "接口返回 %s：%s" % (e.code, detail)
-    except Exception as e:
-        return None, "", "请求失败：%s" % e
-    if "json" in ctype:
-        try:
-            d = json.loads(raw.decode("utf-8", "replace"))
-        except Exception:
-            return None, "", "接口说是 JSON，但解析不了"
-        b64 = d.get("audioBase64")
-        if not b64:
-            return None, "", "JSON 里没有 audioBase64"
-        try:
-            audio = base64.b64decode(b64)
-        except Exception:
-            return None, "", "audioBase64 解不开"
-        got = str(d.get("format") or "").strip().lower()
-        if got in ("wav", "mp3"):
-            fmt = got
-    else:
-        audio = raw
-        if "wav" in ctype or "wave" in ctype:
-            fmt = "wav"
-        elif "mpeg" in ctype or "mp3" in ctype:
-            fmt = "mp3"
-    if not audio:
-        return None, "", "接口返回了空音频"
-    return audio, fmt, ""
-
-
-def _tts_speak_custom(text, cfg):
-    tag = "custom:%s:%s:%s:%s:%s" % (
-        cfg.get("customEndpointUrl") or "", cfg.get("customVoiceId") or "",
-        cfg.get("customSpeed") or 1.0, cfg.get("customVolume") or 1.0,
-        cfg.get("customFormat") or "mp3")
-    fmt = "wav" if str(cfg.get("customFormat") or "").strip().lower() == "wav" else "mp3"
-    cache = _tts_cache_path(tag, text, fmt)
-    try:
-        if cache.is_file() and cache.stat().st_size > 0:
-            return _play_audio_file(cache)
-    except OSError:
-        pass
-    audio, got, err = _custom_synth(text, cfg)
-    if audio is None:
-        return False, err
-    if got != fmt:
-        cache = _tts_cache_path(tag, text, got)
-    try:
-        cache.write_bytes(audio)
-    except OSError:
-        pass
-    return _play_audio_file(cache)
-
-
-def _tts_speak_system(text, cfg):
-    """手机自带的那条嗓子，阻塞播完才返回。"""
-    global TTS_PROC
-    cmd = ["termux-tts-speak"]
-    try:
-        rate = float(cfg.get("rate", 1.0))
-        cmd += ["-r", str(round(rate, 2))]
-    except (TypeError, ValueError):
-        pass
-    try:
-        pitch = float(cfg.get("pitch", 1.0))
-        cmd += ["-p", str(round(pitch, 2))]
-    except (TypeError, ValueError):
-        pass
-    lang = str(cfg.get("language") or "").strip()
-    if lang:
-        cmd += ["-l", lang[:20]]
-    cmd.append(text[:800])
-    try:
-        with TTS_LOCK:
-            TTS_PROC = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.PIPE)
-            proc = TTS_PROC
-        _, err = proc.communicate(timeout=60)
-        with TTS_LOCK:
-            TTS_PROC = None
-        if proc.returncode != 0:
-            detail = (err or b"").decode(errors="replace").strip()[:200]
-            return False, detail or f"exit {proc.returncode}"
-        return True, "ok"
-    except FileNotFoundError:
-        with TTS_LOCK:
-            TTS_PROC = None
-        return False, "termux-tts-speak 不存在（需在 Termux 内运行并安装 Termux:API）"
-    except subprocess.TimeoutExpired:
-        tts_stop()
-        return False, "播放超时"
-    except Exception as e:
-        with TTS_LOCK:
-            TTS_PROC = None
-        return False, str(e)
-
-
-def tts_speak(text):
-    """念一段话。按设置里的引擎分派，返回 (ok, message)。"""
-    t = str(text or "").strip()
-    if not t:
-        return False, "empty"
-    cfg = SETTINGS.get("tts") or {}
-    eng = tts_engine()
-    if eng == "minimax":
-        return _tts_speak_minimax(t[:1500], cfg)
-    if eng == "custom":
-        return _tts_speak_custom(t[:1500], cfg)
-    return _tts_speak_system(t, cfg)
-
-
-def tts_stop():
-    """停掉正在念的。两条嗓子的停法不一样。"""
-    global TTS_PROC
-    if tts_engine() in ("minimax", "custom"):
-        try:
-            subprocess.run(["termux-media-player", "stop"],
-                           capture_output=True, timeout=5)
-            return True
-        except Exception:
-            return False
-    with TTS_LOCK:
-        proc, TTS_PROC = TTS_PROC, None
-    if proc and proc.poll() is None:
-        try:
-            proc.terminate()
-            proc.wait(timeout=3)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        # termux-tts-speak 只是客户端，引擎侧要单独叫停
-        try:
-            subprocess.run(["termux-tts-speak", "-s"], timeout=5,
-                           capture_output=True)
-        except Exception:
-            pass
-        return True
-    return False, "empty"
-    cfg = SETTINGS.get("tts", {})
-    cmd = ["termux-tts-speak"]
-    try:
-        rate = float(cfg.get("rate", 1.0))
-        cmd += ["-r", str(round(rate, 2))]
-    except (TypeError, ValueError):
-        pass
-    try:
-        pitch = float(cfg.get("pitch", 1.0))
-        cmd += ["-p", str(round(pitch, 2))]
-    except (TypeError, ValueError):
-        pass
-    lang = str(cfg.get("language") or "").strip()
-    if lang:
-        cmd += ["-l", lang[:20]]
-    cmd.append(t[:800])
-    try:
-        with TTS_LOCK:
-            TTS_PROC = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.PIPE)
-            proc = TTS_PROC
-        _, err = proc.communicate(timeout=60)
-        with TTS_LOCK:
-            TTS_PROC = None
-        if proc.returncode != 0:
-            detail = (err or b"").decode(errors="replace").strip()[:200]
-            return False, detail or f"exit {proc.returncode}"
-        return True, "ok"
-    except FileNotFoundError:
-        with TTS_LOCK:
-            TTS_PROC = None
-        return False, "termux-tts-speak 不存在（需在 Termux 内运行并安装 Termux:API）"
-    except subprocess.TimeoutExpired:
-        tts_stop()
-        return False, "播放超时"
-    except Exception as e:
-        with TTS_LOCK:
-            TTS_PROC = None
-        return False, str(e)
-
-
-def tts_stop():
-    global TTS_PROC
-    with TTS_LOCK:
-        proc, TTS_PROC = TTS_PROC, None
-    if proc and proc.poll() is None:
-        try:
-            proc.terminate()
-            proc.wait(timeout=3)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        # termux-tts-speak 只是客户端，引擎侧要单独叫停
-        try:
-            subprocess.run(["termux-tts-speak", "-s"], timeout=5,
-                           capture_output=True)
-        except Exception:
-            pass
-        return True
-    return False
-
-
-# ========== 会话管理 ==========
-try:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-except OSError:
-    pass
-
-
-def _new_session(mode=None):
-    sid = str(uuid.uuid4())[:8]
-    if mode is None:
-        try:
-            mode = SETTINGS.get("chat", {}).get("defaultMode", DEFAULT_MODE)
-        except NameError:
-            mode = DEFAULT_MODE
-    return sid, {"id": sid, "title": "新对话", "messages": [], "created": time.time(),
-                 "mode": normalize_mode(mode)}
-
-
-LEGACY_ERROR_PREFIXES = ("[API ", "[错误]", "[请求失败]")
-
-
-def migrate_error_messages(sessions):
-    """把旧版本误当正文存下的错误串迁移成 error 标记。
-
-    早期 LLMClient.chat() 失败时返回 (msg, None, msg)，content 和 error 是同一个串，
-    _handle_send 就把它当 assistant 正文落了库。后果：
-      1. 错误串永久留在历史里，刷新还在；
-      2. 构造上下文时被当成对话内容发给模型，污染后续回复。
-    这里按前缀识别并原地转成 {content:"", error:...}。幂等：已是 error 的跳过。
-    返回迁移条数。
-    """
-    n = 0
-    for s in sessions.values():
-        if not isinstance(s, dict):
-            continue
-        for m in (s.get("messages") or []):
-            if not isinstance(m, dict) or m.get("error"):
-                continue
-            if m.get("role") != "assistant":
-                continue
-            c = m.get("content")
-            if isinstance(c, str) and c.startswith(LEGACY_ERROR_PREFIXES):
-                m["error"] = c
-                m["content"] = ""
-                n += 1
-    return n
-
-
-def load_sessions():
-    """读取会话。解析失败时把坏文件改名保留，绝不静默吞掉历史。"""
-    if SESSIONS_FILE.exists():
-        try:
-            data = json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and data:
-                fixed = migrate_error_messages(data)
-                if fixed:
-                    print(f"⚠ 迁移了 {fixed} 条被误存为正文的错误消息（转 error 标记）")
-                    save_sessions(data)
-                return data
-        except Exception:
-            try:
-                bak = SESSIONS_FILE.with_name(f"sessions.json.corrupt-{int(time.time())}")
-                os.replace(SESSIONS_FILE, bak)
-                print(f"⚠ sessions.json 解析失败，已保留副本: {bak.name}")
-            except OSError:
-                pass
-    sid, s = _new_session()
-    return {sid: s}
-
-
-def save_sessions(sessions):
-    """tmp 写入 + os.replace 原子替换，避免写入中断产生半截 JSON。"""
-    try:
-        SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = SESSIONS_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(sessions, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, SESSIONS_FILE)
-        return True
-    except OSError as e:
-        print(f"⚠ 会话保存失败: {e}")
-        return False
-
-
-SESSIONS = load_sessions()
+# ⚠ `CURRENT_SID` 留在宿主：它是**字符串**，本文件里有多处 `global CURRENT_SID`
+#   整体赋值（新建会话 / 删除会话时改指向），转发会脱钩。用上面转发的 SESSIONS 初始化。
 CURRENT_SID = list(SESSIONS.keys())[0] if SESSIONS else None
-
-# 锁拆分：
-#   STORE_LOCK 只保护 SESSIONS 结构与落盘，持锁时间是毫秒级。
-#   LLM 网络调用与 run_tool 一律在锁外执行，否则一次慢请求会冻结整个服务。
-#   INFLIGHT 记录「哪个会话正在生成」，同会话重复请求直接 409，不排队。
-#   ABORT 记录「哪个会话被用户要求中止」，agent loop 每轮开头检查它并优雅退出。
-STORE_LOCK = threading.Lock()
-INFLIGHT = {}
-
-# ---- 实时增量推送（思考过程看得见）----
-# agent loop 每收到一片增量就丢进订阅队列，GET /chat/<sid>/stream 的线程
-# 再取出来写成 SSE。没有订阅者时，代价只是一次空的列表遍历。
-STREAM_SUBS = {}            # sid -> set(queue.Queue)
-STREAM_LOCK = threading.Lock()
-STREAM_MAX_SECONDS = 900    # 单条 SSE 连接的兜底时长，防止线程挂死
-
-# ---- UI 事件流（皮肤热改这类「界面要立刻变」的事）----
-# 跟上面那套同一形状，只是订阅的是整页而不是单个会话。开着页面的每一个
-# 标签各订一条；没人订的时候，publish 的代价只是一次空列表遍历。
-UI_SUBS = set()             # set(queue.Queue)
-UI_LOCK = threading.Lock()
-UI_REV = 0                  # 每次界面配置变化 +1，前端拿它判断要不要重画
-UI_MAX_SECONDS = 1800
-
-
-def ui_subscribe():
-    q = queue.Queue(maxsize=200)
-    with UI_LOCK:
-        globals()["UI_SUBS"].add(q)
-    return q
-
-
-def ui_unsubscribe(q):
-    with UI_LOCK:
-        globals()["UI_SUBS"].discard(q)
-
-
-def ui_bump_rev():
-    """界面配置变了：版本号 +1，并叫醒所有开着的页面。"""
-    global UI_REV
-    with UI_LOCK:
-        UI_REV += 1
-        rev = UI_REV
-        subs = list(UI_SUBS)
-    for q in subs:
-        try:
-            q.put_nowait({"kind": "skin", "rev": rev})
-        except Exception:
-            pass
-    return rev
-
-
-def stream_subscribe(sid):
-    q = queue.Queue(maxsize=4000)
-    with STREAM_LOCK:
-        STREAM_SUBS.setdefault(sid, set()).add(q)
-    return q
-
-
-def stream_unsubscribe(sid, q):
-    with STREAM_LOCK:
-        subs = STREAM_SUBS.get(sid)
-        if subs is not None:
-            subs.discard(q)
-            if not subs:
-                STREAM_SUBS.pop(sid, None)
-
-
-def stream_publish(sid, kind, text):
-    # 广播一片增量；没有人订就什么都不做。
-    if not text:
-        return
-    with STREAM_LOCK:
-        subs = list(STREAM_SUBS.get(sid) or ())
-    for q in subs:
-        try:
-            q.put_nowait((kind, text))
-        except Exception:
-            pass
-
-ABORT = {}
-
-# loop 最近一次运行的统计，供设置面板 Agent tab 的状态区展示（阶段5 用）
-LAST_RUN = {}
-LAST_RUN_LOCK = threading.Lock()
-
-
-def is_aborted(sid):
-    """用户是否点了中止。只读，不清标记（清由 loop 收尾时统一做）。"""
-    with STORE_LOCK:
-        return bool(ABORT.get(sid))
-
-
-def clear_abort(sid):
-    with STORE_LOCK:
-        ABORT.pop(sid, None)
-
-
-def request_abort(sid):
-    """置中止标记。只有真在跑的会话才有意义，但置了也无害。"""
-    with STORE_LOCK:
-        ABORT[sid] = True
-    return True
 
 
 class Throttle:
@@ -9970,20 +6572,6 @@ def run_agent_loop(sid, client, prompt, history, allow_tools, cfg=None):
     }
 
 
-def sessions_summary():
-    """侧边栏只需要这些字段。messages 不外发。"""
-    out = {}
-    for sid, s in SESSIONS.items():
-        msgs = s.get("messages") or []
-        out[sid] = {
-            "id": sid,
-            "title": s.get("title", "新对话"),
-            "created": s.get("created", 0),
-            "count": len(msgs),
-        }
-    return out
-
-
 # ========== Web 页面骨架 ==========
 # 样式与逻辑全部外置到 static/，这里只留结构。
 # 好处：改前端不用动 Python，也不会再把 50KB 字符串塞进源码里。
@@ -10294,9 +6882,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith("/static/"):
             self._static(path[len("/static/"):])
         elif path == "/health":
+            # kernel 是一行摘要（None = 内核没起来，搜索走的是直接注入那条路）
             self._json({"ok": True,
                         "model": SETTINGS.get("model", {}).get("model", ""),
-                        "inflight": len(INFLIGHT)})
+                        "inflight": len(INFLIGHT),
+                        "kernel": kernel_summary()})
         elif path == "/sessions":
             with STORE_LOCK:
                 snap = sessions_summary()
@@ -12153,7 +8743,7 @@ def _ui_skins_payload():
             s["error"] = s["error"] or "插件当前停用，皮肤未生效"
         skins.append(s)
     return {"ok": True,
-            "rev": UI_REV,
+            "rev": ui_rev(),
             "active": (SETTINGS.get("appearance") or {}).get("uiSkin") or "",
             "skins": skins,
             # 运行时覆盖：插件在跑的过程中改的界面，叠在挑中的那套之上
